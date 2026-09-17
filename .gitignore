@@ -1,0 +1,9 @@
+# Python 字节码缓存（backend/build.py 与 tools/ 都会生成，不要入库）
+__pycache__/
+*.py[cod]
+
+# backend/build.py 的 Node 依赖（本机 npm install 安装，不入库）
+backend/node_modules/
+
+# 构建产物：用 `python backend/build.py` 重新生成即可（默认不带注释，约 350KB）
+backend/ifm_bundle.lua

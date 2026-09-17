@@ -1,0 +1,73 @@
+{
+    "version": 1,
+    "containers": {
+        "main_storage": { "name": "main_storage", "peripheral": "minecraft:chest_0", "kind": "item", "role": "storage" },
+        "buffer_tank": { "name": "buffer_tank", "peripheral": "fluid_storage_0", "kind": "fluid", "role": "storage" },
+        "basin_items": { "name": "basin_items", "peripheral": "create:basin_0", "kind": "item", "role": "interaction" },
+        "basin_fluid": { "name": "basin_fluid", "peripheral": "create:basin_0", "kind": "fluid", "role": "interaction" },
+        "machine_in": { "name": "machine_in", "peripheral": "minecraft:chest_1", "kind": "item", "role": "interaction" },
+        "machine_out": { "name": "machine_out", "peripheral": "minecraft:chest_2", "kind": "item", "role": "interaction" },
+        "dump_chest": { "name": "dump_chest", "peripheral": "minecraft:chest_3", "kind": "item", "role": "output" }
+    },
+    "signals": {
+        "furnace_relay": { "name": "furnace_relay", "peripheral": "redstone_relay_0" }
+    },
+    "filters": {
+        "ores": {
+            "name": "ores",
+            "rules": [
+                { "type": "itemTag_include", "id": "c:ores", "ignoreNbt": false },
+                { "type": "item_exclude", "id": "minecraft:coal_ore", "ignoreNbt": true }
+            ]
+        },
+        "smeltable": {
+            "name": "smeltable",
+            "rules": [
+                { "type": "filter_include", "id": "ores", "ignoreNbt": false }
+            ]
+        }
+    },
+    "machineTypes": {
+        "furnace": { "name": "furnace" }
+    },
+    "machines": {
+        "furnace_1": {
+            "name": "furnace_1",
+            "type": "furnace",
+            "itemInputs": ["machine_in"],
+            "fluidInputs": [],
+            "signals": ["furnace_relay"],
+            "itemOutputs": ["machine_out"],
+            "fluidOutputs": [],
+            "parallel": 2
+        }
+    },
+    "processes": {
+        "smelt_iron": {
+            "name": "smelt_iron",
+            "machineType": "furnace",
+            "maxMultiplier": 8,
+            "inputs": [
+                { "kind": "item", "id": "minecraft:raw_iron", "count": 1, "containerIndex": -1, "slot": -1 },
+                { "kind": "waitSignal", "machineSignalIndex": 1, "sides": ["front"], "op": "ge", "threshold": 15 }
+            ],
+            "outputs": [
+                { "kind": "item", "id": "minecraft:iron_ingot", "min": 1, "max": 1, "priority": 10, "containerIndex": -1, "slot": -1 }
+            ]
+        },
+        "smelt_ore_batch": {
+            "name": "smelt_ore_batch",
+            "machineType": "furnace",
+            "maxMultiplier": 4,
+            "inputs": [
+                { "kind": "filter", "id": "smeltable", "count": 4, "containerIndex": -1, "slot": -1 },
+                { "kind": "waitTime", "seconds": 0.5 }
+            ],
+            "outputs": [
+                { "kind": "item", "id": "minecraft:iron_ingot", "min": 1, "max": 4, "priority": 5, "containerIndex": -1, "slot": -1 },
+                { "kind": "placeholder", "name": "slag", "item": "minecraft:gravel" },
+                { "kind": "emitSignal", "machineSignalIndex": 1, "sides": ["front"], "strength": 15 }
+            ]
+        }
+    }
+}
