@@ -329,6 +329,32 @@ function Store:containerNameFor(obj, name)
     return plain
 end
 
+--- 信号定义名：**红石信号不再需要命名** —— 定义名恒等于中继器的外设名（一个中继器一个定义）。
+--- 兼容旧配置：机器里写的旧“信号定义名”仍然能解析（见 Recipe:signalPeripheralOf）。
+function Store:signalNameFor(obj, name)
+    local derived = self.Util.trim((obj or {}).peripheral or "")
+    if derived ~= "" then
+        return derived
+    end
+    return self.Util.trim(name or "")
+end
+
+--- 丢掉同一个中继器的旧信号定义（名字不同）：信号改用外设名之后，旧的自定义名字要让位，
+--- 否则会留下两个指向同一个外设的定义（界面上看起来像两台不同的信号）。
+function Store:dropSignalByPeripheral(peripheral, keepName)
+    if type(peripheral) ~= "string" or peripheral == "" then
+        return false
+    end
+    local dropped = false
+    for _, def in ipairs(self:list("signals")) do
+        if def.peripheral == peripheral and def.name ~= keepName then
+            self.data.signals[def.name] = nil
+            dropped = true
+        end
+    end
+    return dropped
+end
+
 --- 丢掉同一个外设 + 同一种类的旧定义（名字不同）。
 --- 非输出容器改用外设名作定义名后，旧配置里自定义的名字要让位；否则校验会报
 --- “外设已经分配给容器定义 xxx”而存不进去。
@@ -379,6 +405,12 @@ function Store:set(kind, name, obj, opts)
         if (obj.role or "storage") ~= "output" then
             self:dropContainerByPeripheral(self.Util.kindOfDef(obj), obj.peripheral, name)
         end
+    elseif kind == "signals" then
+        --- 红石信号不再需要命名：定义名就是中继器的外设名（拖外设到机器的信号卡片即可）。
+        --- 旧配置里的自定义信号名会被同名外设的新定义顶掉，机器若还写着旧名字，
+        --- 由 Recipe:signalPeripheralOf 兜底按外设名解析（兼容旧配置）。
+        name = self:signalNameFor(obj, name or obj.name)
+        self:dropSignalByPeripheral(obj.peripheral, name)
     else
         name = self.Util.trim(name or obj.name or "")
     end
@@ -445,8 +477,9 @@ function Store:delete(kind, name, containerKind, opts)
     return true
 end
 
---- 一个机器用到的**外设名集合**（输入/输出容器定义的外设 + 信号定义的外设）。
---- 用途：校验“一个外设只隶属于一个机器” —— 两台机器共用一个外设会互相抢外设（引擎会同时向它搬运/读信号）。
+--- 一个机器用到的**外设名集合**（输入/输出容器定义的外设 + 信号解析出的中继器）。
+--- 现在只用于诊断/展示：1.6.9 起同一个外设允许被多台机器引用（用户明确要求），
+--- 所以不再用它做“一个外设只属于一个机器”的校验。
 function Store:machinePeripheralNames(machine)
     local out = {}
     if type(machine) ~= "table" then
@@ -467,9 +500,10 @@ function Store:machinePeripheralNames(machine)
             end
         end
     end
-    for _, signalName in ipairs(machine.signals or {}) do
-        local def = self:get("signals", signalName)
-        local peripheral = def and def.peripheral or nil
+    for _, signalEntry in ipairs(machine.signals or {}) do
+        --- 信号项可能是旧定义名，也可能直接是外设名（1.6.9 起信号不再需要命名）
+        local def = self:get("signals", signalEntry)
+        local peripheral = (def and def.peripheral) or (type(signalEntry) == "string" and signalEntry or nil)
         if type(peripheral) == "string" and peripheral ~= "" then
             out[peripheral] = true
         end
@@ -812,26 +846,18 @@ function Store:validate(kind, name, obj)
                 end
             end
         end
-        for _, signalName in ipairs(obj.signals or {}) do
-            if not self:get("signals", signalName) then
-                return false, "\\u4FE1\\u53F7 " .. tostring(signalName) .. " \\u4E0D\\u5B58\\u5728"
+        for _, signalEntry in ipairs(obj.signals or {}) do
+            --- 红石信号**不再需要命名**：这一项既可以是旧的“信号定义名”，也可以直接是
+            --- 红石中继器的**外设名**（把外设拖到机器的信号卡片上产生的就是后者）。
+            --- 外设是否存在由引擎检查（Recipe:machineProblem 会给出可读原因）。
+            if not isName(signalEntry) then
+                return false, "\\u4FE1\\u53F7\\u540D\\u4E0D\\u80FD\\u4E3A\\u7A7A"
             end
         end
-        --- 一个外设只隶属于一个机器：同一个外设（容器/信号背后的方块）不能同时出现在另一台机器里 ——
-        --- 两台机器共用一个外设会互相抢（引擎会同时往它搬东西 / 同时读它的红石信号）。
-        local mine = self:machinePeripheralNames(obj)
-        for _, other in ipairs(self:list("machines")) do
-            if other.name ~= name then
-                local used = self:machinePeripheralNames(other)
-                for peripheral in pairs(mine) do
-                    if used[peripheral] then
-                        return false, "\\u5916\\u8BBE " .. tostring(peripheral) ..
-                            " \\u5DF2\\u7ECF\\u5C5E\\u4E8E\\u673A\\u5668 " .. tostring(other.name) ..
-                            "\\uFF08\\u4E00\\u4E2A\\u5916\\u8BBE\\u53EA\\u80FD\\u5C5E\\u4E8E\\u4E00\\u4E2A\\u673A\\u5668\\uFF09"
-                    end
-                end
-            end
-        end
+        --- 1.6.9：允许同一个外设（交互容器 / 红石中继器）被**多台机器**引用 ——
+        --- 用户明确要求“交互容器可以属于多个机器”“一个红石中继器可以给多台机器用”。
+        --- 注意（使用提示）：两台机器共用同一个输入/输出容器时会同时往里搬 / 同时读它的信号，
+        --- 这是配置者自己的选择；IFM 不再替它拦下来。
         if Util.int(obj.parallel, 1) < 1 then
             return false, "\\u5E76\\u884C\\u4FE1\\u53F7\\u91CF\\u5FC5\\u987B\\u5927\\u4E8E\\u7B49\\u4E8E 1"
         end

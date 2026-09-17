@@ -145,6 +145,21 @@ function Recipe:machinesOfType(typeName)
     return list
 end
 
+--- 机器的信号项 → 中继器外设名（1.6.9）：
+---   * 旧配置写的是“信号定义名” → 查定义拿它的外设；
+---   * 现在信号不需要命名，机器里直接写**外设名** → 就把它当成外设名（返回它自己）。
+--- 返回：中继器外设名, 用于显示/日志的名字（解析不到时返回 nil）
+function Recipe:signalPeripheralOf(entry)
+    if type(entry) ~= "string" or entry == "" then
+        return nil
+    end
+    local signal = self.Store:get("signals", entry)
+    if signal and type(signal.peripheral) == "string" and signal.peripheral ~= "" then
+        return signal.peripheral, signal.name or entry
+    end
+    return entry, entry
+end
+
 --- 机器引用的容器/信号外设是否齐全（物品列表要 inventory，流体列表要 fluid_storage）
 function Recipe:machineUsable(machine)
     local lists = {
@@ -160,9 +175,9 @@ function Recipe:machineUsable(machine)
             end
         end
     end
-    for _, signalName in ipairs(machine.signals or {}) do
-        local signal = self.Store:get("signals", signalName)
-        if not signal or not self.Peripherals:exists(signal.peripheral) then
+    for _, signalEntry in ipairs(machine.signals or {}) do
+        local peripheral = self:signalPeripheralOf(signalEntry)
+        if not peripheral or not self.Peripherals:exists(peripheral) then
             return false
         end
     end
@@ -185,13 +200,13 @@ function Recipe:machineProblem(machine)
             end
         end
     end
-    for _, signalName in ipairs(machine.signals or {}) do
-        local signal = self.Store:get("signals", signalName)
-        if not signal then
-            return "\\u4FE1\\u53F7\\u5B9A\\u4E49 " .. tostring(signalName) .. " \\u4E0D\\u5B58\\u5728"
+    for _, signalEntry in ipairs(machine.signals or {}) do
+        local peripheral, label = self:signalPeripheralOf(signalEntry)
+        if not peripheral then
+            return "\\u4FE1\\u53F7\\u5B9A\\u4E49 " .. tostring(signalEntry) .. " \\u4E0D\\u5B58\\u5728"
         end
-        if not self.Peripherals:exists(signal.peripheral) then
-            return "\\u4FE1\\u53F7 " .. tostring(signalName) .. " \\u7684\\u4E2D\\u7EE7\\u5668 " .. tostring(signal.peripheral) .. " \\u4E0D\\u5B58\\u5728"
+        if not self.Peripherals:exists(peripheral) then
+            return "\\u4FE1\\u53F7 " .. tostring(label) .. " \\u7684\\u4E2D\\u7EE7\\u5668 " .. tostring(peripheral) .. " \\u4E0D\\u5B58\\u5728"
         end
     end
     return nil
@@ -258,10 +273,11 @@ function Recipe:resolveSignals(machine, element)
     end
     local machineSignalIndex = tonumber(element.machineSignalIndex) or -1
     if machineSignalIndex >= 1 and machine then
-        local signalName = (machine.signals or {})[machineSignalIndex]
-        local signal = signalName and self.Store:get("signals", signalName) or nil
-        if signal then
-            result[#result + 1] = { peripheral = signal.peripheral, sides = sides, signalName = signal.name }
+        local signalEntry = (machine.signals or {})[machineSignalIndex]
+        --- 信号项可能是旧的“信号定义名”，也可能就是中继器的外设名（1.6.9 起不再需要命名）
+        local peripheral, label = self:signalPeripheralOf(signalEntry)
+        if peripheral then
+            result[#result + 1] = { peripheral = peripheral, sides = sides, signalName = label }
         end
     end
     return result

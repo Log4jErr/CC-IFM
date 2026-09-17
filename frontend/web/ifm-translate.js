@@ -515,17 +515,38 @@
     }
 
     function createService(api) {
-        // TranslationService 的构造参数在不同版本里可能不同：依次尝试（embind 允许省略可选参数）
-        const attempts = [[], [1, 0], [2, 0]];
+        // 0.4.9 的 wasm 里导出的类是 **BlockingService**（官方 worker/translator-worker.js 就是这么用的：
+        //   new this.module.BlockingService({ cacheSize })）；
+        // 旧版/别的构建才叫 TranslationService。以前只试 TranslationService，于是加载模型时
+        // 报 “api.TranslationService is not a constructor”，本地模型白白下载完却用不了（1.6.9 修）。
+        const attempts = [
+            ['BlockingService', [{ cacheSize: 0 }]],
+            ['BlockingService', []],
+            ['TranslationService', [{ cacheSize: 0 }]],
+            ['TranslationService', []],
+            ['TranslationService', [1, 0]],
+        ];
+        const construct = function (Ctor, args) {
+            if (args.length === 0) return new Ctor();
+            if (args.length === 1) return new Ctor(args[0]);
+            return new Ctor(args[0], args[1]);
+        };
         let lastError = null;
+        const tried = [];
         for (let index = 0; index < attempts.length; index += 1) {
+            const name = attempts[index][0];
+            const Ctor = api && api[name];
+            if (typeof Ctor !== 'function') continue;
             try {
-                return new api.TranslationService(...attempts[index]);
+                return construct(Ctor, attempts[index][1]);
             } catch (err) {
                 lastError = err;
+                tried.push(name + ': ' + ((err && err.message) || err));
             }
         }
-        throw lastError || new Error('无法创建翻译服务');
+        throw new Error('翻译引擎里没有可用的服务类（BlockingService / TranslationService）' +
+            (tried.length ? '：' + tried.join(' | ') : '') +
+            (lastError ? '' : '（wasm 可能没加载成功）'));
     }
 
     // 加载一个候选文件组：下载 → 解压 → 建 TranslationModel + TranslationService
@@ -596,7 +617,11 @@
                             sets = sets.concat(remote.sets);
                             console.info('[IFM] 本地模型不可用，改用 Mozilla 清单（' + remote.sets.length + ' 个候选）');
                         } catch (remoteErr) {
-                            failures.push('remote manifest: ' + ((remoteErr && remoteErr.message) || remoteErr));
+                            // Mozilla 的清单放在 Google 存储桶上，**没有 CORS 头** —— 浏览器会直接拦下这次请求
+                            // （控制台里那条 “CORS Missing Allow Origin” 就是它）。所以本地模型缺失时，
+                            // 唯一可靠的办法是手动把模型放到 web/models/en-zh/ 下，而不是靠远端回退。
+                            failures.push('remote manifest: ' + ((remoteErr && remoteErr.message) || remoteErr) +
+                                '（Mozilla 清单不允许跨域读取：请把模型放到 ' + LOCAL_MODEL_DIR + ' 下）');
                         }
                     }
                 }

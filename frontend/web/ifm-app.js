@@ -446,10 +446,8 @@
                 });
                 return;
             }
-            const newSignal = event.target.closest('[data-new-signal]');
-            if (newSignal) {
-                openEditor('signals', null, { peripheral: newSignal.getAttribute('data-new-signal') });
-            }
+            // 注：红石信号不再需要“新建定义”（1.6.9）—— 中继器芯片直接拖到机器的信号卡片即可，
+            // 所以这里没有 data-new-signal 分支了。
         }
     }
 
@@ -737,25 +735,10 @@
         });
     }
 
-    // 机器里引用的是**信号定义名**：已有该外设的信号定义就用它，没有就用外设名建一个
+    // 机器里引用的是**红石中继器的外设名**（1.6.9：信号不再需要命名，也不再需要“信号定义”）。
+    // 直接把中继器拖到机器的红石信号卡片上就是这个外设名；同一个中继器可以给多台机器用。
     function ensureMachineSignal(peripheral) {
-        const existing = Array.from(stores.signals.values()).find(function (item) {
-            return item.peripheral === peripheral;
-        });
-        if (existing) return Promise.resolve(existing.name);
-        const name = String(peripheral);
-        return sendRequest('set_signal', { name: name, data: { peripheral: peripheral } })
-            .then(function (response) {
-                const result = response.result || {};
-                if (result.error) throw new Error(result.error);
-                // 同样本地乐观补上信号定义（服务端推回来时会覆盖）
-                if (!stores.signals.has(name)) {
-                    stores.signals.set(name, { name: name, peripheral: peripheral });
-                    markDirty('signals');
-                    scheduleRender();
-                }
-                return name;
-            });
+        return Promise.resolve(String(peripheral));
     }
 
     function machinePayload(machine) {
@@ -994,9 +977,20 @@
             if (payload.fromMachine) {
                 // 拖回原位：什么都不做
                 if (payload.fromMachine === machineName && payload.fromSlot === slotId) return;
-                // 换位置（同一台机器或另一台机器）：先摘掉旧归属，再加新归属
-                removePeripheralFromMachine(payload, true).then(function () {
-                    return addPeripheralToMachine(machineName, slotId, payload.peripheral, payload.dragKind);
+                if (payload.fromMachine === machineName) {
+                    // 同一台机器内换位置：摘掉旧位置再加新位置（这是“移动”）
+                    removePeripheralFromMachine(payload, true).then(function () {
+                        return addPeripheralToMachine(machineName, slotId, payload.peripheral, payload.dragKind);
+                    });
+                    return;
+                }
+                // 拖到**另一台机器**：只新增，**不摘掉原来那台机器**（1.6.9）——
+                // 交互容器与红石中继器允许被多台机器共用，所以这里是“复制归属”而不是“搬走”。
+                // 想从原机器移除，请把它拖到机器卡片外面（dragend 里处理）。
+                addPeripheralToMachine(machineName, slotId, payload.peripheral, payload.dragKind).then(function (ok) {
+                    if (ok) {
+                        toast(t('machinePeripheralShared', { name: payload.peripheral, machine: machineName }), 'info');
+                    }
                 });
                 return;
             }
@@ -1180,6 +1174,19 @@
         });
         el('editorSaveBtn').addEventListener('click', saveEditor);
         el('editorDeleteBtn').addEventListener('click', deleteEditor);
+        // 编辑器里按 Enter 直接提交（1.6.9）：例如「新建机器类型」填好名字回车即可保存。
+        // 排除容器管理里的资源搜索框（#toolResource，它自己有“放入/取出”按钮）
+        // 与勾选框/单选框（Enter 对它们没有“提交”的含义）。
+        el('editorBody').addEventListener('keydown', function (event) {
+            if (event.key !== 'Enter' && event.keyCode !== 13) return;
+            const target = event.target;
+            if (!target || String(target.tagName || '').toUpperCase() !== 'INPUT') return;
+            if (target.id === 'toolResource') return;
+            const type = String(target.type || 'text').toLowerCase();
+            if (type === 'checkbox' || type === 'radio') return;
+            event.preventDefault();
+            saveEditor();
+        });
         el('promptConfirmBtn').addEventListener('click', confirmPrompt);
         // 数量框支持四则运算：边输入边显示求解结果
         el('promptInput').addEventListener('input', updatePromptPreview);

@@ -266,14 +266,6 @@
         return used;
     }
 
-    function machineUsedSignalNames() {
-        const used = {};
-        Array.from(stores.machines.values()).forEach(function (machine) {
-            asArray(machine.signals).forEach(function (name) { used[String(name)] = true; });
-        });
-        return used;
-    }
-
     function peripheralUnassignedChips(block) {
         const blockName = String(block.name || '');
         // 定义以 stores.containers / stores.signals 为准：乐观更新后界面立刻正确，
@@ -306,14 +298,19 @@
                 '" data-container-kind="' + info[0] + '" title="' + escapeHtml(t('createDefinition')) +
                 '"><i class="fa fa-plus"></i></button></span>');
         });
-        if (block.kinds.indexOf('redstone_relay') >= 0 && signalDefs.length === 0) {
-            chips.push('<span class="chip unassigned" draggable="true"' +
+        // 红石中继器：**始终**给一个可拖拽的“信号”芯片（拖到机器的红石信号卡片 = 让那台机器用它）。
+        // 1.6.9：信号不再需要命名/定义，所以拖拽源不该因为“已经有定义”而消失 ——
+        // 同一个中继器可以给多台机器用（从一台机器的信号卡片拖到另一台 = 复制归属）。
+        // 若存在旧的信号定义（自定义名字），点芯片仍然能编辑/删除它。
+        if (block.kinds.indexOf('redstone_relay') >= 0) {
+            const legacy = signalDefs[0] || null;
+            // 有旧定义时可点击编辑（def-chip 的样式）；没有定义时就是一个纯拖拽源。
+            chips.push('<span class="chip' + (legacy ? ' def-chip' : '') + ' def-signal" draggable="true"' +
                 ' data-drag-peripheral="' + escapeHtml(block.name) + '" data-drag-kind="signal"' +
-                ' title="' + escapeHtml(t('unassignedHint')) + '">' +
-                '<i class="fa fa-bolt"></i> ' + escapeHtml(t('signal')) +
-                ' <span class="muted">' + escapeHtml(t('unassigned')) + '</span>' +
-                '<button class="btn-pixel" data-new-signal="' + escapeHtml(block.name) + '" title="' +
-                escapeHtml(t('createDefinition')) + '"><i class="fa fa-plus"></i></button></span>');
+                (legacy ? ' data-edit-signal="' + escapeHtml(legacy.name) + '"' : '') +
+                ' title="' + escapeHtml(t('signalChipHint')) + '">' +
+                '<i class="fa fa-bolt"></i> ' + escapeHtml(block.name) +
+                ' <span class="muted">' + escapeHtml(t('signal')) + '</span></span>');
         }
         // 2) 有定义、但谁也不引用（output 容器 / 没进机器的 interaction 容器）：不能让它从界面上消失
         defs.forEach(function (def) {
@@ -330,10 +327,9 @@
                 escapeHtml(def.name) + ' <span class="muted">' + escapeHtml(roleLabel(def.role)) + '</span>' +
                 '</span>');
         });
-        // 3) 没被任何机器引用的信号定义也一样要能看到、能编辑（否则建了就找不到了）
-        const usedSignals = machineUsedSignalNames();
-        signalDefs.forEach(function (def) {
-            if (usedSignals[String(def.name)]) return;
+        // 3) 多余的旧信号定义（同一个中继器只该有一个定义）：万一旧配置里留了多个，
+        //    仍然显示出来以便编辑/删除（第一个已经在上面的可拖拽芯片里了）。
+        signalDefs.slice(1).forEach(function (def) {
             chips.push('<span class="chip def-chip def-signal" data-edit-signal="' + escapeHtml(def.name) +
                 '" title="' + escapeHtml(t('clickToEdit')) + '">' +
                 '<i class="fa fa-bolt"></i> ' + escapeHtml(def.name) + '</span>');

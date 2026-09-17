@@ -9,7 +9,7 @@
     // ===================== 常量 =====================
     // 前端版本号：必须与后端 backend/IFMMaster.lua 里的 IFM_VERSION 完全一致。
     // 连上服务端后会比对 status.version，不一致就弹警告并主动停止连接（见 ifm-net.js）。
-    const IFM_CLIENT_VERSION = '1.6.8';
+    const IFM_CLIENT_VERSION = '1.6.9';
     const DEFAULT_RELAY = 'wss://itty.ws/c/';
     const API_BASE = 'https://blocksitems.com/api/v1';
     const API_ORIGIN = 'https://blocksitems.com';
@@ -243,6 +243,9 @@
             versionMismatchShort: '版本不一致',
             transferWorkers: '从节点搬运：{n} 台 · 在飞 {pending}',
             transferNone: '搬运：本机执行',
+            signalChipHint: '拖到机器的红石信号卡片 = 让那台机器使用这个中继器（同一个中继器可以给多台机器用）',
+            signalNameHint: '红石信号不需要命名：名称就是中继器外设名，同一个中继器可以给多台机器用',
+            machinePeripheralShared: '{name} 现在也被 {machine} 使用（原来那台机器保持不变）',
             transferHint: 'IFMWorker：频道 {channel} · 完成 {done} · 失败 {failed}（明细见「诊断」）',
             transferScanHint: '容器代扫：结果缓存 {cached} 个 · worker 代读 {containers} 个容器 · 本机兜底 {localOnly} 次 · worker 看不到容器 {blind} 次 · 暂停剩余 {paused}s',
             transferHintNone: '没有 IFMWorker：搬运由本机执行',
@@ -391,6 +394,9 @@
             versionMismatchShort: 'Version mismatch',
             transferWorkers: 'worker moves: {n} worker(s) · {pending} in flight',
             transferNone: 'moves: run on the server',
+            signalChipHint: 'Drag onto a machine redstone signal slot to let that machine use this relay (one relay can serve several machines)',
+            signalNameHint: 'Redstone signals need no name: the name is the relay peripheral, and one relay can serve several machines',
+            machinePeripheralShared: '{name} is now also used by {machine} (the original machine keeps it)',
             transferHint: 'IFMWorker: channel {channel} · done {done} · failed {failed} (see Diagnose)',
             transferScanHint: 'container scan: cached {cached} · delegated {containers} container(s) · local fallback {localOnly} · worker saw nothing {blind} · pause left {paused}s',
             transferHintNone: 'No IFMWorker: IFM moves items locally',

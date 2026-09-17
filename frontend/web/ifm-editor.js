@@ -530,8 +530,9 @@
     };
 
     function buildSignalEditor(data, name) {
-        return nameRow(name || data.name) +
-            fieldRow(t('peripheral'), selectHtml('fldPeripheral', peripheralOptions(['redstone_relay']), data.peripheral));
+        // 红石信号不需要命名（1.6.9）：名称就是中继器外设名，同一个中继器可以给多台机器用。
+        return fieldRow(t('peripheral'), selectHtml('fldPeripheral', peripheralOptions(['redstone_relay']), data.peripheral)) +
+            '<div class="muted">' + escapeHtml(t('signalNameHint')) + '</div>';
     }
 
     function buildMachineTypeEditor(data, name) {
@@ -635,6 +636,10 @@
         if (kind === 'containers' && !isNamedContainerRole()) {
             requested = (editorState.locked && editorState.locked.peripheral) || currentName || '';
         }
+        // 红石信号不需要命名（1.6.9）：名字就是中继器外设名（同一个中继器只保留一个定义）
+        if (kind === 'signals') {
+            requested = readValue('fldPeripheral') || currentName || '';
+        }
         // 机器 / 流程没有名称字段：编辑既有定义时沿用原名，新建时按类型/产物自动推导
         if (!requested && currentName) requested = currentName;
         if (!requested) requested = autoDefinitionName(kind);
@@ -642,7 +647,8 @@
             toast(t('name') + ' ?', 'error');
             return;
         }
-        const name = uniqueDefinitionName(kind, requested, currentName);
+        // 信号名恒等于外设名：不做“重名自动加序号”（服务端会把同一中继器的旧定义顶掉）
+        const name = kind === 'signals' ? requested : uniqueDefinitionName(kind, requested, currentName);
         if (name !== requested) {
             const field = el('fldName');
             if (field) field.value = name;
