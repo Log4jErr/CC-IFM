@@ -165,7 +165,7 @@
         if (!before) return;
         stores.deliveries.delete(key);          // 乐观移除，失败再放回
         renderSend();
-        sendRequest('delete_delivery', { id: id }).then(function (response) {
+        sendRequest('delete_delivery', { deliveryId: id }).then(function (response) {
             const result = response.result || {};
             if (result.error) {
                 stores.deliveries.set(key, before);

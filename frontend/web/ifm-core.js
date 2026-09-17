@@ -9,7 +9,7 @@
     // ===================== 常量 =====================
     // 前端版本号：必须与后端 backend/IFMMaster.lua 里的 IFM_VERSION 完全一致。
     // 连上服务端后会比对 status.version，不一致就弹警告并主动停止连接（见 ifm-net.js）。
-    const IFM_CLIENT_VERSION = '1.6.7';
+    const IFM_CLIENT_VERSION = '1.6.8';
     const DEFAULT_RELAY = 'wss://itty.ws/c/';
     const API_BASE = 'https://blocksitems.com/api/v1';
     const API_ORIGIN = 'https://blocksitems.com';
@@ -241,8 +241,8 @@
             versionServer: '服务端 v{server}',
             versionMismatch: '版本不一致：前端 v{client} / 服务端 v{server}。已停止连接，请把服务端（backend/IFMMaster.lua）与网页（frontend/）更新到同一版本后重试。',
             versionMismatchShort: '版本不一致',
-            transferWorkers: '卸载搬运 {n} 台（在飞 {pending}）',
-            transferNone: '本机搬运',
+            transferWorkers: '从节点搬运：{n} 台 · 在飞 {pending}',
+            transferNone: '搬运：本机执行',
             transferHint: 'IFMWorker：频道 {channel} · 完成 {done} · 失败 {failed}（明细见「诊断」）',
             transferScanHint: '容器代扫：结果缓存 {cached} 个 · worker 代读 {containers} 个容器 · 本机兜底 {localOnly} 次 · worker 看不到容器 {blind} 次 · 暂停剩余 {paused}s',
             transferHintNone: '没有 IFMWorker：搬运由本机执行',
@@ -389,8 +389,8 @@
             versionServer: 'server v{server}',
             versionMismatch: 'Version mismatch: frontend v{client} / server v{server}. The connection has been stopped; update the server (backend/IFMMaster.lua) and the page (frontend/) to the same version and retry.',
             versionMismatchShort: 'Version mismatch',
-            transferWorkers: 'transfer workers {n} (in flight {pending})',
-            transferNone: 'local moves',
+            transferWorkers: 'worker moves: {n} worker(s) · {pending} in flight',
+            transferNone: 'moves: run on the server',
             transferHint: 'IFMWorker: channel {channel} · done {done} · failed {failed} (see Diagnose)',
             transferScanHint: 'container scan: cached {cached} · delegated {containers} container(s) · local fallback {localOnly} · worker saw nothing {blind} · pause left {paused}s',
             transferHintNone: 'No IFMWorker: IFM moves items locally',

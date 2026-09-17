@@ -16,7 +16,7 @@ local args = { ... }
 --- 版本号：前端 web/ifm-core.js 里的 IFM_CLIENT_VERSION 必须与此保持一致。
 --- 网页连上后会比对两边的版本号，不一致时弹出警告并主动停止连接，
 --- 避免“新前端 + 旧后端”（或反过来）产生难以定位的怪问题。
-local IFM_VERSION = "1.6.7"
+local IFM_VERSION = "1.6.8"
 
 local DEFAULT_RELAY = "wss://itty.ws/c/"
 
@@ -1160,9 +1160,13 @@ local function handleRequest(payload)
         end
         return { success = true, state = state, key = key, info = "query sent to IFMWorker; see status.transfer.lastQuery" }
     elseif action == "delete_delivery" then
-        cache:removeDelivery(tonumber(payload.id))
+        --- 发货 id 用 deliveryId 字段传：请求里顶层的 id 是**请求关联号**（响应要靠它配对），
+        --- 早先前端把发货 id 也写成 id，把关联号覆盖掉 → 响应回来了网页却等不到（1.6.7 修）。
+        --- 这里仍然接受旧的 id 字段（老前端/缓存的页面），保证兼容。
+        local deliveryId = tonumber(payload.deliveryId or payload.id)
+        local removed = cache:removeDelivery(deliveryId)
         cache:flush()
-        return { success = true }
+        return { success = true, removed = removed and true or false, id = deliveryId }
     end
     return { error = "\\u672A\\u77E5\\u7684 action\\uFF1A" .. tostring(action) }
 end

@@ -48,7 +48,11 @@
                 return;
             }
             const id = ++requestSeq;
-            const payload = Object.assign({ id: id, action: action }, data || {});
+            // 注意顺序：请求关联 id 与 action **必须最后写入**，否则 payload 里同名的字段
+            // （例如 delete_delivery 的 { id = 发货 id }）会把关联 id 覆盖掉 ——
+            // 响应确实回来了，但网页按错误的 id 找不到等待中的请求，只能干等 30 秒超时
+            //（用户实测：“request delete_delivery got no response in 30s”就是这么来的）。
+            const payload = Object.assign({}, data || {}, { id: id, action: action });
             const finish = function () {
                 pendingCount = Math.max(0, pendingCount - 1);
                 updatePendingInfo();
