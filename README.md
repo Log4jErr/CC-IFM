@@ -69,7 +69,7 @@ ifm/IFMWorker.lua
 
 ## 什么原理
 - 浏览器与服务端通过 **itty-sockets** 中转的 WebSocket 互相传递消息
-- 前端图标和资源信息按照三个方案获取：本地 `frontend/icon-exports/` 导出（质量最佳，但是需要根据Minecraft示例专门导出）→ blocksitems.com 接口（质量很好，不过有些物品缺失，并且不支持国际化）→ 注册名转换（没有图标。你可以按右上角翻译按钮启用Bergamot翻译器以获取你的语言的物品名称，质量较差）。**注意**：导出要完整——`icon-exports-metadata/<lang>.json` 里登记了、但 `icon-exports/` 里没有对应图片的物品，会自动退回 blocksitems 接口、再退到名称字形（仓库里自带的这份导出并不完整：约 18k 条元数据、约 4.7k 张图）；想要完整图标请用导出工具重新导出一份。
+- 前端图标和资源信息按照三个方案获取：本地 `frontend/icon-exports/` 导出（质量最佳，但是需要根据Minecraft示例专门导出）→ blocksitems.com 接口（质量很好，不过有些物品缺失，并且不支持国际化）→ 注册名转换（没有图标。你可以按右上角翻译按钮启用Bergamot翻译器以获取你的语言的物品名称，质量较差）。
 - 拼音搜索库借助 `pinyinlite` 提供
 - 前端部署依赖 `Github Pages`
 
@@ -87,7 +87,7 @@ ifm/IFMMaster --room <房间号>
 shell.run("bg", "ifm/IFMWorker.lua")
 ```
 - 如果修改后端源码，重新编译为单文件产物：`python backend/build.py`，产物是 `backend/ifm_bundle.lua`。
-- 主控的**数据文件**放在安装目录下的 `ifm/data/` 里：`data/config.json`（容器/机器/流程等定义）与 `data/cache.json`（运行态缓存），与代码（`ifm/modules/`）分开。从 1.6.16 及更早版本升级时，主控启动会**自动**把旧位置里的 config/cache 搬到 `data/`（只搬一次，搬完删掉老文件）。
+- 主控的数据文件放在安装目录下的 `ifm/data/` 里，从节点自身不保存数据。
 
 ## 限制
 - 计算机所在区块必须保持加载，否则脚本会停摆（记得准备区块加载手段）。
@@ -124,101 +124,105 @@ shell.run("bg", "ifm/IFMWorker.lua")
 # CC-IFM Integrated Factory Manager
 
 ## What is that?
-- A Minecraft **CC:Tweaked** script that auto-crafts through *process definitions*, much like AE2 autocrafting, Integrated Dynamics or Super Factory Manager. Once everything is set up you just request the target product and watch materials flow through your machines, being crafted step by step until the requested items show up.
-- The same factory can be browsed and managed from a web browser — no Minecraft client needed.
+- A Minecraft **CC:Tweaked** script. It auto-crafts through *process definitions*, much like AE2, Integrated Dynamics or Super Factory Manager. Once everything is set up you just click the target product and watch materials flow through your machines, being crafted step by step until the requested items show up.
+- The same factory can be browsed and managed from a web browser, with no Minecraft client needed.
 
 ## Requirements
-- CC:Tweaked installed on the Minecraft server (IFM runs on a CC:Tweaked computer, obviously).
-- A proper **wired network**: every computer, storage container (chest, barrel, drawer, fluid tank, …) and machine must be attached to a **wired modem** (wired only — CC:Tweaked ships both cased and full-block wired modems, either works), and all wired modems must be joined with networking cable.
-- At least one computer in the IFM network; item/fluid scheduling is expensive, so add as many computers as you like to speed it up. IFM is distributed: one computer is the **master** (`IFMMaster`), the rest are **workers** (`IFMWorker`). Running without a worker is possible but not recommended unless you enjoy snail speed.
+- CC:Tweaked installed on the Minecraft server. (Needless to say, IFM runs on a CC:Tweaked computer.)
+- A correct network topology: you must connect every part of the factory with cable. Concretely, every computer / storage container (chest, barrel, drawers or other storage from other mods, any fluid tank) / machine must be attached to a **wired modem** (wireless will not do; CC:Tweaked ships both cased and full-block wired modems, either works), and all wired modems must be joined with networking cable.
+- At least one computer in the whole IFM system. Item/fluid scheduling is expensive, so add as many computers as you like to speed it up. IFM is distributed: one computer is the **master** (`IFMMaster`), the others are **workers** (`IFMWorker`). Running without workers is possible but not recommended unless you can live with snail speed.
 
 ## Installation
 - Run this single command on **every** computer of the IFM network:
 ```
 wget run https://raw.githubusercontent.com/Log4jErr/CC-IFM/main/backend/ifm_bundle.lua
 ```
-- When a new version is released, just run the same command again to update.
+- When a new version is released, run the same command again to update.
+- If GitHub is unreachable from your server, download `ifm_bundle.lua` separately, drag it onto the computer and run it to install.
+- The bundle installs into the `ifm/` directory next to it.
 
-- The bundle unpacks into an **`ifm/` directory next to it**: `ifm/IFMMaster.lua` (server entry), `ifm/IFMWorker.lua` (worker entry) and `ifm/modules/` (code modules). The bundle file itself is deleted afterwards.
 ## Booting
-- Start the master script on one of the computers (warning: never run the master on two computers of the same wired network, the result is unpredictable):
+- Run the master script on one of the computers (warning: never run the master on two computers of the same wired network, the result is unpredictable):
 ```
-IFMMaster.lua
+ifm/IFMMaster.lua
 ```
-After it starts, the room name is printed on screen — note it down, it is the credential your browser uses to connect.
-- (Advanced) The room name is generated randomly; pass `--room <room name>` to choose your own.
-- (Optional) Start worker scripts on the remaining computers:
+After it starts, the room name is shown on screen - note it down, it is the credential your browser uses to connect.
+- (Advanced) The room name is generated randomly; pass `--room <room>` to choose your own.
+- (Optional) Start the worker script on the remaining computers:
 ```
-IFMWorker.lua
+ifm/IFMWorker.lua
 ```
-Master and workers discover each other automatically, no further action needed.
-- **Master and workers must run exactly the same version**: when the version strings differ they refuse to run moves/queries for each other (the master stops dispatching, the worker refuses and logs it, and the worker card is flagged in the web UI). Update every computer together.
+Master and workers discover each other automatically, so no further action is needed.
+- **Master and workers must run exactly the same version**: when the version strings differ they refuse to run moves/queries for each other (the master stops dispatching, the worker refuses and prints a hint, and the worker card is flagged in the web UI). Update every computer together.
 
 ## Web terminal
-- The web client is a static page: deploy `frontend/` to GitHub Pages (or any static host) and open it, or serve it locally for development:
-```
-cd frontend
-python serve.py            # http://localhost:8000/index.html
-```
-- Enter the room name in the page to connect to your in-game IFM system.
+- Open [this page](https://log4jerr.github.io/CC-IFM/frontend/) in your browser - that is the web terminal.
+- Enter the room name in the web terminal to connect to your in-game IFM system.
+
+For development you can also serve the frontend locally: `cd frontend` then `python serve.py` (opens http://localhost:8000/index.html).
 
 ## Features
 - **Stock browsing**: browse all stored items/fluids, with sorting and search (pinyin search supported).
 - **Delivery**: mark a container as an output container, then pick items/fluids and amounts to move them there.
-- **Storage optimisation**: automatically merges and swaps items between storage containers to free space. The compaction algorithm moves stacks according to slot capacity and stack size, e.g. moving large amounts into high-capacity slots (drawers).
-- **Unloading**: mark a container as an input container, and anything inside is taken out and moved into storage automatically.
-- **General-purpose auto-crafting**: the most complex part — see the next section.
-
+- **Storage optimisation**: automatically merges and swaps items between storage containers to free space. The algorithm moves stacks according to slot capacity and stack size, e.g. moving large amounts into high-capacity slots (drawers).
+- **Unloading**: mark a container as an input container; anything inside it is taken out and moved into storage automatically.
+- **General-purpose auto-crafting**: the most complex part - it cannot be described in one sentence, see the next section.
 
 ## Auto-crafting system
-- Just like AE2 patterns, IFM auto-crafting is driven by your **machine** and **process** definitions.
-- First define a **machine type**. This abstraction layer exists for parallelisation: if you own several brewing stands that all can do brewing recipes, create and name a machine type such as “Brewing” and let IFM use them.
-- Next create a **machine** under that machine type; a machine is the smallest working unit. It needs input container(s), output container(s) and an optional redstone signal (IFM can drive a redstone relay to send or wait for signals, which is handy in some setups). For the brewing stand example, add it both as input and output container (you feed materials into it and pull products straight out of it). Some machines have several input/output containers (e.g. Create's Mechanical Arm assembly needs materials inserted into both the arm and the depot below it — mark both as input containers).
-- Machines have a few more parameters, e.g. **parallelism** is how many crafting jobs the machine accepts at the same time. The default 1 means the machine must finish a job (products fully extracted) before new materials are inserted. Some machines can handle several jobs at once — e.g. a hopper feeding a composter can accept multiple stacks, so raise the value there. (AE2 players will recognise this as Pattern Provider “block until products return”.)
-- One machine type can contain many machines; when crafting with that type, any idle machine of the type can be used.
-- Next create a **process**: the complete set of steps that makes one craft on a machine. Say we want 3× Awkward Potion from 1× Nether Wart + 3× Water Bottle — that is a process. For the potion example, link the process to the brewing machine and set the inserted materials (1× Nether Wart + 3× Water Bottle) and the extracted products (3× Awkward Potion). When a machine has multiple input/output containers and you need to control which container receives materials, set the **machine index**; when you need to control which slot inside that container receives them, set the **slot index** (many Minecraft logistics/autocrafting mods cannot do slot-precise I/O at all).
-- Product extraction is smart: IFM only extracts the items you specify and ignores everything else. So for the brewing example you do not need redstone gating like vanilla auto-brewing — and you can be even more precise about which container and which slot to extract from.
-- A process runs simply: materials are inserted in order, then products are extracted in order. If materials cannot be inserted, the process waits until they can; if products cannot be extracted, it waits until they can.
-- Processes also have a **max multiplier**: to craft more than one item, IFM multiplies the input materials by that factor, inserts them together and expects the products to be multiplied as well. For example, to craft Snow Blocks in the vanilla Crafter (1× Snowball into slots 1..4 → 1× Snow Block), set the multiplier to 16 (snowballs stack to 16 in the crafter).
-- Besides item/fluid I/O, processes support other steps: a timed wait holds the process for at least that long when reached in order; redstone steps need a redstone relay and can wait for a signal or emit one (obviously you can encode a process that plays redstone music).
+- Just like AE2 patterns, IFM auto-crafting needs **machine** and **process** definitions.
+- First create a **machine type**. That abstraction layer exists so machines can work in parallel (if you own several brewing stands that can all brew, create and name a machine type such as "Brewing" and let IFM use your stands).
+- Next create a **machine** under that machine type; a machine is the smallest working unit. It needs input container(s), output container(s) and an optional redstone signal (IFM can use a redstone relay to send or wait for signals, which is handy at times). For the brewing stand example, add the stand both as input and output container (you insert materials into it and pull products straight out of it). Some machines have several input/output containers (e.g. Create's Mechanical Arm assembly needs materials inserted into both the arm and the depot below it - mark both as input containers).
+- Machines have a few more parameters, e.g. **parallel signals** is how many crafting jobs the machine accepts at the same time. The default 1 means the machine must have inserted a job and fully extracted its products before new materials may be inserted. Some machines handle several jobs at once - e.g. a hopper feeding a composter can accept multiple stacks, so raise the value there. (AE2 players will recognise this as a Pattern Provider set to "block until products return".)
+- One machine type can contain many machines; when crafting with that type, any idle machine of that type can be used.
+- Next create a **process**: the complete set of steps that performs one craft on a machine. Say we want 3x Awkward Potion from 1x Nether Wart + 3x Water Bottle - make that a process. For the potion example, link the process to the brewing machine and set the inserted materials (1x Nether Wart + 3x Water Bottle) and the extracted products (3x Awkward Potion). When a machine has several input/output containers and you need to control which container receives the materials, set the **machine index**; when you need to control which slot inside that container receives them, set the **slot index**. (Most Minecraft logistics/autocrafting mods cannot do slot-precise I/O at all.)
+- Product extraction is smart: IFM only extracts the items you specify and ignores everything else. So the brewing example needs no redstone gating like vanilla auto-brewing - and you can be even more precise about which container and which slot to extract from.
+- A process runs simply: materials are inserted in order, then products are extracted in order. If materials cannot be inserted, the process waits until they can; if products cannot be extracted, it also waits until they can.
+- Processes also have a **max multiplier**: to craft more than one item, IFM multiplies the input materials by that factor, inserts them together and expects the multiplied products. For example, to craft Snow Blocks in the vanilla Crafter (1x Snowball into slots 1..4 -> 1x Snow Block), set the multiplier to 16 (snowballs stack to 16 in the crafter).
+- Besides item/fluid I/O, processes support other steps: a timed wait holds the process for at least that long when reached in order; redstone steps need a redstone relay and can wait for a signal or emit one. (Obviously you can encode a process that plays redstone music.)
 - **Ignore NBT**: you can ignore item NBT (off by default, which requires NBT to match exactly).
-- Products also have **minimum** and **maximum** counts for chance-based recipes whose output amount varies. Distribution counts are computed from the maximum (IFM optimistically assumes it can get all products, and retries to craft the remainder if it cannot), and product extraction also uses the maximum (so it never over-extracts). The minimum is used to decide whether an extraction is complete, i.e. the worst case.
+- Products' **minimum** and **maximum** counts target chance-based recipes whose output amount is uncertain. Distribution counts are computed from the maximum (IFM optimistically assumes it can get all products, and retries to craft the remainder if it cannot), and product extraction also uses the maximum (so it never over-extracts). The minimum is used to decide whether an extraction is complete, i.e. the worst case.
 
-## Theorum
+## How it works
 - Browser and script exchange messages over a WebSocket relayed by **itty-sockets**.
-- Icons and resource info are fetched in three fallback tiers: local `frontend/icon-exports/` export (best quality, but must be exported from your own Minecraft instance) → blocksitems.com API (good quality, but some items are missing and it is not internationalised) → registry name conversion (no icon; press the translate button top-right to enable the **Bergamot** translator and get names in your own language — lower quality). **Note**: the export must be complete - items listed in `icon-exports-metadata/<lang>.json` whose image is missing from `icon-exports/` (the copy in this repo is partial: ~18k entries, ~4.7k images) fall back to the blocksitems.com API and then to the name glyph; re-export with the tool for full coverage.
+- Icons and resource info are fetched in three fallback tiers: local `frontend/icon-exports/` export (best quality, but must be exported from your own Minecraft instance) -> blocksitems.com API (good quality, but some items are missing and it is not internationalised) -> registry name conversion (no icon; press the translate button top-right to enable the **Bergamot** translator and get item names in your own language, lower quality).
 - Pinyin search is provided by the `pinyinlite` library.
-- Frontend deployment relies on GitHub Pages.
+- Frontend deployment relies on `Github Pages`.
 
-## Startup
+## Advanced
 - Auto-start the master (create a `startup.lua` with):
 ```lua
-shell.run("bg", "IFMMaster.lua")
+shell.run("bg", "ifm/IFMMaster.lua")
 ```
 - Custom room name:
 ```
-IFMMaster --room <room name>
+ifm/IFMMaster --room <room>
 ```
 - Auto-start a worker (create a `startup.lua` with):
 ```lua
-shell.run("bg", "IFMWorker.lua")
+shell.run("bg", "ifm/IFMWorker.lua")
 ```
-- Rebuild the backend after changing its source: `python backend/build.py` (writes `backend/ifm_bundle.lua`).
-- Master **data files** live in `<install dir>/data/`: `data/config.json` (container / machine / process definitions) and `data/cache.json` (runtime cache). When upgrading from 1.6.15 or older, the master migrates the old files out of `ifm/` automatically on the next start (one-time, the old file is then deleted).
-- Container scan intervals live in the web **Settings** panel: the storage container one defaults to **8000 ms** and means *the minimum interval between two scans of the same container* (moves/sorting force a fresh read when they need current data); the input container one defaults to **1000 ms** and is the pace of the input-container drain scan. Changes apply immediately and are stored in `config.json`.
+- After changing the backend source, rebuild it into a single file: `python backend/build.py` (writes `backend/ifm_bundle.lua`).
+- The master's data files live in `ifm/data/` inside the install directory; workers keep no data of their own.
+
+## Limitations
+- The chunk the computer is in must stay loaded, otherwise the script stalls (get a chunk loader).
+- Peripherals travel at most 256 blocks over wired cable, so do not exceed that length or they cannot be found.
+- The public relay `wss://itty.ws/c/` cannot be reached in some regions; host your own itty-sockets server and point to it with `--relay`.
+- Container reads are blocking (each container read takes about 1 tick), so large factories scan slowly - raise the scan intervals or add more workers.
 
 ## Tools
-- `backend/tools/` holds a few extra CC scripts that provide some handy utilities. Each of them runs **standalone** (they do not depend on IFM itself and are not part of the bundle) and prints ASCII English only, because the CC terminal font has no CJK glyphs and non-ASCII text would show up as garbage.
+- `backend/tools/` holds a few extra CC scripts that provide some handy utilities. Each of them runs standalone.
 
 ### netsync
-- You have one master computer plus a pile of workers, and IFM just released a new version — updating them one by one is a pain. The `netserver` / `netsync` pair syncs files automatically.
-- **What gets synced is decided by two files** placed **next to the `netserver` script**: `syncinclude.txt` (one path per line to sync; a directory must end with `/` and is then synced recursively) and `syncignore.txt` (one path per line to ignore; a directory may have a trailing `/` or not). Both accept **absolute paths** (leading `/`) and **relative paths** (relative to the script directory); lines starting with `#` are comments and empty lines are ignored. If either file is missing, an empty one is created and netserver errors out — fill them in and start it again.
-- Client-side layout = the server-side absolute path without the leading `/`: with netserver in the root and `ifm/` in `syncinclude.txt`, clients get `/ifm/IFMMaster.lua`, `/ifm/modules/*.lua`, ... New files are picked up automatically (the list is re-scanned on every request), so no restart is needed.
-- `netsync` is started with a name, downloads all files from that `netserver` to the local computer, and reboots the computer when the download is done.
-- `netserver` keeps a version number: after you change the files, start it with `netserver --update <name>` to bump the version.
-- `netsync` only downloads when the server has a newer version; otherwise it just keeps waiting.
-- If the include list is empty or none of its paths exist: netserver logs "nothing to distribute" and the client logs "server returned 0 files" and does **not** treat it as a successful sync (nothing is written, the version is not recorded and the computer is not rebooted). Fix `syncinclude.txt`, then run `netserver --update <name>` again.
-- To auto-update IFM with this, install `netserver` on the master and `netsync` on the workers, and start `netsync` together with `IFMWorker` at boot (using `shell.run` with `bg` or `fg`). Whenever IFM updates: install the new version on the master first, then run `netserver --update <name>` on the master.
+- You have one master and a pile of workers, and IFM just released a new version - updating them one by one is a pain. The `netserver` and `netsync` scripts are used as a pair to sync files automatically.
+- `netserver` and `netsync` are started with a name; a `netserver` syncs its files to the `netsync`s with the same name.
+- Two config files next to the `netserver` script decide what gets synced: `syncinclude.txt` (one path per line to sync; a directory ends with `/` and its contents are synced recursively) and `syncignore.txt` (one path per line to ignore). Both accept absolute paths (leading `/`) and relative paths (relative to the directory of the `netserver` script); lines starting with `#` are comments, empty lines are ignored.
+- `netsync` writes files with its own script directory as the root.
+- `netserver` needs the two config files, `syncinclude.txt` and `syncignore.txt`: the former lists the files or directories to sync (a directory path ends with `/`), the latter lists the paths to exclude.
+- `netsync` only downloads when `netserver` has a newer version; otherwise it keeps waiting.
+- Every time you change files and want them synced, start `netserver` with `netserver --update name` to bump the version.
+- `--update` may be omitted, in which case `netserver` does not bump the version. In one sentence: add `--update` when the files to sync changed, omit it when they did not.
+- To auto-update IFM with this, install `netserver` on the master and set the sync directory to `ifm/`, install `netsync` on the workers, and you can auto-start `netsync` together with `IFMWorker` at boot (via `shell.run` `bg` or `fg`). Whenever IFM updates: install the new version on the master first, then run `netserver --update <name>` on the master. Sounds like a hassle? Do it once and benefit forever.
 
 ### crafter
 - You want IFM auto-crafting, but the vanilla Crafter is slow (and laggy!) — use a turtle as a batch crafter instead.
@@ -229,8 +233,3 @@ shell.run("bg", "IFMWorker.lua")
 - The container below is optional; without it the turtle drops the products as items. If there are too many products for the turtle's inventory they are dropped as items as well (e.g. crafting 64× Flint and Steel from 64× Iron Ingot + 64× Flint: the turtle only holds 16, so 48 are dropped).
 - Unlike the Crafter (one craft per redstone pulse), the turtle crafts everything in one go. (Or, on older Minecraft versions without the Crafter, this turtle is probably your only option.)
 - To control it fully from IFM, put a redstone relay next to the turtle and make the process emit a redstone pulse after all materials have been inserted.
-
-## Limitation
-- CC:Tweaked keeps a computer running only while its chunk is loaded — use a chunk loader.
-- The public relay `wss://itty.ws/c/` cannot be reached in some regions; host your own itty-sockets server and point to it with `--relay`.
-- Container reads are blocking (about one server tick per container on wired networks), so large factories get slow while scanning — raise the scan intervals, or add more workers.
