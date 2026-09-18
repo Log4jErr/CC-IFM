@@ -1,0 +1,28 @@
+ASCII 检查：通过（15 个 Lua 文件，代码与字符串均为 ASCII）
+保留字检查：通过（15 个 Lua 文件，没有把保留字当字段名/表键）
+方法遮蔽检查：通过（15 个 Lua 文件，没有实例字段覆盖类方法）
+Lua 语法检查：通过（luaparse，15 个文件）
+tools 检查：通过（3 个独立脚本，代码与字符串均为 ASCII）
+Lua 语法检查：通过（luaparse，3 个文件）
+Lua 语法检查：通过（luaparse，15 个文件）
+已生成单文件产物：C:\Users\XianTou\Desktop\cctscripts\IFM\backend\ifm_bundle.lua
+内嵌文件 15 个（含主入口）：
+  - modules/cache.lua (5709 字节)
+  - modules/containers.lua (57589 字节)
+  - modules/diagnose.lua (28718 字节)
+  - modules/filter.lua (3970 字节)
+  - modules/jsonfile.lua (1865 字节)
+  - modules/modems.lua (1916 字节)
+  - modules/peripherals.lua (3347 字节)
+  - modules/protocol.lua (19602 字节)
+  - modules/recipe.lua (91226 字节)
+  - modules/scheduler.lua (1757 字节)
+  - modules/store.lua (31338 字节)
+  - modules/transfer.lua (46917 字节)
+  - modules/util.lua (2577 字节)
+  - IFMMaster.lua (46770 字节)
+  - IFMWorker.lua (26802 字节)
+注释剥离：源码 525791 字节 -> 370103 字节（省下 155688 字节，30%）
+产物总计 376659 字节（CC:T 默认磁盘 1MB，放得下）
+提示：产物只解压、不自启：运行后会在**同级创建 ifm/ 目录**，把 IFMMaster.lua / IFMWorker.lua 与 modules/*.lua 写进去，并删除产物自身；
+      然后手动运行 ifm/IFMMaster.lua [--room <房间号>] [--relay <中转地址前缀>] [--random-room] 启动服务端。
