@@ -293,6 +293,9 @@
     // 页面起来之后后台抓一次、建索引，抓完重画一次（那之前先用接口图标）。
     const ICON_EXPORTS_BASE = 'icon-exports/';
     const ICON_EXPORTS_META_DIR = 'icon-exports-metadata/';
+    // 部署时目录名不一定完全一致（导出工具 / 手工改名）：按顺序都试一遍，第一个能用的生效。
+    // 每个目录里都是 <lang>.json（如 zh.json）；找不到就继续下一个，全都不行才彻底降级。
+    const ICON_EXPORTS_META_DIRS = ['icon-exports-metadata/', 'icon-export-metadata/', 'icon-exports-metadata', 'icon-exports/'];
     const ICON_EXPORT_LANGS = ['zh', 'en'];
     let iconExportIndex = null;          // 当前展示用的索引（图标来源）
     let iconExportIndexLang = null;      // 这份索引是哪门语言的元数据（决定名字能不能用）
@@ -324,7 +327,9 @@
         const namespace = (colon >= 0 ? text.slice(0, colon) : 'minecraft').toLowerCase();
         const path = (colon >= 0 ? text.slice(colon + 1) : text).toLowerCase();
         if (!path) return null;
-        return namespace + '__' + path.replace(/\//g, '__') + '.png';
+        // 流体的导出文件名带 fluid__ 前缀（物品没有）：fluid__create_dragons_plus__magenta_dye.png
+        const prefix = (kind === 'fluid') ? 'fluid__' : '';
+        return prefix + namespace + '__' + path.replace(/\//g, '__') + '.png';
     }
 
     /// 语言顺序：当前界面语言优先，其次是其它语言（其它语言只用来拿图标）
@@ -334,16 +339,23 @@
     }
 
     // 导出的物品名只在**当前语言**下使用（名字与语言相关）；乱码（含 U+FFFD）一律不用
+    // 导出物品名：只用**当前语言**那份元数据里的名字（见 iconExportName 的语言检查）。
+    // 以前要求“必须含中文”才采用，结果 en.json 的名字和没汉化的模组名全被丢掉、
+    // 只能退回注册名去下划线 —— 现在只挡乱码（U+FFFD）。
     function iconExportUsableName(text) {
         const value = String(text || '').trim();
         if (!value || value.indexOf('\ufffd') >= 0) return '';
-        return /[\u3400-\u4dbf\u4e00-\u9fff]/.test(value) ? value : '';
+        return value;
     }
 
+    // components（NBT）比较用的键：**键顺序无关**，否则游戏侧 { "a":1, "b":2 } 与导出侧
+    // { "b":2, "a":1 } 会被当成两个不同的变体，NBT 物品就永远匹配不上它的专属图标。
     function iconExportComponentsKey(components) {
         if (!components || typeof components !== 'object') return '';
         try {
-            return JSON.stringify(components);
+            const sorted = {};
+            Object.keys(components).sort().forEach(function (key) { sorted[key] = components[key]; });
+            return JSON.stringify(sorted);
         } catch (err) {
             return '';
         }
@@ -401,32 +413,43 @@
                 return;
             }
             const code = order[position];
-            const url = ICON_EXPORTS_META_DIR + code + '.json';
             iconExportLoadingLang = code;
-            fetch(url)
-                .then(function (response) {
-                    if (!response.ok) throw new Error('HTTP ' + response.status);
-                    return response.json();
-                })
-                .then(function (body) {
-                    const meta = body && asArray(body.meta);
-                    if (meta.length === 0) throw new Error('元数据为空');
-                    const index = buildIconExportIndex(meta, code);
-                    iconExportLangCache[code] = { index: index };
-                    iconExportIndex = index;
-                    iconExportIndexLang = code;
+            // 目录名可能有多种写法（部署差异）：逐个试，找到第一个能用的就停
+            const tryDir = function (dirIndex) {
+                if (dirIndex >= ICON_EXPORTS_META_DIRS.length) {
+                    iconExportLangCache[code] = { failed: true };   // 这个语言彻底没有
                     iconExportLoadingLang = null;
-                    console.info('[IFM] icon-exports 元数据已加载：' + url + '（' + index.size + ' 个物品图标' +
-                        (code === wanted ? '，物品名也用这份' : '，只借图标：当前语言没有对应文件') + '）');
-                    ['resources', 'peripherals', 'processes', 'deliveries', 'machines'].forEach(markDirty);
-                    scheduleRender();
-                })
-                .catch(function (err) {
-                    iconExportLangCache[code] = { failed: true };   // 负缓存：不再反复请求
-                    iconExportLoadingLang = null;
-                    console.info('[IFM] icon-exports 元数据不可用（' + url + '：' + ((err && err.message) || err) + '）');
                     tryLanguage(position + 1);
-                });
+                    return;
+                }
+                const url = ICON_EXPORTS_META_DIRS[dirIndex] + code + '.json';
+                fetch(url)
+                    .then(function (response) {
+                        if (!response.ok) throw new Error('HTTP ' + response.status);
+                        return response.json();
+                    })
+                    .then(function (body) {
+                        const meta = body && asArray(body.meta);
+                        if (meta.length === 0) throw new Error('metadata is empty');
+                        const index = buildIconExportIndex(meta, code);
+                        iconExportLangCache[code] = { index: index };
+                        iconExportIndex = index;
+                        iconExportIndexLang = code;
+                        iconExportLoadingLang = null;
+                        console.info('[IFM] icon-exports 元数据已加载：' + url + '（' + index.size + ' 个物品图标' +
+                            (code === wanted ? '，物品名也用这份' : '，只借图标：当前语言没有对应文件') + '）');
+                        ['resources', 'peripherals', 'processes', 'deliveries', 'machines'].forEach(markDirty);
+                        scheduleRender();
+                    })
+                    .catch(function (err) {
+                        // 这个目录不行（没文件 / 不是 JSON）：换下一个候选目录；都没有才换语言。
+                        // 不写负缓存：candidate 还有机会成功，避免一次网络抖动就把整个语言判死。
+                        console.info('[IFM] icon-exports 元数据不可用（' + url + '：' +
+                            ((err && err.message) || err) + '），换下一个候选目录');
+                        tryDir(dirIndex + 1);
+                    });
+            };
+            tryDir(0);
         };
         tryLanguage(0);
     }
@@ -470,7 +493,7 @@
         // 只在“元数据已经加载成功”时才猜：这样没部署 icon-exports 的机器不会白刷一堆 404。
         if (iconExportIndex) {
             const guess = iconExportConventionalFile(kind, name);
-            if (guess && !iconExportFailedFiles.has(guess)) return guess;
+            if (guess && !iconExportFailedFiles.has(guess.toLowerCase())) return guess;
         }
         return null;
     }
@@ -485,7 +508,7 @@
 
     // 导出图片 404 时别反复请求（但**不**影响接口图标：那是另一层）
     function iconExportMarkFailed(file) {
-        if (file) iconExportFailedFiles.add(file);
+        if (file) iconExportFailedFiles.add(String(file).toLowerCase());
     }
 
     

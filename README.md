@@ -26,8 +26,8 @@ wget run https://raw.githubusercontent.com/Log4jErr/CC-IFM/main/backend/ifm_bund
 ```
 - 如果IFM有更新的版本，你可以重新运行这条命令以完成更新。
 - 如果服务器内无法访问Github，你可以单独下载ifm_bundle.lua，然后将此文件拖拽上传至计算机，运行ifm_bundle.lua以完成安装。
+- 软件安装会安装到同级目录的 `ifm/` 目录中
 
-- 安装产物会解压到**运行目录下的 `ifm/` 目录**里：`ifm/IFMMaster.lua`（主控入口）、`ifm/IFMWorker.lua`（从节点入口）、`ifm/modules/`（代码模块）。解压完成后产物自身会被删除。
 ## 启动
 - 在其中一台计算机中运行主控脚本，使用下面这条命令启动（警告：不要有复数台计算机在同一有线网络中运行主控脚本，否则会发生不可预料的结果）
 ```
@@ -69,7 +69,7 @@ ifm/IFMWorker.lua
 
 ## 什么原理
 - 浏览器与服务端通过 **itty-sockets** 中转的 WebSocket 互相传递消息
-- 前端图标和资源信息按照三个方案获取：本地 `frontend/icon-exports/` 导出（质量最佳，但是需要根据Minecraft示例专门导出）→ blocksitems.com 接口（质量很好，不过有些物品缺失，并且不支持国际化）→ 注册名转换（没有图标。你可以按右上角翻译按钮启用Bergamot翻译器以获取你的语言的物品名称，质量较差）
+- 前端图标和资源信息按照三个方案获取：本地 `frontend/icon-exports/` 导出（质量最佳，但是需要根据Minecraft示例专门导出）→ blocksitems.com 接口（质量很好，不过有些物品缺失，并且不支持国际化）→ 注册名转换（没有图标。你可以按右上角翻译按钮启用Bergamot翻译器以获取你的语言的物品名称，质量较差）。**注意**：导出要完整——`icon-exports-metadata/<lang>.json` 里登记了、但 `icon-exports/` 里没有对应图片的物品，会自动退回 blocksitems 接口、再退到名称字形（仓库里自带的这份导出并不完整：约 18k 条元数据、约 4.7k 张图）；想要完整图标请用导出工具重新导出一份。
 - 拼音搜索库借助 `pinyinlite` 提供
 - 前端部署依赖 `Github Pages`
 
@@ -101,13 +101,13 @@ shell.run("bg", "ifm/IFMWorker.lua")
 ### netsync
 - 你有1个主控和一大堆从节点，现在IFM版本更新了，一个个去更新可太麻烦了。工具脚本netserver和netsync是成对使用的，用于自动同步文件。
 - netserver和netsync启动时需要指定name，相同的name之间的netserver会把文件同步给netsync。
-- **同步什么由两个文件决定**（放在 **netserver 脚本同目录**）：`syncinclude.txt` 每行一个要同步的路径（目录末尾写 `/`，会递归），`syncignore.txt` 每行一个要忽略的路径（目录带不带 `/` 都行）；两者都支持**绝对路径**（以 `/` 开头）与**相对路径**（相对 netserver 脚本所在目录），`#` 开头是注释、空行忽略。两个文件缺哪个就**自动创建一个空的并报错**，填好后再启动 netserver。
-- 客户端上的落点 = 服务端绝对路径去掉开头的 `/`：例如 netserver 在根目录、`syncinclude.txt` 里写 `ifm/`，客户端就会写出 `/ifm/IFMMaster.lua`、`/ifm/modules/*.lua` 等。**新增文件不用重启** netserver（每次请求都会重新扫描）。
+- netserver脚本同目录下两个配置文件决定要同步哪些内容：`syncinclude.txt` 每行一个要同步的路径（目录末尾写 `/`，会递归同步目录下的内容），`syncignore.txt` 每行一个要忽略的路径；两者都支持绝对路径（以 `/` 开头）与相对路径（相对 netserver 脚本所在目录），`#` 开头是注释、空行忽略
+- netsync以脚本自身所在目录作为根目录写文件。
 - netserver需要两个配置文件，syncinclude.txt和syncignore.txt，前者指定要同步的文件或目录的路径（目录路径末尾加斜杠/），后者指定要排除的路径。
 - netsync只会在netserver有更新的版本时才下载。否则会保持等待。
 - 每次你更新了文件，需要同步时，使用netserver --update name启动netserver，以更新版本。
 - --update参数可以不加，此时netserver不会更新版本。一句话描述：如果你修改了要同步的文件，启动netserver时加--update。如果文件没有变动，不加--update参数。
-- 为了使用这个脚本自动更新IFM，你应当在主控节点安装netserver，在从节点安装netsync，并且从节点可以设置netsync和IFMWorker同时开机自启（借助shell.run bg或者fg命令）。每次需要更新IFM版本时，先在主控安装新版IFM，然后在主控运行netserver --update <名称>
+- 为了使用这个脚本自动更新IFM，你应当在主控节点安装netserver，设置同步目录为ifm/，在从节点安装netsync，并且从节点可以设置netsync和IFMWorker同时开机自启（借助shell.run bg或者fg命令）。每次需要更新IFM版本时，先在主控安装新版IFM，然后在主控运行netserver --update <名称>。觉得太麻烦了？一次处理，之后就可以一直受益。
 
 ### crafter
 - 现在你希望使用IFM自动合成，可Minecraft原版的合成器速度很慢（而且，很卡！），为此你可以使用海龟合成。
@@ -186,7 +186,7 @@ python serve.py            # http://localhost:8000/index.html
 
 ## Theorum
 - Browser and script exchange messages over a WebSocket relayed by **itty-sockets**.
-- Icons and resource info are fetched in three fallback tiers: local `frontend/icon-exports/` export (best quality, but must be exported from your own Minecraft instance) → blocksitems.com API (good quality, but some items are missing and it is not internationalised) → registry name conversion (no icon; press the translate button top-right to enable the **Bergamot** translator and get names in your own language — lower quality).
+- Icons and resource info are fetched in three fallback tiers: local `frontend/icon-exports/` export (best quality, but must be exported from your own Minecraft instance) → blocksitems.com API (good quality, but some items are missing and it is not internationalised) → registry name conversion (no icon; press the translate button top-right to enable the **Bergamot** translator and get names in your own language — lower quality). **Note**: the export must be complete - items listed in `icon-exports-metadata/<lang>.json` whose image is missing from `icon-exports/` (the copy in this repo is partial: ~18k entries, ~4.7k images) fall back to the blocksitems.com API and then to the name glyph; re-export with the tool for full coverage.
 - Pinyin search is provided by the `pinyinlite` library.
 - Frontend deployment relies on GitHub Pages.
 

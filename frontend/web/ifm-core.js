@@ -9,7 +9,7 @@
     // ===================== 常量 =====================
     // 前端版本号：必须与后端 backend/IFMMaster.lua 里的 IFM_VERSION 完全一致。
     // 连上服务端后会比对 status.version，不一致就弹警告并主动停止连接（见 ifm-net.js）。
-    const IFM_CLIENT_VERSION = '1.6.17';
+    const IFM_CLIENT_VERSION = '1.6.18';
     const DEFAULT_RELAY = 'wss://itty.ws/c/';
     const API_BASE = 'https://blocksitems.com/api/v1';
     const API_ORIGIN = 'https://blocksitems.com';
@@ -152,7 +152,7 @@
             storageRemoved: '已把 {name} 移出存储容器',
             inputRole: '输入',
             inputItemCard: '输入物品容器', inputFluidCard: '输入流体容器',
-            inputDropHint: '把外设卡片拖到这里，即可把它设为这种输入容器（放进去的物品会被自动搬进存储容器）',
+            inputDropHint: '把外设卡片拖到这里，即可把它设为这种输入容器',
             inputRemove: '移出输入容器（删掉这条定义）',
             containerRoleSet: '已把 {name} 设为{kind}（{role}容器）',
             storageNeedKind: '{name} 没有{kind}外设，不能作为该存储容器',
@@ -845,10 +845,12 @@
     function displayName(kind, name) {
         // 三层优先级（任务 8 / 1.6.12）：① icon-exports 本地导出名（中文，若导出文件正常）
         // → ② blocksitems 的 display_name → ③ 注册名去下划线 / Bergamot 翻译
-        if (lang === 'zh') {
-            const exported = iconExportName(kind, name);
-            if (exported) return exported;
-        }
+        // icon-exports 的 <lang>.json 里就是**这个语言的官方物品名**（en.json 就是英文名）：
+        // 中英都用它，比 blocksitems 的英文名 / 注册名去下划线都准。
+        // 只有“当前语言的元数据文件没加载成功”时它才返回 ''（那时才往后落）。
+        // 以前只在中文下用，导致英文界面永远显示注册名去下划线。
+        const exported = iconExportName(kind, name);
+        if (exported) return exported;
         const english = englishName(kind, name);
         // 开启 Bergamot 名称翻译后优先显示中文（翻译结果由 web/ifm-translate.js 提供）
         const translator = window.IFMTranslate;
