@@ -108,6 +108,9 @@ end
 
 function Cache:markDirty()
     self.file:markDirty()
+    --- 状态变更计数（1.6.12）：网页推送用它判断“有没有新东西要推”
+    --- —— 有变化就立刻推，不做时间上的硬速率限制（用户第 7 项要求）
+    self.revision = (self.revision or 0) + 1
 end
 
 --- 去抖写盘（由主循环按 tick 调用）

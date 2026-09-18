@@ -295,11 +295,19 @@
         const realKind = kind === 'fluid' ? 'fluid' : 'item';
         const key = resourceKey(realKind, name);
         queueMeta(realKind, name);
+        // 三档优先级（1.6.12，任务 8）：
+        //   ① icon-exports 本地导出图片（离线可用、与游戏里一致；NBT 变体优先匹配）
+        //   ② blocksitems 接口图标
+        //   ③ 名称字形兜底（见 ifmIconFallback / iconFallbackText）
+        const exported = iconExportFile(realKind, name);
+        if (exported) {
+            return '<img src="' + iconExportUrl(exported) + '" alt="" data-icon-key="' + escapeHtml(key) +
+                '" data-icon-tier="export" onerror="window.ifmIconFallback(this, \'' + realKind + '\')">';
+        }
         // 与 iconHtml 一致：接口没明确说“没有这个资源”就先请求图片（过滤器轮换图标也走这条路）
         if (metaState(key) !== 'missing' && !iconFailedKeys.has(key)) {
-            return '<img src="' + iconUrl(realKind, name) + '" alt="" title="' + escapeHtml(name || '') +
-                '" data-icon-key="' + escapeHtml(key) +
-                '" onerror="window.ifmIconFallback(this, \'' + realKind + '\')">';
+            return '<img src="' + iconUrl(realKind, name) + '" alt="" data-icon-key="' + escapeHtml(key) +
+                '" data-icon-tier="api" onerror="window.ifmIconFallback(this, \'' + realKind + '\')">';
         }
         return faGlyphHtml(realKind, name);
     }
@@ -307,8 +315,7 @@
     function filterIconHtml(entry) {
         const samples = asArray(entry.samples);
         if (samples.length === 0) {
-            return '<span class="icon" title="' + escapeHtml(entry.name) + '">' +
-                faGlyphHtml('filter', entry.name) + '</span>';
+            return '<span class="icon">' + faGlyphHtml('filter', entry.name) + '</span>';
         }
         const current = iconIndex.get(entry.name) || 0;
         const sample = samples[current % samples.length];
@@ -585,6 +592,39 @@
         });
     }
 
+    // ===== 乐观占位的“增量核对”（1.6.12，任务 5）=====
+    // 后台真正发完物品后，界面上的「发送中」偶尔会一直留着那条占位：以前只在渲染时按时间猜
+    // （“服务端 1.5 秒后又推过队列”），没有推送就不会重算。
+    // 现在改成确定性做法：
+    //   ① 服务端**确认收到**这次发送请求之后（send_items 的响应回来）才“武装”这些占位；
+    //   ② 之后每收到一次发送队列的增量更新，就核对一次：队列里没有它 = 已经发完/被拒 → 立刻退休，
+    //      并主动重画（不再等下一次渲染）。这就是它要求的“相同的增量更新行为”。
+    let optimisticArmed = false;
+    let optimisticArmedAt = 0;
+    let optimisticSweeps = 0;
+
+    function armOptimisticDeliveries() {
+        optimisticArmed = true;
+        optimisticArmedAt = Date.now();
+        optimisticSweeps = 0;
+    }
+
+    /// 核对并移除已经不在服务端队列里的占位；返回是否真的移除了（调用方据此重画）
+    function reconcileOptimisticDeliveries() {
+        if (!optimisticArmed || optimisticDeliveries.length === 0) return false;
+        optimisticSweeps += 1;
+        // 响应回来之后的**第 1 次**推送，内容可能是在服务端处理这条请求之前收集的，
+        // 那时队列里当然还没有它 —— 所以再等一次推送（或 1.5 秒）才敢把“队列里没有它”
+        // 当成“已经发完 / 被拒”，避免刚发出的东西立刻从「发送中」闪掉。
+        const settled = optimisticSweeps >= 2 || (Date.now() - optimisticArmedAt) >= 1500;
+        if (!settled) return false;
+        const before = optimisticDeliveries.length;
+        // 队列里有它 → 由服务端的真实条目接管；队列里没有它 → 已经发完/被拒 → 退休。
+        // 两种情况都该把本地占位清掉（否则就是一直留着的那条“发送中”）。
+        optimisticDeliveries = [];
+        return before !== 0;
+    }
+
     // 发送中：乐观项（最新提交的排最前）+ 服务端队列（按 id 从后往前 = 最新提交的排最前）
     function deliveryEntries() {
         const out = [];
@@ -592,19 +632,12 @@
         Array.from(stores.deliveries.values()).forEach(function (item) {
             real[sendKeyOf(item)] = item;
         });
-        // 服务端已经有这种材料了：乐观项退休（否则会一直重复显示）
-        // 另外两种情况也要退休（1.6.10 修“全量刷新后发送中一直残留”）：
-        //   * 服务端在我这条占位之后**又推过一次发送队列**（说明它已经看过我的请求）：
-        //     队列里没有这种材料 = 已经发完或被拒了；
-        //   * 兜底：超过 1 分钟还没对上，就当它已经不在队列里（离线/丢包时不会永远残留）。
-        const syncedAt = Number(typeof deliveriesSyncedAt === 'number' ? deliveriesSyncedAt : 0);
+        // 服务端已经有这种材料了（或增量核对发现它已经不在队列里）：乐观项退休。
+        // 实测兜底：超过 1 分钟还没对上就当它已经不在队列里（离线/丢包时不会永远残留）。
         const nowMs = Date.now();
         optimisticDeliveries = optimisticDeliveries.filter(function (entry) {
-            const at = Number(entry.at) || 0;
             if (real[sendKeyOf(entry)]) return false;
-            // 给服务端 1.5 秒的处理时间：推送可能在我们发出请求之前就生成了
-            if (syncedAt > at + 1500) return false;
-            return nowMs - at < 60000;
+            return nowMs - (Number(entry.at) || 0) < 60000;
         });
         optimisticDeliveries.slice().reverse().forEach(function (entry) {
             out.push({ kind: entry.kind, name: entry.name, count: entry.count, pending: true });

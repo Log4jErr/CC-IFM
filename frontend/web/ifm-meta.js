@@ -74,8 +74,9 @@
 
     function faGlyphHtml(kind, name) {
         const text = iconFallbackText(iconLabelOf(kind, name));
-        return '<span class="icon-text" data-fallback-len="' + text.length + '" title="' +
-            escapeHtml(name || '') + '">' + escapeHtml(text) + '</span>';
+        // 不再写 title：图标上的**注册名原生提示**会与自定义悬停详情（.icon-tooltip）重复出现
+        // （用户第 2 项要求：移除多余的注册名提示）
+        return '<span class="icon-text" data-fallback-len="' + text.length + '">' + escapeHtml(text) + '</span>';
     }
 
     // 元信息状态：'ready'（接口里有）/ 'missing'（接口确认没有）/ 'unknown'（还没查到）
@@ -86,14 +87,14 @@
     }
 
     function iconImgHtml(kind, name, className) {
-        return '<span class="' + className + '"><img src="' + iconUrl(kind, name) + '" alt="" title="' +
-            escapeHtml(name || '') + '" data-icon-key="' + escapeHtml(resourceKey(kind, name)) +
+        // 同上：图标上不再挂注册名的原生 title（避免与自定义悬停详情重复）
+        return '<span class="' + className + '"><img src="' + iconUrl(kind, name) + '" alt="" data-icon-key="' +
+            escapeHtml(resourceKey(kind, name)) +
             '" onerror="window.ifmIconFallback(this, \'' + kind + '\')"></span>';
     }
 
     function faSpanHtml(kind, name, className) {
-        return '<span class="' + className + '" title="' + escapeHtml(name || '') + '">' +
-            faGlyphHtml(kind, name) + '</span>';
+        return '<span class="' + className + '">' + faGlyphHtml(kind, name) + '</span>';
     }
 
     function iconHtml(kind, name, extraClass, forceChar) {
@@ -113,6 +114,17 @@
     window.ifmIconFallback = function (img, kind) {
         const holder = img.parentNode;
         if (!holder) return;
+        const tier = img.getAttribute('data-icon-tier') || '';
+        // 第 ① 层（icon-exports 本地图片）打不开：退到第 ② 层（blocksitems 接口）再试一次，
+        // 别直接掉到名称兜底（本地导出可能缺这一条，但接口有）
+        if (tier === 'export') {
+            const key = img.getAttribute('data-icon-key') || '';
+            const parts1 = splitKey(key);
+            iconExportMarkFailed(String(img.getAttribute('src') || '').replace(ICON_EXPORTS_BASE, ''));
+            img.setAttribute('data-icon-tier', 'api');
+            img.setAttribute('src', iconUrl(kind || parts1[0] || 'item', parts1[1] || ''));
+            return;
+        }
         // 图片加载失败：先把这次失败记下来（见 iconFailedKeys），再换成名称兜底。
         const key = img.getAttribute('data-icon-key');
         if (key) {
@@ -229,6 +241,11 @@
         metaQueue = [];
         missingMetaKeys.clear();
         iconFailedKeys.clear();
+        // icon-exports 也一起重来（刷新按钮 = 重新拉一次本地导出元数据）
+        iconExportIndex = null;
+        iconExportUnavailable = false;
+        iconExportLoading = false;
+        iconExportFailedFiles.clear();
         try { localStorage.removeItem(MISSING_META_STORAGE); } catch (err) { /* ignore */ }
     }
 
@@ -251,6 +268,125 @@
                 if (typeof key === 'string' && !metaCache.has(key)) metaCache.set(key, 'missing');
             });
         } catch (err) { /* ignore */ }
+    }
+
+    // ===================== icon-exports（本地图标导出，任务 8 / 1.6.12）=====================
+    // 三层优先级：① icon-exports（本地导出的图片 + 元数据）→ ② blocksitems 接口 → ③ Bergamot 翻译/名称字形兜底。
+    //
+    // 为什么懒加载：icon-exports-metadata.json 约 7MB / 1.9 万条，开局同步解析会明显拖慢首屏。
+    // 所以页面起来之后在后台抓一次、建索引，抓完再重画一次（那之前先用接口图标）。
+    //   * 文件不存在（没导出 / 没随网页部署）→ 记下失败、不再重试，整条链路自动退回接口图标；
+    //   * 同一个 id 可能有多个“带 components 的变体”（例如染色、画作图案）：
+    //     查图标时优先用 **components 与物品 NBT 一致** 的那一条，其次用不带 components 的默认图标。
+    const ICON_EXPORTS_BASE = 'icon-exports/';
+    const ICON_EXPORTS_META = 'icon-exports-metadata.json';
+    let iconExportIndex = null;          // Map: "item|minecraft:oak_log" -> { plain, variants, name }
+    let iconExportLoading = false;
+    let iconExportUnavailable = false;
+    const iconExportFailedFiles = new Set();   // 已 404 的导出图片（避免反复请求）
+
+    function iconExportUrl(file) {
+        return ICON_EXPORTS_BASE + String(file || '');
+    }
+
+    // 导出的中文名只有“像正常中文”时才用：这份导出里 local_name 是乱码（含 U+FFFD），
+    // 这种情况直接跳过，交给 blocksitems / 翻译层（用户要求的三层顺序仍然成立）。
+    function iconExportUsableName(text) {
+        const value = String(text || '').trim();
+        if (!value || value.indexOf('\ufffd') >= 0) return '';
+        return /[\u3400-\u4dbf\u4e00-\u9fff]/.test(value) ? value : '';
+    }
+
+    function iconExportComponentsKey(components) {
+        if (!components || typeof components !== 'object') return '';
+        try {
+            return JSON.stringify(components);
+        } catch (err) {
+            return '';
+        }
+    }
+
+    function buildIconExportIndex(meta) {
+        const index = new Map();
+        meta.forEach(function (entry) {
+            if (!entry || !entry.id || !entry.image_file) return;
+            const kind = entry.type === 'fluid' ? 'fluid' : 'item';
+            const key = kind + '|' + entry.id;
+            let record = index.get(key);
+            if (!record) {
+                record = { plain: null, variants: [] };
+                index.set(key, record);
+            }
+            const name = iconExportUsableName(entry.local_name);
+            if (name && !record.name) record.name = name;
+            const components = iconExportComponentsKey(entry.components);
+            if (components) record.variants.push({ components: components, file: entry.image_file });
+            else if (!record.plain) record.plain = entry.image_file;
+        });
+        return index;
+    }
+
+    function loadIconExports() {
+        if (iconExportIndex || iconExportLoading || iconExportUnavailable) return;
+        iconExportLoading = true;
+        fetch(ICON_EXPORTS_META)
+            .then(function (response) {
+                if (!response.ok) throw new Error('HTTP ' + response.status);
+                return response.json();
+            })
+            .then(function (body) {
+                const meta = body && asArray(body.meta);
+                if (meta.length === 0) throw new Error('元数据为空');
+                iconExportIndex = buildIconExportIndex(meta);
+                console.info('[IFM] icon-exports 已加载：' + iconExportIndex.size + ' 个物品图标（优先于 blocksitems 接口）');
+                ['resources', 'peripherals', 'processes', 'deliveries', 'machines'].forEach(markDirty);
+                scheduleRender();
+            })
+            .catch(function (err) {
+                iconExportUnavailable = true;
+                console.info('[IFM] 没有可用的 icon-exports（' + ((err && err.message) || err) +
+                    '）：图标继续用 blocksitems 接口 / 名称兜底');
+            })
+            .finally(function () {
+                iconExportLoading = false;
+            });
+    }
+
+    // 查一条导出记录：nbt 命中变体优先，其次默认（不带 components）图标
+    function iconExportEntry(kind, name, nbt) {
+        if (iconExportUnavailable) return null;
+        if (!iconExportIndex) {
+            loadIconExports();
+            return null;                 // 索引还没好：这一轮先用接口图标
+        }
+        const record = iconExportIndex.get((kind === 'fluid' ? 'fluid' : 'item') + '|' + String(name || ''));
+        if (!record) return null;
+        return record;
+    }
+
+    // 导出的图标文件名（没有就返回 null，调用方退回接口图标）
+    function iconExportFile(kind, name, nbt) {
+        const record = iconExportEntry(kind, name, nbt);
+        if (!record) return null;
+        const wanted = nbt ? iconExportComponentsKey(nbt) : '';
+        if (wanted) {
+            for (let i = 0; i < record.variants.length; i += 1) {
+                if (record.variants[i].components === wanted) return record.variants[i].file;
+            }
+        }
+        if (record.plain) return record.plain;
+        return record.variants.length > 0 ? record.variants[0].file : null;
+    }
+
+    // 导出里的中文名（若可用）：displayName 会优先用它（三层里的第一层）
+    function iconExportName(kind, name, nbt) {
+        const record = iconExportEntry(kind, name, nbt);
+        return record && record.name ? record.name : '';
+    }
+
+    // 导出图片 404 时别反复请求（但**不**影响接口图标：那是另一层）
+    function iconExportMarkFailed(file) {
+        if (file) iconExportFailedFiles.add(file);
     }
 
     

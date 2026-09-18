@@ -306,16 +306,30 @@
         acState = null;
     }
 
-    // 候选池：资源名（物品/流体）+ 过滤器名 + 常见标签 + 资源上已经出现过的 #标签
-    function acCandidates(query) {
+    // 候选池（source 决定给哪一类）：
+    //   any（默认）→ 物品 / 流体 / 过滤器 / 标签 / 常见标签（流程元素、容器工具用）
+    //   tag        → 只给标签（“包含物品标签”这类规则用：以前会拿物品名去补全，任务 3）
+    //   item/fluid → 只给该种类的资源
+    function acCandidates(query, source) {
         const text = String(query || '').trim().toLowerCase();
-        const pool = suggestionValues();
+        const kind = source || 'any';
+        const pool = [];
+        const tagPool = [];
         Array.from(stores.resources.values()).forEach(function (entry) {
-            asArray(entry.tags).forEach(function (tag) { pool.push('#' + String(tag)); });
+            const entryKind = entry.kind === 'fluid' ? 'fluid' : 'item';
+            if (kind === 'any' || kind === entryKind) pool.push(entry.name);
+            asArray(entry.tags).forEach(function (tag) { tagPool.push(String(tag)); });
         });
+        if (kind === 'any') {
+            Array.from(stores.filters.values()).forEach(function (entry) { pool.push(entry.name); });
+        }
+        if (kind === 'any' || kind === 'tag') {
+            AC_TAG_HINTS.forEach(function (tag) { tagPool.push(tag); });
+        }
+        const list = (kind === 'tag' ? tagPool : pool);
         const seen = {};
         const out = [];
-        pool.forEach(function (value) {
+        list.forEach(function (value) {
             const candidate = String(value || '');
             if (!candidate || seen[candidate]) return;
             seen[candidate] = true;
@@ -323,6 +337,21 @@
             out.push(candidate);
         });
         return out.slice(0, AC_LIMIT);
+    }
+
+    // 常见标签（没有扫描到标签数据时也能给点候选）
+    const AC_TAG_HINTS = ['c:ingots', 'c:ores', 'c:stones', 'c:plates', 'c:water', 'minecraft:logs'];
+
+    // 输入框该给哪一类候选：过滤器规则行里看“规则类型”
+    function acSourceForInput(input) {
+        const row = input && input.closest ? input.closest('.rule-row') : null;
+        if (!row) return 'any';
+        const select = row.querySelector('.rule-type');
+        const ruleType = select ? String(select.value || '') : '';
+        if (ruleType.indexOf('Tag_') >= 0) return 'tag';       // itemTag_include / fluidTag_include
+        if (ruleType.indexOf('item_') === 0) return 'item';
+        if (ruleType.indexOf('fluid_') === 0) return 'fluid';
+        return 'any';
     }
 
     function renderAcPanel() {
@@ -349,7 +378,7 @@
     }
 
     function openAutocomplete(input, index) {
-        const items = acCandidates(input.value);
+        const items = acCandidates(input.value, acSourceForInput(input));
         if (items.length === 0) {
             closeAutocomplete();
             return;
@@ -1089,6 +1118,9 @@
         const slot = row.querySelector('.rule-value-slot');
         const current = slot.querySelector('input, select');
         slot.innerHTML = ruleValueHtml(select.value, current ? current.value : '');
+        // 换成文本输入框时补上候选列表（“包含物品标签”给标签候选，物品/流体给对应资源，任务 3）
+        const input = slot.querySelector('input.rule-value');
+        if (input) attachAutocomplete(input);
     };
 
     window.ifmRemoveRule = function (button) {

@@ -196,9 +196,13 @@
         for (let index = 0; index < bases.length; index += 1) {
             const base = bases[index];
             try {
-                const wasmBinary = await fetchBytes(base + 'bergamot-translator-worker.wasm');
+                const wasmUrl = base + 'bergamot-translator-worker.wasm';
+                const wasmBinary = await fetchBytes(wasmUrl);
                 console.info('[IFM] 翻译引擎来源：' + base);
-                return { base: base, wasmBinary: wasmBinary };
+                // wasmUrl 一起带出去：实例化时优先用它做 instantiateStreaming，
+                // 这样 DevTools 里 wasm 帧带的是**真实 URL**，不会去解析合成出来的
+                // "wasm:<脚本 URL>" 源映射（用户第 4 项里控制台那条 URL 报错就来自这里）。
+                return { base: base, wasmBinary: wasmBinary, wasmUrl: wasmUrl };
             } catch (err) {
                 failures.push(base + ' → ' + ((err && err.message) || err));
                 progress = { received: 0, total: 0 };
@@ -278,14 +282,29 @@
                  * （返回 {} 是 emscripten 约定的“实例化是异步的，等 accept 回调”。）
                  */
                 instantiateWasm: function (imports, accept) {
-                    WebAssembly.instantiate(runtime.wasmBinary, withWasmGemm(imports))
-                        .then(function (result) { accept(result.instance); })
-                        .catch(function (err) {
-                            console.error('[bergamot] wasm 实例化失败：' + ((err && err.message) || err));
-                            message = 'translateError';
-                            status = 'failed';
-                            notify();
-                        });
+                    const fail = function (err) {
+                        console.error('[bergamot] wasm 实例化失败：' + ((err && err.message) || err));
+                        message = 'translateError';
+                        status = 'failed';
+                        notify();
+                    };
+                    const fromBytes = function () {
+                        WebAssembly.instantiate(runtime.wasmBinary, withWasmGemm(imports))
+                            .then(function (result) { accept(result.instance); })
+                            .catch(fail);
+                    };
+                    // 优先 instantiateStreaming（参数是**真实的 wasm URL**）：
+                    // 用字节实例化时，DevTools 会把这一帧的“资源 URL”记成
+                    // "wasm:<脚本 URL> line N > WebAssembly.instantiate"，随后去解析源映射，
+                    // 在控制台留下 “URL constructor: ... is not a valid URL” 的报错（用户第 4 项）。
+                    // 走 streaming 之后帧上带的是 wasm 文件自己的 URL，这条报错就没了。
+                    if (runtime.wasmUrl && typeof WebAssembly.instantiateStreaming === 'function') {
+                        WebAssembly.instantiateStreaming(fetch(runtime.wasmUrl), withWasmGemm(imports))
+                            .then(function (result) { accept(result.instance); })
+                            .catch(function () { fromBytes(); });     // 服务器没给正确的 MIME 时退回字节实例化
+                    } else {
+                        fromBytes();
+                    }
                     return {};
                 },
                 onRuntimeInitialized: function () { runtimeReady(); },

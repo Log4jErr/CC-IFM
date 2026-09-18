@@ -45,13 +45,12 @@ local KEY_FIELDS = {
 
 local SCALAR_CATEGORIES = { status = true }
 
---- 推送间隔的自动放大倍数：下一次推送至少等 PUSH_COST_MULTIPLIER × 上次推送耗时，
---- 这样“扫描容器”最多占用这台计算机 ~1/3 的时间（超过就继续拉长间隔）。
-local PUSH_COST_MULTIPLIER = 4
-
---- 增量推送的**硬下限**（毫秒）：无论谁触发（定时 / 请求之后），两次增量包之间至少隔这么久。
---- 与 updateInterval（默认 2 秒）取较大值 —— 用户要求“增量更新最快 2 秒一次”（1.6.7）。
-local MIN_PUSH_GAP_MS = 2000
+--- 推送策略（1.6.12）：
+---   * 服务端**不设 WebSocket 收发的速率硬限制**（用户第 7 项要求）——
+---     推送由“状态变更计数”（cache.revision）驱动：有变化就推，同一 tick 内多次请求只推一次；
+---   * 没有变化时仍有 updateInterval 兜底刷新；推送失败时用同一个间隔退避重试。
+--- 想恢复旧行为（最快 N 毫秒一次 / 按推送耗时放大间隔）时，传 minPushInterval 即可。
+local DEFAULT_MIN_PUSH_GAP_MS = 0
 
 --- 异步连接的超时（毫秒）：http.websocketAsync 立刻返回，结果靠 websocket_success /
 --- websocket_failure 事件送达。万一两个事件都没来（中继静默丢包），超过这个时间就
@@ -113,21 +112,20 @@ function Protocol.new(opts)
     self.onRequest = opts.onRequest
     self.onConnect = opts.onConnect
     self.updateInterval = opts.updateInterval or 2
-    --- 浏览器请求之后那次推送的最小间隔（毫秒）：一次推送要全量收集（扫描所有容器），
-    --- 而浏览器会连着发心跳/请求（心跳每 5 秒一次）。设置最小间隔后，请求的响应照旧立即返回，
-    --- 最新数据由随后的定时推送（updateInterval）补齐，避免“点一下按钮就重扫一遍容器”。
-    ---
-    --- 1.6.7：下限从 400ms 提到 **2000ms**（= updateInterval）。以前只要距上次推送超过 400ms，
-    --- 任何一次请求（连点按钮、看流程、切面板…）都会立刻再推一次增量包 —— 数据包刷得比
-    --- 网页能用上的速度还快，也白占主控与无线带宽。现在**增量推送最快 2 秒一次**：
-    --- 请求的响应本身照旧立刻回（网页的即时反馈不受影响），数据变更由 ≤2 秒后的一次推送补齐。
-    --- 需要立刻全量的场合（浏览器刚接入 / 点了刷新 / full_request）仍然用 pushUpdates(true) 强制推送。
-    self.minPushInterval = opts.minPushInterval or MIN_PUSH_GAP_MS
-    --- 两次增量推送之间的**实际**硬下限：minPushInterval 与 updateInterval 取较大者
-    self.pushGap = math.max(self.minPushInterval, self.updateInterval * 1000)
-    --- 上一次推送（收集 + 发送）花了多少毫秒：定时推送的间隔会按它自动放大（见 PUSH_COST_MULTIPLIER）。
-    --- 实测：有线网络 / 远程外设上每个容器一次 list() ≈ 1 个服务器刻（50ms），
-    --- 12 个容器就是 ~0.6s；固定 1 秒推送会把主循环压到 1s 以上。
+    --- 浏览器请求之后那次推送的最小间隔（毫秒）。
+    --- 1.6.12：**默认 0 = 不设硬限制** —— 有数据变化就立刻推（用户第 7 项要求：
+    --- 服务端不应当对 WebSocket 收发数据包做速率硬限制）。
+    --- 仍然存在的两件事：① 一次推送会全量收集（读容器）——为了不把主循环压垮，
+    --- 推送**按“状态变更计数”驱动**：只有自上次推送后有变化（cache.revision 变了）才会再推，
+    --- 同一 tick 里多次请求只会合并成一次推送；② 推送失败时退避到下一个间隔再试。
+    --- 需要立刻全量的场合（浏览器刚接入 / 点了刷新 / full_request）仍然用 pushUpdates(true)。
+    self.minPushInterval = opts.minPushInterval or DEFAULT_MIN_PUSH_GAP_MS
+    --- 两次增量推送之间的**实际**下限：只由 minPushInterval 决定（默认 0）
+    self.pushGap = math.max(self.minPushInterval, 0)
+    --- 状态变更计数提供者（一般是 cache.revision）：变了就推
+    self.revisionProvider = opts.revisionProvider
+    self.pushedRevision = nil
+    --- 上一次推送（收集 + 发送）花了多少毫秒：只用于诊断显示，不再用它放大推送间隔
     self.lastPushCost = 0
     self.reconnectInterval = opts.reconnectInterval or 5
     --- 浏览器心跳超时（毫秒）：超过这个时间没收到浏览器任何消息就重连中继。
@@ -404,6 +402,23 @@ function Protocol:sendCategoryChanges(category, changes)
     return true
 end
 
+--- 当前状态变更计数（cache.revision；没有提供者时返回 0）
+function Protocol:currentRevision()
+    if not self.revisionProvider then
+        return 0
+    end
+    local ok, value = pcall(self.revisionProvider)
+    if not ok then
+        return 0
+    end
+    return tonumber(value) or 0
+end
+
+--- 自上次推送之后状态有没有变化（1.6.12：推送改成“有变化就推”，不做时间硬限制）
+function Protocol:hasChanges()
+    return self:currentRevision() ~= (self.pushedRevision or 0)
+end
+
 --- 推送全部类别（force 时即使客户端未激活也推送）
 function Protocol:pushUpdates(force)
     if not self.connected then
@@ -458,6 +473,8 @@ function Protocol:pushUpdates(force)
         self.needFullSync = false
         self.lastPush = os.epoch("utc")
         self.stats.pushes = self.stats.pushes + 1
+        --- 记下这次推送时的“状态变更计数”：下次只有计数又变了才会立刻再推（1.6.12）
+        self.pushedRevision = self:currentRevision()
         --- 全量数据发完了：给网页一个明确的“结束”信号。
         --- 网页在全量期间先把数据收进缓冲、结束（或超时兜底）时才整体替换 store ——
         --- 否则每次全量都要先清空，列表会瞬间变空（整页闪一下）。
@@ -499,15 +516,12 @@ function Protocol:update(now)
         return
     end
     if self.clientActive then
-        -- 定时推送：间隔随“上次推送耗时”自动放大（扫描慢的机器不会被推送占满）
-        local cost = self.lastPushCost or 0
-        local minGap = math.max(self.pushGap or (self.updateInterval * 1000), cost * PUSH_COST_MULTIPLIER)
-        -- 一次 2.4s 的收集如果只等 6s 就重来，主循环会被推送吃掉大半（网页随之“连不上”）：
-        -- 慢推送之后强制拉长到 6 倍耗时（上限 15s），把主循环让给引擎与消息收发。
-        if cost > 400 then
-            minGap = math.max(minGap, math.min(cost * 6, 15000))
-        end
-        if now - self.lastPush >= minGap then
+        -- 推送策略（1.6.12，用户第 7 项：不做速率硬限制）：
+        --   * 状态有变化（cache.revision 变了）→ 立刻推；
+        --   * 没有变化 → 每 updateInterval 兜底推一次（防止漏掉没走 markDirty 的变化）；
+        --   * 推送耗时不再放大推送间隔（那是以前的“自适应硬限制”）。
+        local changed = self:hasChanges()
+        if changed or now - self.lastPush >= self.updateInterval * 1000 then
             local startedAt = os.epoch("utc")
             local ok = self:pushUpdates(false)
             self.lastPushCost = os.epoch("utc") - startedAt
@@ -628,13 +642,13 @@ function Protocol:handleMessage(raw)
     if self.clientActive and payload.action ~= "heartbeat" then
         -- 推送出错绝不能把异常抛到主循环（主循环结束 = 服务端退出 = 网页所有请求超时）
         --
-        --- 两点优化（实测：15 个容器在有线网络上一次全量收集约 1.4s）：
-        ---   1) 心跳只表示“浏览器还活着”，不必为它做全量收集 + 推送（每 5 秒一次）；
-        ---   2) 其它请求之后的推送也做最小间隔限制（pushGap = minPushInterval 与 updateInterval
-        ---      取较大者，默认 2 秒）：浏览器连点按钮时不会每次都重扫容器、也不会把增量包刷爆，
-        ---      最新数据由定时推送补齐；请求的响应本身已经立刻发回去了。
+        --- 1.6.12：请求处理完之后**有变化就推**（用户第 7 项：不做速率硬限制）。
+        ---   * 判断依据是 cache.revision：同一 tick 里连着来几个请求，也只有第一个会真的推
+        ---     （推完 revision 就同步了），因此不会把主循环刷爆；
+        ---   * 心跳只表示“浏览器还活着”，不为它做全量收集（保持原样）；
+        ---   * minPushInterval 默认 0（可在启动参数里恢复节流）。
         local now = os.epoch("utc")
-        if now - (self.lastPush or 0) >= (self.pushGap or self.minPushInterval) then
+        if now - (self.lastPush or 0) >= (self.pushGap or 0) and self:hasChanges() then
             local okPush, pushErr = pcall(self.pushUpdates, self, false)
             if not okPush then
                 self.log("Push after action %s failed: %s", tostring(payload.action), tostring(pushErr))

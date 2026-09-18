@@ -116,11 +116,12 @@
             event.preventDefault();
             const resource = resourceFromKey(card.getAttribute('data-resource'));
             if (resource.kind === 'placeholder') return;
+            // 中键 = 设置发送数量；Shift+中键 = 设置合成数量（1.6.12：与以往相反，用户要求对调）
             if (event.shiftKey) {
-                openSendCountPrompt(resource);
+                openCraftPrompt(resource);
                 return;
             }
-            openCraftPrompt(resource);
+            openSendCountPrompt(resource);
         });
     }
 
@@ -227,6 +228,9 @@
         animateSendToDelivery(pairs);
         busyButton('sendBtn', sendRequest('send_items', { container: container, items: items })).then(function (response) {
             const result = response.result || {};
+            // 服务端已经收到并处理了这次发送：现在开始用“发送队列的增量更新”核对乐观占位
+            // （发完/被拒的物品会随下一次增量更新从「发送中」里消失，任务 5 / 1.6.12）
+            armOptimisticDeliveries();
             if (result.error) {
                 restoreSend();
                 toast(t('requestFailed', { error: result.error }), 'error');
@@ -1454,6 +1458,9 @@
         bindIconTooltips();
         applyI18n();
         loadMissingMeta();
+        // icon-exports 元数据（≈7MB）延后一点再拉：先让首屏用接口图标画出来，
+        // 索引建好后会自动重画一次换成第 ① 层图标（任务 8）
+        setTimeout(loadIconExports, 900);
         syncDeliveryPanelSpacing();
         // 先画一次外设/过滤器面板：没有数据时也能看到「暂无数据」与排序模式
         renderPeripherals();

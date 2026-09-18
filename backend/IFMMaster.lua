@@ -16,7 +16,7 @@ local args = { ... }
 --- 版本号：前端 web/ifm-core.js 里的 IFM_CLIENT_VERSION 必须与此保持一致。
 --- 网页连上后会比对两边的版本号，不一致时弹出警告并主动停止连接，
 --- 避免“新前端 + 旧后端”（或反过来）产生难以定位的怪问题。
-local IFM_VERSION = "1.6.11"
+local IFM_VERSION = "1.6.12"
 
 local DEFAULT_RELAY = "wss://itty.ws/c/"
 
@@ -1209,15 +1209,19 @@ protocol = Protocol.new({
     log = log,
     collect = collectSnapshot,
     onRequest = handleRequest,
-    -- 定时推送间隔（秒）：每次网页操作后服务端都会立刻推一次，
-    -- 这里只是“没有任何操作时”的兜底刷新频率。
+    -- 定时推送间隔（秒）：**没有变化时**的兜底刷新频率（有变化会立刻推，见下）。
     -- 注意：一次推送要全量收集（每个容器一次外设调用，有线网络上 ≈1 个服务器刻/次），
-    -- 12 个容器就 ~0.6s，所以别设太小；协议层还会按“上次推送耗时 ×3”自动放大间隔。
+    -- 12 个容器就 ~0.6s，所以兜底频率别设太小。
     updateInterval = 2,
-    -- 增量推送的**硬下限**（秒/毫秒）：无论谁触发，两次增量包之间至少隔这么久（1.6.8）。
-    -- 不设的话默认就是 2000ms（与 updateInterval 取较大者）。用户实测“数据包推送太频繁”，
-    -- 是因为以前任何一次请求之后只要距上次推送超过 400ms 就会再推一次 —— 现在固定在 2 秒。
-    minPushInterval = 2000,
+    -- 增量推送的硬下限（毫秒）：1.6.12 起**默认 0 = 不设硬限制**（用户要求：服务端不应当
+    -- 对 WebSocket 收发数据包做速率硬限制）。推送改由“状态变更计数”驱动：
+    -- cache.revision 变了就立刻推，同一 tick 内多个请求合并成一次。
+    -- 想恢复旧的“最快 N 毫秒一次”节流时，把这里设成毫秒数即可（例如 2000）。
+    minPushInterval = 0,
+    -- 状态变更计数：cache.revision（任何 Cache:markDirty() 都会 +1）
+    revisionProvider = function()
+        return cache.revision or 0
+    end,
     reconnectInterval = 5,
     -- 浏览器心跳超时（秒）：别设太小，浏览器后台标签页的定时器会被节流，
     -- 太小会导致服务端不停重连中继，把正在处理的请求响应一起丢掉（网页表现为“超时”）

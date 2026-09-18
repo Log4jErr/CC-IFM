@@ -9,7 +9,7 @@
     // ===================== 常量 =====================
     // 前端版本号：必须与后端 backend/IFMMaster.lua 里的 IFM_VERSION 完全一致。
     // 连上服务端后会比对 status.version，不一致就弹警告并主动停止连接（见 ifm-net.js）。
-    const IFM_CLIENT_VERSION = '1.6.11';
+    const IFM_CLIENT_VERSION = '1.6.12';
     const DEFAULT_RELAY = 'wss://itty.ws/c/';
     const API_BASE = 'https://blocksitems.com/api/v1';
     const API_ORIGIN = 'https://blocksitems.com';
@@ -200,7 +200,7 @@
             workerCurrent: '当前工作：{task}',
             workerWaitingReply: '等待回报（搬运 {moves} · 查询 {queries}）',
             workerLastQuery: '最近查询：{container} {stacks} 组（{ms}ms）',
-            workerLastQueryEmpty: '最近查询：扫过 {scanned} 个容器（都是空的）',
+            workerLastQueryEmpty: '最近查询：{container} 空（{ms}ms）',
             workerScanBlind: '代扫看不到容器（上次查询一个容器都没扫到：它和主控不在同一有线网络？）',
             workerCounters: '搬运 {jobs}（{moved} 个）· 查询 {queries} · 详情 {details} · 在飞 {pending}',
             deliveryCancel: '取消这一项发送',
@@ -233,7 +233,7 @@
             tipRegistry: '注册名', tipKind: '种类', tipStored: '存量', tipSendAmount: '待发送',
             tipRemaining: '剩余',
             tipState: '状态', tipBatch: '本批数量', tipMachine: '机器',
-            tipResourceClick: '左键 +1 · Shift+左键 +64 · 右键 -1 · Shift+右键 -64 · 中键 设合成数量 · Shift+中键 设发送数量',
+            tipResourceClick: '左键 +1 · Shift+左键 +64 · 右键 -1 · Shift+右键 -64 · 中键 设发送数量 · Shift+中键 设合成数量',
             tipCraftClick: '点右上角 “+”：只合成不发送',
             tipSendClick: '左键 +1 · 右键 -1 · 点右上角 “×” 移除',
             tipTags: '标签',
@@ -262,7 +262,7 @@
             sortPeripheralBlock: '方块名',
             sortPeripheralDefs: '定义数量',
             sortTitle: '排序', sortCountDesc: '数量降序', sortCountAsc: '数量升序', sortName: '字典序',
-            settingsTitle: '设置', settingsScan: '容器扫描',
+            settingsTitle: '设置',
             settingsStorageScan: '存储容器扫描间隔（毫秒）',
             settingsInputScan: '输入容器扫描间隔（毫秒）',
             settingsHint: '扫描间隔越大，主控读外设越少、越省性能；越小则库存/输入容器变化越快被看到。范围 250 ~ 600000 毫秒。',
@@ -395,7 +395,7 @@
             workerCurrent: 'now: {task}',
             workerWaitingReply: 'waiting for a reply (moves {moves} · queries {queries})',
             workerLastQuery: 'last query: {container} {stacks} stack(s) ({ms}ms)',
-            workerLastQueryEmpty: 'last query: scanned {scanned} container(s), all empty',
+            workerLastQueryEmpty: 'last query: {container} empty ({ms}ms)',
             workerScanBlind: 'delegated scan sees no containers (last query scanned 0 containers: not on the master\'s wired network?)',
             workerCounters: '{jobs} move(s) / {moved} item(s) · {queries} query(ies) · {details} item detail(s) · in flight {pending}',
             deliveryCancel: 'Cancel this delivery',
@@ -424,7 +424,7 @@
             sortPeripheralBlock: 'Block',
             sortPeripheralDefs: 'Defs',
             sortTitle: 'Sort', sortCountDesc: 'Count (desc)', sortCountAsc: 'Count (asc)', sortName: 'Name',
-            settingsTitle: 'Settings', settingsScan: 'Container scanning',
+            settingsTitle: 'Settings',
             settingsStorageScan: 'Storage container scan interval (ms)',
             settingsInputScan: 'Input container scan interval (ms)',
             settingsHint: 'Longer intervals read peripherals less often (lighter on the master); shorter intervals make stock / input container changes show up sooner. Range 250 ~ 600000 ms.',
@@ -489,7 +489,7 @@
             tipRegistry: 'Registry', tipKind: 'Kind', tipStored: 'Stored', tipSendAmount: 'To send',
             tipRemaining: 'Left',
             tipState: 'State', tipBatch: 'Batch size', tipMachine: 'Machine',
-            tipResourceClick: 'Left click +1 · Shift+Left +64 · Right click -1 · Shift+Right -64 · Middle click set craft count · Shift+Middle set send count',
+            tipResourceClick: 'Left click +1 · Shift+Left +64 · Right click -1 · Shift+Right -64 · Middle click set send count · Shift+Middle set craft count',
             tipCraftClick: 'Click "+" at the top right: craft only (no send)',
             tipSendClick: 'Left click +1 · Right click -1 · click "×" to remove',
             tipTags: 'Tags',
@@ -839,6 +839,12 @@
     }
 
     function displayName(kind, name) {
+        // 三层优先级（任务 8 / 1.6.12）：① icon-exports 本地导出名（中文，若导出文件正常）
+        // → ② blocksitems 的 display_name → ③ 注册名去下划线 / Bergamot 翻译
+        if (lang === 'zh') {
+            const exported = iconExportName(kind, name);
+            if (exported) return exported;
+        }
         const english = englishName(kind, name);
         // 开启 Bergamot 名称翻译后优先显示中文（翻译结果由 web/ifm-translate.js 提供）
         const translator = window.IFMTranslate;

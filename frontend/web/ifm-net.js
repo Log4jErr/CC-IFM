@@ -154,13 +154,15 @@
             }
             const store = stores[category];
             if (!store) return;
-            if (category === 'deliveries') deliveriesSyncedAt = Date.now();
             const list = Array.isArray(changes[category]) ? changes[category] : [];
             list.forEach(function (item) {
                 const key = keyOf(category, item);
                 if (item._deleted) store.delete(key); else store.set(key, normalizeItemArrays(category, item));
             });
             markDirty(category);
+            // 发送队列的增量更新到了：立刻核对「发送中」里的乐观占位
+            // （后台已经发完的物品要马上从界面上消失，任务 5 / 1.6.12）
+            if (category === 'deliveries') reconcileOptimisticDeliveries();
         });
         scheduleRender();
     }
@@ -170,10 +172,8 @@
     // 这里在 start..end 之间把数据先收进缓冲，end（或超时兜底）时**整体替换**并只重画一次：
     // 页面不会再出现“列表先变空、再填回来”的闪烁，中途发失败也不会把界面清空。
     let fullSyncBuffer = null;      // { changes: { [category]: [...] }, timer }
-    // 最近一次“服务端把发送队列推给我”的时间（毫秒）：网页用它判断本地乐观占位要不要退休。
-    /// 没有它的话：如果服务端在我们发出请求后的第一次推送之前就已经把货发完了，
-    /// 那条乐观占位（“发送中”）会永远留在界面上（用户实测的现象，1.6.10 修）。
-    let deliveriesSyncedAt = 0;
+    // 1.6.12：发送队列的乐观占位不再按“服务端推送时间”猜退休时机，
+    // 改成 send_items 响应后“武装”，之后每次收到 deliveries 增量更新就核对（见 ifm-resources.js）。
 
     function beginFullSync() {
         if (fullSyncBuffer) clearTimeout(fullSyncBuffer.timer);
@@ -210,7 +210,6 @@
             }
             const store = stores[category];
             if (!store) return;
-            if (category === 'deliveries') deliveriesSyncedAt = Date.now();
             // 只替换这一轮真的收到数据的类别（没出现的类别保持原样，避免误清空）
             store.clear();
             asArray(buffer.changes[category]).forEach(function (item) {
@@ -218,6 +217,7 @@
                 store.set(keyOf(category, item), normalizeItemArrays(category, item));
             });
             markDirty(category);
+            if (category === 'deliveries') reconcileOptimisticDeliveries();
             touched = true;
         });
         if (touched) scheduleRender();

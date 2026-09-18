@@ -63,19 +63,21 @@
             if (worker.lastQuery && worker.lastQuery.mode) {
                 const stacks = worker.lastQuery.stacks || 0;
                 const scanned = worker.lastQuery.scanned || 0;
-                if (stacks > 0) {
-                    // 一条查询只查一个容器：这里显示容器名（老数据没有该字段时退回 mode）
-                    info.push(t('workerLastQuery', {
-                        container: String(worker.lastQuery.container || worker.lastQuery.mode || '?'),
-                        stacks: fmtCount(stacks),
-                        ms: worker.lastQuery.elapsed || 0
-                    }));
-                } else if (scanned === 0) {
+                const container = String(worker.lastQuery.container || worker.lastQuery.mode || '?');
+                const ms = worker.lastQuery.elapsed || 0;
+                if (scanned === 0) {
                     // 查询回来了、却一个容器都没看到：这台 worker 看不到主控的容器
                     // （多半不和主控在同一有线网络上）→ 容器代扫对它永远无效
                     info.push(t('workerScanBlind'));
+                } else if (stacks > 0) {
+                    info.push(t('workerLastQuery', {
+                        container: container,
+                        stacks: fmtCount(stacks),
+                        ms: ms
+                    }));
                 } else {
-                    info.push(t('workerLastQueryEmpty', { scanned: fmtCount(scanned) }));
+                    // 扫到的容器是空的：也要显示**外设名与用时**（任务 6：以前只显示“扫过 N 个容器”）
+                    info.push(t('workerLastQueryEmpty', { container: container, ms: ms }));
                 }
             }
             // 普通信息一行、异常信息（红字）一行：版本不匹配时能一眼看出来
