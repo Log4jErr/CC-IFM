@@ -98,10 +98,11 @@ shell.run("bg", "IFMWorker.lua")
 
 ### netsync
 - 你有1个主控和一大堆从节点，现在IFM版本更新了，一个个去更新可太麻烦了。工具脚本netserver和netsync是成对使用的，用于自动同步文件。
-- netserver启动时需要指定name，然后它会将本机所有文件发送给指定的name相同的运行了netsync的计算机。
+- netserver启动时需要指定name，它会把 `/netsync/<name>/` 目录下的文件（含子目录）发送给同名的 netsync 计算机，所以**要分发的文件必须放进 `/netsync/<name>/`**（以 `.` 开头的项、服务端脚本自身、`*.version`、顶层的 `rom/` 与 `disk/` 不会被下发）。
 - netsync启动时需要指定name，然后它会从netserver下载所有文件到本机，下载完成后重启计算机。
 - netserver有一个文件版本信息，修改了文件后你需要使用netserver --update name启动netserver，以更新版本。
 - netsync只会在netserver有更新的版本时才下载。否则会保持等待。
+- 如果 `/netsync/<name>/` 是空的：netserver 启动时会提示 "the sync root is empty"，客户端拿到 0 个文件会报"server returned 0 files" 并**不算同步成功**（不写盘、不记版本号、不重启），把文件放进该目录后重新运行 `netserver --update <name>` 即可。
 - 为了使用这个脚本自动更新IFM，你应当在主控节点安装netserver，在从节点安装netsync，并且从节点可以设置netsync和IFMWorker同时开机自启（借助shell.run bg或者fg命令）。每次需要更新IFM版本时，先在主控安装新版IFM，然后在主控运行netserver --update <名称>
 
 ### crafter
@@ -205,10 +206,11 @@ shell.run("bg", "IFMWorker.lua")
 
 ### netsync
 - You have one master computer plus a pile of workers, and IFM just released a new version — updating them one by one is a pain. The `netserver` / `netsync` pair syncs files automatically.
-- `netserver` is started with a name and then sends all files on that computer to every computer running `netsync` with the same name.
+- `netserver` is started with a name and serves the files inside `/netsync/<name>/` (subdirectories included), so **the files you want to distribute must be placed there** (entries starting with `.`, the server script itself, `*.version` and the top-level `rom/` and `disk/` are never sent).
 - `netsync` is started with a name, downloads all files from that `netserver` to the local computer, and reboots the computer when the download is done.
 - `netserver` keeps a version number: after you change the files, start it with `netserver --update <name>` to bump the version.
 - `netsync` only downloads when the server has a newer version; otherwise it just keeps waiting.
+- If `/netsync/<name>/` is empty: `netserver` prints "the sync root is empty" at startup, and the client logs "server returned 0 files" and does **not** treat it as a successful sync (nothing is written, the version is not recorded and the computer is not rebooted). Put the files there and run `netserver --update <name>` again.
 - To auto-update IFM with this, install `netserver` on the master and `netsync` on the workers, and start `netsync` together with `IFMWorker` at boot (using `shell.run` with `bg` or `fg`). Whenever IFM updates: install the new version on the master first, then run `netserver --update <name>` on the master.
 
 ### crafter

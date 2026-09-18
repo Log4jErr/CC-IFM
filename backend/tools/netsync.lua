@@ -33,6 +33,7 @@ local PROTOCOL = "netsync"          -- 消息协议标识
 local ANNOUNCE_CHANNEL = 42001      -- 广播发现频道
 local CHUNK_SIZE = 4096             -- 单个数据块大小(字节)
 local STATE_DIR = "/.netsync"       -- 客户端状态目录
+local SERVER_ROOT = "/netsync"      -- 服务端的同步根目录(/netsync/<name>, 与 netserver.lua 保持一致)
 local ID_CHANNEL_MOD = 65500        -- 电脑 ID 通道取模(保证通道号在 0-65535 内)
 local REPLY_TIMEOUT = 5             -- 单次请求等待时间(秒)
 local MAX_ATTEMPTS = 5              -- 清单 / 数据块的最大重试次数
@@ -398,6 +399,15 @@ local function syncFrom(server)
     local files = requestList(server)
     if not files then
         log("failed to get the file list")
+        return false
+    end
+    --- 空清单 = 服务端的同步根目录里什么都没有（或者里面的东西全被跳过规则过滤了）。
+    --- **绝不能当成同步成功**：那样客户端会记下这个版本号，服务端之后放了文件也不会再来取
+    --- （版本号没变就不算"有新版本"）。这里按失败处理，等下一次广播重试。
+    if #files == 0 then
+        log("server returned 0 files: its sync root (%s/%s) is empty, or everything inside is excluded",
+            SERVER_ROOT, name)
+        log("nothing downloaded and the version was NOT recorded; put the files into the server's sync root, then run 'netserver --update %s'", name)
         return false
     end
     local totalBytes = 0

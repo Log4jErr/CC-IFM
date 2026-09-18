@@ -188,6 +188,9 @@ local function sendList(targetChannel, clientId)
         files = files,
     })
     log("client #%s requested the file list: %d file(s)", tostring(clientId), #files)
+    if #files == 0 then
+        log("  nothing to distribute: sync root %s is empty (or everything inside it is excluded)", root)
+    end
 end
 
 -- 回复一个数据块
