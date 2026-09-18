@@ -3,16 +3,20 @@
     通过 modem 定期广播自己, 供同名客户端发现并下载文件(同名文件覆盖)
 
     用法:
-      netserver [--update] <name>
+      netserver <name>
 
     参数:
-      --update  可选; 指定时版本号 +1, 然后对外提供服务
       <name>    服务端名称, 仅允许字母 / 数字 / 下划线 / 连字符
+
+    版本号(1.6.19 起全自动): 启动时先把同步范围内的**所有文件内容**算一遍哈希, 和上次记录的
+      哈希( /netsync/<name>.hash )不一致就把版本号 +1 并写回, 一致就保持不动。
+      因此**不再需要 --update**(传了会报错提醒); 客户端只在版本号变大时才来下载。
 
     同步范围(1.6.17 起): 不再固定同步某个目录, 而是读**脚本同目录**下的两个文件:
       syncinclude.txt   每行一个路径, 要同步的内容(目录末尾写 "/", 会递归)
       syncignore.txt    每行一个路径, 要忽略的内容(目录带不带 "/" 都行)
-      两个文件都支持绝对路径(以 "/" 开头, 相对电脑根目录)与相对路径(相对本脚本所在目录);
+      绝对路径以**文件系统根目录** "/" 为起点, 与脚本放在哪里无关(例: "/ifm/" 就是根目录下的
+      ifm/, 不会变成"脚本目录/ifm/"); 相对路径才相对本脚本所在目录。
       "#" 开头的行是注释, 空行忽略。两个文件必须存在, 缺哪个就创建哪个(空文件)并报错。
 
     客户端上的落点: 服务端绝对路径去掉开头的 "/" 就是客户端上的路径 ——
@@ -42,6 +46,7 @@ local CHUNK_SIZE = 4096             -- 单个数据块大小(字节)
 local DATA_ROOT = "/netsync"        -- 服务端状态目录(只放 <name>.version)
 local INCLUDE_FILE = "syncinclude.txt"  -- 同步范围(放在脚本同目录)
 local IGNORE_FILE = "syncignore.txt"    -- 忽略范围(放在脚本同目录)
+local HASH_SUFFIX = ".hash"             -- 内容哈希记录文件(/netsync/<name>.hash)
 local ID_CHANNEL_MOD = 65500        -- 电脑 ID 通道取模(保证通道号在 0-65535 内)
 local MAX_SERVES_PER_TICK = 6       -- 每个 tick 最多回复多少个请求(公平轮转)
 local CLIENT_TIMEOUT_MS = 60000     -- 客户端队列的保活时间(超过就丢掉它的统计)
@@ -52,10 +57,10 @@ local CLIENT_TIMEOUT_MS = 60000     -- 客户端队列的保活时间(超过就�
 
 local function usage()
     print("NetSync server")
-    print("usage: netserver [--update] <name>")
-    print("  --update  bump the version number, then start serving")
+    print("usage: netserver <name>")
     print("  <name>    server name (letters / digits / underscore / hyphen only)")
-    print("example: netserver --update alpha")
+    print("example: netserver alpha")
+    print("  the version number is bumped automatically when the synced files change")
 end
 
 -- 校验名称, 避免路径分隔符等字符混入目录名
@@ -160,9 +165,16 @@ local function parsePaths(text, dir, kind)
             local isDir = value:sub(-1) == "/"
             local raw = isDir and value:sub(1, -2) or value
             if raw ~= "" then
-                local abs = fs.combine(raw)
-                if abs:sub(1, 1) ~= "/" then
-                    abs = fs.combine(dir, abs)          -- 相对路径: 相对 netserver 脚本所在目录
+                --- 以 "/" 开头的行是**绝对路径**: 从文件系统根目录开始, 与脚本位置无关
+                --- (1.6.19 修正: 以前先 fs.combine 再判断, "/ifm/" 可能被解析成"脚本目录/ifm/")
+                local abs
+                if value:sub(1, 1) == "/" then
+                    abs = fs.combine(raw)
+                    if abs:sub(1, 1) ~= "/" then
+                        abs = "/" .. abs
+                    end
+                else
+                    abs = fs.combine(dir, raw)          -- 相对路径: 相对 netserver 脚本所在目录
                 end
                 out[#out + 1] = { kind = kind, raw = value, path = fs.combine(abs), isDir = isDir }
             end
@@ -249,6 +261,67 @@ local function resolveFile(clientPath)
     return abs
 end
 
+-- ==========================================
+-- 内容哈希（自动判断要不要把版本号 +1）
+-- ==========================================
+
+-- 简易 32 位滚动哈希：CC:T 的 Lua 没有 sha/md5，这里只用加/乘/取模，不需要位运算
+local function hashText(hash, text)
+    for i = 1, #text do
+        hash = (hash * 31 + text:byte(i)) % 4294967296
+    end
+    return hash
+end
+
+-- 同步范围内所有内容(路径 + 大小 + 文件内容)的哈希；按 4KB 分块读，不把大文件整个塞进内存
+local function computeContentHash(files, index)
+    local hash = 2166136261
+    hash = hashText(hash, tostring(#files))
+    for _, entry in ipairs(files) do
+        hash = hashText(hash, entry.path .. "|" .. tostring(entry.size or 0))
+        local abs = index[entry.path]
+        if abs then
+            local handle = fs.open(abs, "r")
+            if handle then
+                while true do
+                    local chunk = handle.read(4096)
+                    if chunk == nil or chunk == "" then
+                        break
+                    end
+                    hash = hashText(hash, chunk)
+                end
+                handle.close()
+            end
+        end
+    end
+    return tostring(math.floor(hash))
+end
+
+local function readHash(path)
+    if not fs.exists(path) then
+        return nil
+    end
+    local handle = fs.open(path, "r")
+    if not handle then
+        return nil
+    end
+    local text = (handle.readAll() or ""):gsub("%s+", "")
+    handle.close()
+    if text == "" then
+        return nil
+    end
+    return text
+end
+
+local function writeHash(path, value)
+    fs.makeDir(fs.getDir(path))
+    local handle = fs.open(path, "w")
+    if handle then
+        handle.write(tostring(value))
+        handle.close()
+    end
+end
+
 -- 从文件的 offset 位置读取最多 count 字节
 local function readChunk(path, offset, count)
     local file = fs.open(path, "r")
@@ -269,6 +342,7 @@ end
 
 local configDir = "/"          -- 两个配置文件所在目录(netserver 脚本目录)
 local versionPath              -- 版本号文件
+local hashPath                 -- 内容哈希文件(与 version 同目录)
 local version = 0              -- 当前对外版本号
 local modem                    -- modem 外设
 local myChannel = 0            -- 本机直连通道
@@ -404,11 +478,12 @@ end
 -- ==========================================
 
 local args = { ... }
-local update = false
 name = nil
 for _, value in ipairs(args) do
-    if value == "--update" then
-        update = true
+    if value:sub(1, 1) == "-" then
+        usage()
+        error("unknown option: " .. tostring(value) ..
+            " (--update is no longer needed: the version is bumped automatically when the synced files change)", 0)
     elseif name == nil then
         name = value
     else
@@ -423,6 +498,7 @@ if not validName(name) then
 end
 
 versionPath = fs.combine(DATA_ROOT, name .. ".version")
+hashPath = fs.combine(DATA_ROOT, name .. HASH_SUFFIX)
 
 --- 同步范围: 两个配置文件都放在 netserver 脚本同目录; 缺哪个就创建哪个(空文件)并报错
 configDir = scriptDir()
@@ -433,12 +509,22 @@ log("sync config: %s (%d include path(s)) / %s (%d ignore path(s))",
     fs.combine(configDir, INCLUDE_FILE), #includeEntries,
     fs.combine(configDir, IGNORE_FILE), #ignoreEntries)
 
+--- 版本号：把当前同步范围内的所有内容算一遍哈希，和上次记录的不一样就 +1。
+--- 这样改了文件直接启动就行，不用再记 --update。
+local startupFiles = scanIncludes()
+local contentHash = computeContentHash(startupFiles, index)
 version = readVersion(versionPath)
-if update then
+local storedHash = readHash(hashPath)
+if storedHash ~= contentHash then
     version = version + 1
-    log("version bumped to %d", version)
+    writeVersion(versionPath, version)
+    writeHash(hashPath, contentHash)
+    log("content hash changed (%s -> %s): version bumped to %d",
+        tostring(storedHash), tostring(contentHash), version)
+else
+    writeVersion(versionPath, version)
+    log("content hash unchanged (%s): version stays %d", tostring(contentHash), version)
 end
-writeVersion(versionPath, version)
 
 modem = peripheral.find("modem")
 if not modem then
@@ -459,9 +545,13 @@ local function announce()
     })
 end
 
-local startupFiles = scanIncludes()
+local totalBytes = 0
+for _, entry in ipairs(startupFiles) do
+    totalBytes = totalBytes + (entry.size or 0)
+end
 log("server started: name=%s version=%d local channel=%d", name, version, myChannel)
-log("to distribute: %d file(s) (see %s / %s in %s)", #startupFiles, INCLUDE_FILE, IGNORE_FILE, configDir)
+log("sync rules matched %d file(s), %d byte(s) in total (see %s / %s in %s)",
+    #startupFiles, totalBytes, INCLUDE_FILE, IGNORE_FILE, configDir)
 if #startupFiles == 0 then
     log("note: nothing to distribute - put the paths you want to send into %s in %s",
         INCLUDE_FILE, configDir)

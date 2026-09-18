@@ -101,13 +101,13 @@ shell.run("bg", "ifm/IFMWorker.lua")
 ### netsync
 - 你有1个主控和一大堆从节点，现在IFM版本更新了，一个个去更新可太麻烦了。工具脚本netserver和netsync是成对使用的，用于自动同步文件。
 - netserver和netsync启动时需要指定name，相同的name之间的netserver会把文件同步给netsync。
-- netserver脚本同目录下两个配置文件决定要同步哪些内容：`syncinclude.txt` 每行一个要同步的路径（目录末尾写 `/`，会递归同步目录下的内容），`syncignore.txt` 每行一个要忽略的路径；两者都支持绝对路径（以 `/` 开头）与相对路径（相对 netserver 脚本所在目录），`#` 开头是注释、空行忽略
-- netsync以脚本自身所在目录作为根目录写文件。
+- netserver脚本同目录下两个配置文件决定要同步哪些内容：`syncinclude.txt` 每行一个要同步的路径（目录末尾写 `/`，会递归同步目录下的内容），`syncignore.txt` 每行一个要忽略的路径；两者都支持绝对路径（以 `/` 开头，**以文件系统根目录为起点**，例 `/ifm/` 就是根目录下的 ifm/，与脚本放在哪里无关）与相对路径（相对 netserver 脚本所在目录），`#` 开头是注释、空行忽略
+- **客户端上的落点 = 服务端绝对路径去掉开头的 `/`**（服务端 `/ifm/x.lua` → 客户端 `/ifm/x.lua`），服务端怎么摆，客户端就怎么摆。
 - netserver需要两个配置文件，syncinclude.txt和syncignore.txt，前者指定要同步的文件或目录的路径（目录路径末尾加斜杠/），后者指定要排除的路径。
 - netsync只会在netserver有更新的版本时才下载。否则会保持等待。
-- 每次你更新了文件，需要同步时，使用netserver --update name启动netserver，以更新版本。
-- --update参数可以不加，此时netserver不会更新版本。一句话描述：如果你修改了要同步的文件，启动netserver时加--update。如果文件没有变动，不加--update参数。
-- 为了使用这个脚本自动更新IFM，你应当在主控节点安装netserver，设置同步目录为ifm/，在从节点安装netsync，并且从节点可以设置netsync和IFMWorker同时开机自启（借助shell.run bg或者fg命令）。每次需要更新IFM版本时，先在主控安装新版IFM，然后在主控运行netserver --update <名称>。觉得太麻烦了？一次处理，之后就可以一直受益。
+- **版本号是自动的**：netserver 启动时会把同步范围内所有文件（路径 + 大小 + 内容）算一遍哈希，与上次记录的 `/netsync/<name>.hash` 不一致就把版本号 +1，一致就不动。改完文件直接启动 netserver 即可。
+- 启动时会打印**按同步规则匹配到的文件总数与总字节数**（如 `sync rules matched 37 file(s), 412345 byte(s) in total`）；一个都没有时会提示把路径写进 `syncinclude.txt`。`--update` 参数已在 1.6.19 移除（传了会报错提醒）。
+- 为了使用这个脚本自动更新IFM，你应当在主控节点安装netserver，设置同步目录为ifm/，在从节点安装netsync，并且从节点可以设置netsync和IFMWorker同时开机自启（借助shell.run bg或者fg命令）。每次需要更新IFM版本时，先在主控安装新版IFM，然后在主控重新启动 netserver（版本号会自动 +1）。觉得太麻烦了？一次处理，之后就可以一直受益。
 
 ### crafter
 - 现在你希望使用IFM自动合成，可Minecraft原版的合成器速度很慢（而且，很卡！），为此你可以使用海龟合成。
@@ -216,13 +216,13 @@ shell.run("bg", "ifm/IFMWorker.lua")
 ### netsync
 - You have one master and a pile of workers, and IFM just released a new version - updating them one by one is a pain. The `netserver` and `netsync` scripts are used as a pair to sync files automatically.
 - `netserver` and `netsync` are started with a name; a `netserver` syncs its files to the `netsync`s with the same name.
-- Two config files next to the `netserver` script decide what gets synced: `syncinclude.txt` (one path per line to sync; a directory ends with `/` and its contents are synced recursively) and `syncignore.txt` (one path per line to ignore). Both accept absolute paths (leading `/`) and relative paths (relative to the directory of the `netserver` script); lines starting with `#` are comments, empty lines are ignored.
-- `netsync` writes files with its own script directory as the root.
+- Two config files next to the `netserver` script decide what gets synced: `syncinclude.txt` (one path per line to sync; a directory ends with `/` and its contents are synced recursively) and `syncignore.txt` (one path per line to ignore). Both accept absolute paths (leading `/`, **resolved from the filesystem root** - `/ifm/` means the `ifm/` in the root directory, no matter where the script lives) and relative paths (relative to the directory of the `netserver` script); lines starting with `#` are comments, empty lines are ignored.
+- **Client-side layout = the server-side absolute path without the leading `/`** (server `/ifm/x.lua` becomes client `/ifm/x.lua`): whatever layout the server has, the client gets the same.
 - `netserver` needs the two config files, `syncinclude.txt` and `syncignore.txt`: the former lists the files or directories to sync (a directory path ends with `/`), the latter lists the paths to exclude.
 - `netsync` only downloads when `netserver` has a newer version; otherwise it keeps waiting.
-- Every time you change files and want them synced, start `netserver` with `netserver --update name` to bump the version.
-- `--update` may be omitted, in which case `netserver` does not bump the version. In one sentence: add `--update` when the files to sync changed, omit it when they did not.
-- To auto-update IFM with this, install `netserver` on the master and set the sync directory to `ifm/`, install `netsync` on the workers, and you can auto-start `netsync` together with `IFMWorker` at boot (via `shell.run` `bg` or `fg`). Whenever IFM updates: install the new version on the master first, then run `netserver --update <name>` on the master. Sounds like a hassle? Do it once and benefit forever.
+- **The version number is automatic**: on startup `netserver` hashes every file in the sync scope (path + size + content) and, when the result differs from the recorded `/netsync/<name>.hash`, bumps the version by one; when nothing changed it stays put. Just start `netserver` after editing files.
+- On startup it prints **how many files the sync rules matched and their total size** (e.g. `sync rules matched 37 file(s), 412345 byte(s) in total`); when that is zero it tells you to put paths into `syncinclude.txt`. The `--update` argument was removed in 1.6.19 (passing it is an error with a hint).
+- To auto-update IFM with this, install `netserver` on the master and set the sync directory to `ifm/`, install `netsync` on the workers, and you can auto-start `netsync` together with `IFMWorker` at boot (via `shell.run` `bg` or `fg`). Whenever IFM updates: install the new version on the master first, then restart `netserver` on the master (its version bumps automatically). Sounds like a hassle? Do it once and benefit forever.
 
 ### crafter
 - You want IFM auto-crafting, but the vanilla Crafter is slow (and laggy!) — use a turtle as a batch crafter instead.
