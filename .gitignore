@@ -5,6 +5,10 @@ __pycache__/
 # backend/build.py 的 Node 依赖（本机 npm install 安装，不入库）
 backend/node_modules/
 
+# 构建时随手重定向出来的临时日志（b.txt 之类），不要入库
+backend/*.txt
+backend/*.log
+
 # 构建产物：用 `python backend/build.py` 重新生成即可（默认不带注释，约 350KB）
 # backend/ifm_bundle.lua **要入库**：README 里的
 #   wget run https://raw.githubusercontent.com/Log4jErr/CC-IFM/main/backend/ifm_bundle.lua
