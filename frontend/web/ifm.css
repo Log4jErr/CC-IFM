@@ -660,7 +660,9 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 /* 点「发送」时飞向「发送中」的副本（FLIP 动画） */
 .send-ghost {
     position: fixed;
-    z-index: 60;
+    /* 飞行副本必须压在底部面板（#deliveryPanel z-index 40）和提示条（60）之上，
+       否则动画会“飞进面板后面”看不见（1.6.11 排查：动画元素被面板遮住） */
+    z-index: 3000;
     margin: 0;
     pointer-events: none;
     transition: transform .45s cubic-bezier(.2, .7, .3, 1), opacity .45s linear;

@@ -701,6 +701,30 @@
         return value.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
     }
 
+    // ===== 控制台手动翻译（任务 4，1.6.11）=====
+    // 在浏览器控制台里试一句话的翻译效果：
+    //   await IFMTranslate.translateText('Andesite Casing')     // => '安山岩外壳'（本地模型/缓存）
+    //   await IFMTranslate.translateText('Iron Ingot', { cached: false })  // 强制重新翻译（跳过缓存）
+    // 返回中文译文；引擎还没就绪 / 没开启翻译时抛错（错误信息说明原因，照抄到控制台即可）。
+    async function translateText(text, options) {
+        const source = cleanTranslateInput(text);
+        if (!source) return '';
+        const opts = options || {};
+        if (opts.cached !== false && cache[source]) return cache[source];
+        if (!enabled) throw new Error('翻译开关没打开：先点顶部「物品名翻译」按钮');
+        await start();
+        if (status !== 'ready') {
+            throw new Error('翻译引擎未就绪（status=' + status + '）：' + (message || ''));
+        }
+        const translated = translateBatch([source])[0] || '';
+        if (translated) {
+            cache[source] = translated;
+            saveCacheSoon();
+            notify();                 // 界面会顺带用上新译文
+        }
+        return translated;
+    }
+
     function queueNames(names) {
         if (!enabled || status !== 'ready') return;
         let added = false;
@@ -758,6 +782,7 @@
             return cache[englishName] || null;
         },
         queueNames: queueNames,
+        translateText: translateText,
         translatedCount: function () { return Object.keys(cache).length; },
         setEnabled: setEnabled,
         clearCache: function () {

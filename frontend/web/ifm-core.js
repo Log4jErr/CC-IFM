@@ -9,7 +9,7 @@
     // ===================== 常量 =====================
     // 前端版本号：必须与后端 backend/IFMMaster.lua 里的 IFM_VERSION 完全一致。
     // 连上服务端后会比对 status.version，不一致就弹警告并主动停止连接（见 ifm-net.js）。
-    const IFM_CLIENT_VERSION = '1.6.10';
+    const IFM_CLIENT_VERSION = '1.6.11';
     const DEFAULT_RELAY = 'wss://itty.ws/c/';
     const API_BASE = 'https://blocksitems.com/api/v1';
     const API_ORIGIN = 'https://blocksitems.com';
@@ -66,7 +66,8 @@
     // 版本比对：服务端版本号 + 是否因版本不一致而停止连接（避免新旧版本混用产生怪问题）
     let serverVersion = '';
     let versionMismatch = false;
-    let sortMode = 'default';         // default | name | count
+    // 资源排序模式（1.6.11）：数量降序（默认）/ 数量升序 / 字典序
+    let sortMode = 'countDesc';       // countDesc | countAsc | name
     // 「外设与定义」的排序模式：peripheral（外设名字典序，默认）| block（方块名）| defs（定义数量）
     let peripheralSortMode = 'peripheral';
     let searchText = '';
@@ -236,7 +237,7 @@
             tipCraftClick: '点右上角 “+”：只合成不发送',
             tipSendClick: '左键 +1 · 右键 -1 · 点右上角 “×” 移除',
             tipTags: '标签',
-            searchSyntax: '搜索：关键词 / #标签 / @模组（空格分隔多个条件，同时满足才显示）',
+            searchSyntax: '搜索：关键词（支持英文/中文/拼音，如 gzt、gongzuotai） / #标签 / @模组（空格分隔多个条件，同时满足才显示）',
             tipGraphClick: '点击圆点编辑该流程定义',
             tipGraphCraft: '点击节点图标可填入合成数量（只合成，不发送）',
             tipCrafting: '正在合成', tipCraftTarget: '剩余目标',
@@ -260,6 +261,12 @@
             sortPeripheralPeripheral: '外设名',
             sortPeripheralBlock: '方块名',
             sortPeripheralDefs: '定义数量',
+            sortTitle: '排序', sortCountDesc: '数量降序', sortCountAsc: '数量升序', sortName: '字典序',
+            settingsTitle: '设置', settingsScan: '容器扫描',
+            settingsStorageScan: '存储容器扫描间隔（毫秒）',
+            settingsInputScan: '输入容器扫描间隔（毫秒）',
+            settingsHint: '扫描间隔越大，主控读外设越少、越省性能；越小则库存/输入容器变化越快被看到。范围 250 ~ 600000 毫秒。',
+            settingsSaved: '已保存扫描间隔（存储 {storage}ms / 输入 {input}ms）',
             missingDelete: '删除该外设对应的定义',
             missingDeleted: '已删除定义「{name}」',
             containerPut: '放入', containerTake: '取出',
@@ -416,6 +423,12 @@
             sortPeripheralPeripheral: 'Peripheral',
             sortPeripheralBlock: 'Block',
             sortPeripheralDefs: 'Defs',
+            sortTitle: 'Sort', sortCountDesc: 'Count (desc)', sortCountAsc: 'Count (asc)', sortName: 'Name',
+            settingsTitle: 'Settings', settingsScan: 'Container scanning',
+            settingsStorageScan: 'Storage container scan interval (ms)',
+            settingsInputScan: 'Input container scan interval (ms)',
+            settingsHint: 'Longer intervals read peripherals less often (lighter on the master); shorter intervals make stock / input container changes show up sooner. Range 250 ~ 600000 ms.',
+            settingsSaved: 'Scan intervals saved (storage {storage}ms / input {input}ms)',
             missingDelete: 'Delete the definition behind this missing peripheral',
             missingDeleted: 'Deleted definition "{name}"',
             containerPut: 'Put in', containerTake: 'Take out',
@@ -480,7 +493,7 @@
             tipCraftClick: 'Click "+" at the top right: craft only (no send)',
             tipSendClick: 'Left click +1 · Right click -1 · click "×" to remove',
             tipTags: 'Tags',
-            searchSyntax: 'Search: keyword / #tag / @mod (space separates conditions, all must match)',
+            searchSyntax: 'Search: keyword (English / Chinese / pinyin, e.g. gzt or gongzuotai) / #tag / @mod (space separates conditions, all must match)',
             tipGraphClick: 'Click the dot to edit this process',
             tipGraphCraft: 'Click the node icon to enter a craft amount (craft only, no send)',
             tipCrafting: 'Crafting', tipCraftTarget: 'Left to craft'

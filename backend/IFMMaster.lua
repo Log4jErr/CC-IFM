@@ -16,7 +16,7 @@ local args = { ... }
 --- 版本号：前端 web/ifm-core.js 里的 IFM_CLIENT_VERSION 必须与此保持一致。
 --- 网页连上后会比对两边的版本号，不一致时弹出警告并主动停止连接，
 --- 避免“新前端 + 旧后端”（或反过来）产生难以定位的怪问题。
-local IFM_VERSION = "1.6.10"
+local IFM_VERSION = "1.6.11"
 
 local DEFAULT_RELAY = "wss://itty.ws/c/"
 
@@ -224,6 +224,18 @@ if cacheLoaded then
 else
     log("No existing runtime state (%s), starting fresh", tostring(cacheErr))
 end
+
+--- 容器扫描间隔设置（1.6.11）：存储容器（list 缓存时长）与输入容器（排空扫描节奏）。
+--- 网页「设置」面板改完会立刻生效，重启后从 config.json 里的 settings.scan 恢复。
+local function applyScanSettings()
+    local settings = store:scanSettings()
+    containers:applyScanSettings(settings.storageScanMs)
+    engine:applyScanSettings(settings.inputScanMs)
+    return settings
+end
+local scanSettings = applyScanSettings()
+log("Container scan settings: storage=%dms input=%dms (config.json -> settings.scan)",
+    scanSettings.storageScanMs, scanSettings.inputScanMs)
 
 --- 房间号：保存在 config.json 顶层的 room 字段里（不再使用 room.txt）
 -- 规则：--room 指定 -> 用它；--random-room -> 随机一个；都没有 -> 用配置里的；配置里没有 -> 随机并写入配置
@@ -711,6 +723,8 @@ function buildStatus()
     if transfer then
         current.transfer = transfer:status()
     end
+    --- 容器扫描间隔设置（网页「设置」面板显示 + 编辑）
+    current.scanSettings = store:scanSettings()
     return current
 end
 
@@ -989,6 +1003,23 @@ local function handleRequest(payload)
         log("Storage compact requested (%s): the plan is computed in small slices so the master stays responsive",
             tostring(state))
         return { success = true, planning = true, state = state }
+    elseif action == "set_scan_settings" then
+        --- 容器扫描间隔（毫秒）：存储容器 / 输入容器各一个。校验走 Store:set，
+        --- 保存后立刻应用并回传生效值（网页直接显示回传值，避免“看着存了其实没生效”）。
+        local data = {
+            storageScanMs = payload.storageScanMs,
+            inputScanMs = payload.inputScanMs,
+        }
+        local ok, err = store:set("settings", Store.SETTINGS_NAME, data, { force = true })
+        if not ok then
+            log("Save settings failed: %s", tostring(err))
+            return { error = err }
+        end
+        local applied = applyScanSettings()
+        store:flush()
+        log("Container scan settings updated: storage=%dms input=%dms",
+            applied.storageScanMs, applied.inputScanMs)
+        return { success = true, scanSettings = applied }
     elseif action == "container_view" then
         -- 交互容器管理：查看该容器当前的内容物
         return containerView(payload)

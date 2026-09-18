@@ -442,6 +442,19 @@ function Containers:setCacheOnly(on)
     end
 end
 
+--- 应用「存储容器扫描间隔」设置（毫秒，来自网页「设置」面板，见 IFMMaster 的 set_settings）：
+--- 就是 list 缓存的基础时长 self.listTtl（effectiveListTtl 会在容器很多时再放大它）。
+--- 传 nil 时不改动；返回真正生效的值。
+function Containers:applyScanSettings(storageScanMs)
+    local value = tonumber(storageScanMs)
+    if value and value > 0 then
+        self.listTtl = math.max(250, math.floor(value))
+        --- 交给 worker 代扫时，旧值最多还能顶多久：至少等于缓存时长，别让缓存先“作废”
+        self.staleTtl = math.max(self.staleTtl or 0, self.listTtl)
+    end
+    return self.listTtl
+end
+
 --- 只读缓存模式下的 list 结果：有缓存就直接用（不看 TTL），没有就返回 nil 表示“这一轮没有数据”
 function Containers:cachedList(peripheralName)
     local cached = self.listCache[peripheralName]
@@ -636,7 +649,10 @@ function Containers:setScanProvider(provider)
 end
 
 --- 物品搬运：从 fromContainer 的 fromSlot 推送到 toContainer（toSlot 为 nil 或 <1 表示任意槽位）
-function Containers:pushItem(fromContainer, fromSlot, limit, toContainer, toSlot)
+--- mode（可选）：往存储容器放东西时的**放入策略**（Containers.INSERT_SPEED / INSERT_LEAST）：
+---   传了策略且没指定 toSlot 时，IFM 自己挑槽位（见 insertSlotFor）；挑出来的槽位先试一次，
+---   万一因为缓存过期放不进去，再退回 CC:T 的默认放入行为（保证“就算挑错也照样能搬”）。
+function Containers:pushItem(fromContainer, fromSlot, limit, toContainer, toSlot, mode)
     local fromPeripheral = self:peripheralOf(fromContainer, "item")
     local toPeripheral = self:peripheralOf(toContainer, "item")
     if not fromPeripheral then
@@ -645,7 +661,17 @@ function Containers:pushItem(fromContainer, fromSlot, limit, toContainer, toSlot
     if not toPeripheral then
         return 0, self:unusableReason(toContainer, "item") or ("\\u76EE\\u6807\\u5BB9\\u5668 " .. tostring(toContainer) .. " \\u4E0D\\u53EF\\u7528")
     end
-    local wantsSlot = (tonumber(toSlot) or -1) >= 1 and tonumber(toSlot) ~= fromSlot
+    local explicitSlot = (tonumber(toSlot) or -1) >= 1 and tonumber(toSlot) or nil
+    --- 放入策略：没显式指定槽位时自己挑一个（只在“不同外设之间”做，容器内部挪动不动它）
+    local autoSlot = nil
+    if not explicitSlot and mode and fromPeripheral ~= toPeripheral then
+        local source = self:stackAt(fromContainer, fromSlot)
+        if source and source.name then
+            autoSlot = self:insertSlotFor(toContainer, source.name, source.nbt, tonumber(limit) or 1, mode)
+        end
+    end
+    local chosenSlot = explicitSlot or autoSlot
+    local wantsSlot = chosenSlot ~= nil and chosenSlot ~= fromSlot
     if fromPeripheral == toPeripheral and not wantsSlot then
         -- 同一个外设：只有“明确要求换到另一个槽位”时才需要搬运（容器内部挪动，CC 允许）；
         -- 否则资源本来就在目标容器里，返回理由交给调用方按“已经在目标容器里”处理。
@@ -663,45 +689,183 @@ function Containers:pushItem(fromContainer, fromSlot, limit, toContainer, toSlot
     --- （不管成功与否都记账：调用方随后 invalidate() 时只作废这两个容器，其它容器复用缓存）
     self.dirty[fromPeripheral] = true
     self.dirty[toPeripheral] = true
-    if self.transfer then
-        local state, moved, err = self.transfer:request({
-            action = "push_item",
-            from = fromPeripheral,
-            fromSlot = fromSlot,
-            limit = limit,
-            to = toPeripheral,
-            toSlot = (tonumber(toSlot) or -1) >= 1 and toSlot or nil,
-        })
-        if state == "pending" then
-            return nil, "pending"
-        elseif state == "done" then
-            return moved, err
+    --- 尝试一次搬运（slot 为 nil = 让 CC:T 自己挑目标槽位）
+    local function attempt(slot)
+        if self.transfer then
+            local state, moved, err = self.transfer:request({
+                action = "push_item",
+                from = fromPeripheral,
+                fromSlot = fromSlot,
+                limit = limit,
+                to = toPeripheral,
+                toSlot = (tonumber(slot) or -1) >= 1 and slot or nil,
+            })
+            if state == "pending" then
+                return nil, "pending"
+            elseif state == "done" then
+                return moved, err
+            end
+        end
+        local targetSlot = (tonumber(slot) or -1) >= 1 and slot or nil
+        local ok, moved = pcall(inv.pushItems, toPeripheral, fromSlot, limit, targetSlot)
+        if ok and type(moved) == "number" and moved > 0 then
+            return moved
+        end
+        if not ok then
+            -- 包装对象可能已失效（外设替换 / 区块重载）：清缓存，下个 tick 重新 wrap 再试
+            self.Peripherals:invalidate(fromPeripheral)
+            self.Peripherals:invalidate(toPeripheral)
+        end
+        local targetInv = self:inventory(toPeripheral)
+        if targetInv then
+            local ok2, moved2 = pcall(targetInv.pullItems, fromPeripheral, fromSlot, limit, targetSlot)
+            if ok2 and type(moved2) == "number" and moved2 > 0 then
+                return moved2
+            end
+        end
+        if ok then
+            return 0, "\\u672A\\u80FD\\u642C\\u8FD0\\u4EFB\\u4F55\\u7269\\u54C1"
+        end
+        return 0, tostring(moved)
+    end
+    local moved, err = attempt(chosenSlot)
+    if err == "pending" then
+        return moved, err
+    end
+    if (tonumber(moved) or 0) == 0 and autoSlot and not explicitSlot then
+        --- 挑出来的槽位可能已经过期（缓存 1.2 秒）：退回 CC:T 的默认放入行为，绝不让搬运白跑
+        local retryMoved, retryErr = attempt(nil)
+        if retryErr ~= "pending" and (tonumber(retryMoved) or 0) > 0 then
+            return tonumber(retryMoved), nil
         end
     end
-    local targetSlot
-    if toSlot and toSlot >= 1 then
-        targetSlot = toSlot
+    return moved, err
+end
+
+--- ===== 抽取 / 放入的槽位策略（1.6.11）=====
+--- 用户要求：同一个搬运动作在不同场景下要用不同的“碎片”策略 ——
+---   * 从存储容器**抽**给机器（要快）→ 优先拿数量最多的槽位        ORDER_SPEED
+---   * 抽给输出容器（发货）/ 从输入容器抽（要少碎片）→ 优先拿数量最少的  ORDER_FRAGMENT
+---   * 往存储容器**放**机器产物（要快）→ 放得下整叠且余量最小的槽位   INSERT_SPEED
+---   * 往存储容器放输入容器里的东西（要少碎片）→ 先并入已有同类槽位，
+---     都满了再挑“放得下且余量最小”的槽位                        INSERT_LEAST
+Containers.ORDER_SPEED = "speed"
+Containers.ORDER_FRAGMENT = "fragment"
+Containers.INSERT_SPEED = "speed"
+Containers.INSERT_LEAST = "leastWaste"
+
+--- 按抽取策略给“物品栈 / 流体罐”列表排序（返回新表，不改原表；不传策略时保持原顺序）
+function Containers:orderStacks(list, order)
+    local out = {}
+    for index, entry in ipairs(list or {}) do
+        out[index] = entry
     end
-    local ok, moved = pcall(inv.pushItems, toPeripheral, fromSlot, limit, targetSlot)
-    if ok and type(moved) == "number" and moved > 0 then
-        return moved
+    if order ~= Containers.ORDER_SPEED and order ~= Containers.ORDER_FRAGMENT then
+        return out
     end
-    if not ok then
-        -- 包装对象可能已失效（外设替换 / 区块重载）：清缓存，下个 tick 重新 wrap 再试
-        self.Peripherals:invalidate(fromPeripheral)
-        self.Peripherals:invalidate(toPeripheral)
+    table.sort(out, function(a, b)
+        local ca = tonumber(a and (a.count or a.amount)) or 0
+        local cb = tonumber(b and (b.count or b.amount)) or 0
+        if ca ~= cb then
+            if order == Containers.ORDER_SPEED then
+                return ca > cb
+            end
+            return ca < cb
+        end
+        -- 数量相同：按容器定义名 + 槽位/罐号稳定排序（结果可复现，便于诊断）
+        if tostring(a and a.container) ~= tostring(b and b.container) then
+            return tostring(a and a.container) < tostring(b and b.container)
+        end
+        return (tonumber(a and (a.slot or a.tank)) or 0) < (tonumber(b and (b.slot or b.tank)) or 0)
+    end)
+    return out
+end
+
+--- 物品的最大堆叠数：**只查字典，绝不调用外设**（拿不到就按 64 算）。
+--- 放入策略要在每个 tick 里比较几十个槽位，不能让它变成阻塞调用。
+function Containers:itemMaxCount(itemName, nbt)
+    if type(itemName) ~= "string" or itemName == "" then
+        return DEFAULT_ITEM_MAX_COUNT
     end
-    local targetInv = self:inventory(toPeripheral)
-    if targetInv then
-        local ok2, moved2 = pcall(targetInv.pullItems, fromPeripheral, fromSlot, limit, targetSlot)
-        if ok2 and type(moved2) == "number" and moved2 > 0 then
-            return moved2
+    local known = self.itemMaxCountCache and self.itemMaxCountCache[itemName]
+    if known then
+        return known
+    end
+    local detail, cached = self:cachedItemDetail(itemName, nbt)
+    if cached then
+        local value = tonumber(detail and detail.maxCount) or DEFAULT_ITEM_MAX_COUNT
+        if value <= 0 then
+            value = DEFAULT_ITEM_MAX_COUNT
+        end
+        self.itemMaxCountCache = self.itemMaxCountCache or {}
+        self.itemMaxCountCache[itemName] = value
+        return value
+    end
+    return DEFAULT_ITEM_MAX_COUNT
+end
+
+--- 往目标容器放 amount 个物品时该用哪个槽位（只看当前缓存里的内容；不算外设调用）。
+--- 返回槽位号；拿不到容器信息时返回 nil（调用方退回 CC:T 的默认放入行为）。
+function Containers:insertSlotFor(containerName, itemName, nbt, amount, mode)
+    local peripheralName = self:peripheralOf(containerName, "item")
+    if not peripheralName then
+        return nil
+    end
+    local size = self:slotCount(peripheralName)
+    if not size or size <= 0 then
+        return nil
+    end
+    local slots = self:stacksPeripheral(peripheralName)
+    --- stacksPeripheral 返回的是**顺序数组**（里面带 slot 字段），这里按槽位建索引
+    local bySlot = {}
+    for _, entry in ipairs(slots or {}) do
+        local index = tonumber(entry and entry.slot)
+        if index then
+            bySlot[index] = entry
         end
     end
-    if ok then
-        return 0, "\\u672A\\u80FD\\u642C\\u8FD0\\u4EFB\\u4F55\\u7269\\u54C1"
+    local capacity = self:itemMaxCount(itemName, nbt)
+    amount = math.max(1, tonumber(amount) or 1)
+    local sameSlot, sameFree            -- 已存有本物品、仍有余量的槽位（余量最小的那个）
+    local fitsSlot, fitsFree            -- 能一次放下 amount 的槽位（余量最小的那个）
+    local roomSlot, roomFree            -- 放不下整叠时：余量最大的槽位
+    for slot = 1, size do
+        local stack = bySlot[slot]
+        local free = nil
+        local same = false
+        if stack == nil then
+            free = capacity
+        elseif tostring(stack.name) == tostring(itemName) and tostring(stack.nbt or "") == tostring(nbt or "") then
+            free = math.max(0, capacity - (tonumber(stack.count) or 0))
+            same = true
+        end
+        if free and free > 0 then
+            if same and (sameFree == nil or free < sameFree) then
+                sameSlot, sameFree = slot, free
+            end
+            if free >= amount and (fitsFree == nil or free < fitsFree) then
+                fitsSlot, fitsFree = slot, free
+            end
+            if roomFree == nil or free > roomFree then
+                roomSlot, roomFree = slot, free
+            end
+        end
     end
-    return 0, tostring(moved)
+    if mode == Containers.INSERT_LEAST then
+        -- 少碎片：① 先并入同类槽位（哪怕一次放不完，剩下的下一轮继续）
+        if sameSlot then
+            return sameSlot
+        end
+        if fitsSlot then
+            return fitsSlot
+        end
+        return roomSlot
+    end
+    -- 速度：① 一次放得下且余量最小 → ② 余量最大（放得最多）
+    if fitsSlot then
+        return fitsSlot
+    end
+    return roomSlot
 end
 
 --- 流体搬运
@@ -1074,7 +1238,8 @@ end
 
 --- 匹配 spec 的物品栈与流体罐
 -- spec = {kind = "item"|"fluid"|"filter", id = string}
-function Containers:matchSpec(spec, role)
+--- order（可选）：抽取策略（Containers.ORDER_SPEED / ORDER_FRAGMENT）—— 决定“先拿哪一堆”
+function Containers:matchSpec(spec, role, order)
     role = role or "storage"
     local snapshot = self:snapshot(role)
     local items, fluids = {}, {}
@@ -1094,7 +1259,7 @@ function Containers:matchSpec(spec, role)
             end
         end
     end
-    return items, fluids
+    return self:orderStacks(items, order), self:orderStacks(fluids, order)
 end
 
 --- 统计 spec 在指定角色容器中的总量（物品按个数、流体按 mB；过滤器两者相加）

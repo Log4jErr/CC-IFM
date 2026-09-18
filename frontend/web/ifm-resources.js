@@ -30,16 +30,8 @@
         return activeCraftKeys.has(resourceKey(entry.kind === 'fluid' ? 'fluid' : 'item', entry.name));
     }
 
-    function resourceOrder(entry) {
-        // 正在合成的项目永远排最前面（用户要求）
-        if (isCrafting(entry)) return 0;
-        if (entry.kind === 'placeholder') return 1;
-        if (entry.kind === 'filter') return 2;
-        if (entry.kind === 'fluid' && entry.craftable) return 3;
-        if (entry.kind === 'item' && entry.craftable) return 4;
-        if (entry.kind === 'fluid') return 5;
-        return 6;
-    }
+    // 资源排序（1.6.11）：三种模式统一在 visibleResources() 里实现；
+    // 正在合成的资源仍然带 .crafting 高亮（这是视觉标记，不再参与排序）。
 
     // ===================== 搜索语法：关键词 / @模组 / #标签 =====================
     // 空格分隔的多个条件同时满足（AND）：
@@ -103,9 +95,139 @@
         return list.length > max ? shown + ' …' : shown;
     }
 
+    // ===================== 中文拼音搜索（任务 7，1.6.11）=====================
+    // 只在中文界面 + pinyinlite 可用时生效。pinyinlite 由 index.html 里的
+    // <script src="dist/pinyinlite_full.min.js"> 提供：pinyinlite('增长') => [['ceng','zeng'],['zhang','chang']]
+    // 匹配规则（用户给出的例子，逐条实现）：
+    //   * 忽略声调（pinyinlite 给的就是无声调音节），**任意读音都算**（孳生读音全都要试）；
+    //   * 查询串按空格切成若干段，每段吃「1 个或多个连续音节」，每个音节可以只吃它读音的**前缀**
+    //     （所以 "g" 能匹配 gong、"zt" 能匹配 gong+zuo+tai 的第 2、3 个音节的声母）；
+    //   * 段与段之间必须**紧挨**（不许跳音节）："gt" ✗、"gong tai" ✗；但可以从中间开始："tai" ✓、"zt" ✓。
+    const pinyinCache = new Map();
+
+    function pinyinAvailable() {
+        return typeof window.pinyinlite === 'function';
+    }
+
+    function pinyinSyllables(text) {
+        const key = String(text || '');
+        if (!key) return [];
+        if (pinyinCache.has(key)) return pinyinCache.get(key);
+        let rows = [];
+        try {
+            rows = window.pinyinlite(key) || [];
+        } catch (err) {
+            rows = [];
+        }
+        const out = rows.map(function (row) {
+            return (Array.isArray(row) ? row : []).map(function (item) {
+                return String(item || '').toLowerCase();
+            }).filter(Boolean);
+        });
+        if (pinyinCache.size > 4000) pinyinCache.clear();
+        pinyinCache.set(key, out);
+        return out;
+    }
+
+    function hasHanzi(text) {
+        return /[\u3400-\u4dbf\u4e00-\u9fff]/.test(String(text || ''));
+    }
+
+    // 一段（seg）能否恰好由 syllables[start..start+count-1] 拼出来。
+    // 规则：每个音节只吃它读音的**前缀**（≥1 个字符），片与片之间紧挨着（不许跳音节）；
+    // 本音节吃过至少一个字符后，可以结束这一片、到下一个音节继续吃（这就是 "gzt" = g|z|t 的由来）。
+    function pinyinSegmentFits(seg, syllables, start, count) {
+        const limit = start + count;
+        let states = [{ index: start, used: 0 }];
+        for (let position = 0; position < seg.length; position += 1) {
+            const char = seg.charAt(position);
+            const next = [];
+            const seen = {};
+            const push = function (state) {
+                const key = state.index + ':' + state.used;
+                if (seen[key]) return;
+                seen[key] = true;
+                next.push(state);
+            };
+            for (let s = 0; s < states.length; s += 1) {
+                const state = states[s];
+                // ① 继续在当前音节里吃字符
+                if (state.index < limit) {
+                    const readings = syllables[state.index] || [];
+                    for (let r = 0; r < readings.length; r += 1) {
+                        if (readings[r].charAt(state.used) !== char) continue;
+                        if (state.used + 1 >= readings[r].length) push({ index: state.index + 1, used: 0 });
+                        else push({ index: state.index, used: state.used + 1 });
+                    }
+                }
+                // ② 本音节已经吃过字符：可以结束这一片，转入下一个音节（下一个音节必须紧挨着）
+                if (state.used > 0 && state.index + 1 < limit) {
+                    const readings = syllables[state.index + 1] || [];
+                    for (let r = 0; r < readings.length; r += 1) {
+                        if (readings[r].charAt(0) !== char) continue;
+                        if (readings[r].length === 1) push({ index: state.index + 2, used: 0 });
+                        else push({ index: state.index + 1, used: 1 });
+                    }
+                }
+            }
+            states = next;
+            if (states.length === 0) return false;
+        }
+        // 必须**吃满** count 个音节（最后一个可以只吃一半，但必须至少吃了一个字符）：
+        // 否则片段会“假装”跨过中间音节，出现 "gong tai" 这种越位匹配。
+        return states.some(function (state) {
+            if (state.index === limit) return true;
+            return state.index === limit - 1 && state.used > 0;
+        });
+    }
+
+    function pinyinMatches(text, query) {
+        if (!pinyinAvailable()) return false;
+        const syllables = pinyinSyllables(text);
+        if (syllables.length === 0) return false;
+        const segments = String(query || '').toLowerCase().split(/\s+/).filter(Boolean);
+        if (segments.length === 0) return true;
+        const memo = {};
+        const rest = function (from, segmentIndex) {
+            if (segmentIndex >= segments.length) return true;
+            const key = from + '/' + segmentIndex;
+            if (memo[key] !== undefined) return memo[key];
+            const seg = segments[segmentIndex];
+            let ok = false;
+            for (let end = from; end < syllables.length && !ok; end += 1) {
+                if (!pinyinSegmentFits(seg, syllables, from, end - from + 1)) continue;
+                ok = rest(end + 1, segmentIndex + 1);
+            }
+            memo[key] = ok;
+            return ok;
+        };
+        for (let start = 0; start < syllables.length; start += 1) {
+            if (rest(start, 0)) return true;
+        }
+        return false;
+    }
+
+    // 中/英任何一个名字命中拼音都算（只在中文界面开启）
+    function pinyinSearchHit(query, label, englishLabel) {
+        if (lang !== 'zh' || !pinyinAvailable()) return false;
+        const text = String(query || '').trim();
+        if (!text) return false;
+        const targets = [label, englishLabel].filter(function (value) {
+            return value && hasHanzi(value);
+        });
+        for (let i = 0; i < targets.length; i += 1) {
+            if (pinyinMatches(targets[i], text)) return true;
+        }
+        return false;
+    }
+
     function matchesSearch(entry, query) {
         if (searchQueryEmpty(query)) return true;
         const name = String(entry.name || '').toLowerCase();
+        // 注册名的**路径部分**（去掉模组命名空间）：搜索 "create" 不该命中所有 create 模组的物品，
+        // 想按模组搜请写 @create（用户第 5 项要求）；标签同理，必须写 #tag。
+        const colon = name.indexOf(':');
+        const namePath = colon >= 0 ? name.slice(colon + 1) : name;
         const label = displayName(entry.kind, entry.name).toLowerCase();
         // 翻译开关打开时：中文译名与英文原名都能搜到
         const englishLabel = englishName(entry.kind, entry.name).toLowerCase();
@@ -119,9 +241,9 @@
         }
         for (let i = 0; i < query.terms.length; i += 1) {
             const term = query.terms[i];
-            const hit = name.indexOf(term) >= 0 || label.indexOf(term) >= 0 ||
+            const hit = namePath.indexOf(term) >= 0 || label.indexOf(term) >= 0 ||
                 englishLabel.indexOf(term) >= 0 ||
-                tags.some(function (tag) { return String(tag).toLowerCase().indexOf(term) >= 0; });
+                pinyinSearchHit(term, label, englishLabel);
             if (!hit) return false;
         }
         return true;
@@ -135,17 +257,38 @@
         }
         list.sort(function (a, b) {
             if (sortMode === 'name') {
-                return displayName(a.kind, a.name).localeCompare(displayName(b.kind, b.name));
+                return displayName(a.kind, a.name).localeCompare(displayName(b.kind, b.name), undefined,
+                    { numeric: true, sensitivity: 'base' });
             }
-            if (sortMode === 'count') {
-                return (b.count || 0) - (a.count || 0);
-            }
-            const rankA = resourceOrder(a);
-            const rankB = resourceOrder(b);
-            if (rankA !== rankB) return rankA - rankB;
-            return (b.count || 0) - (a.count || 0);
+            // 数量升序 / 降序（1.6.11 的新默认）：数量相同的按名字排，保证顺序稳定
+            const diff = (Number(a.count) || 0) - (Number(b.count) || 0);
+            if (diff !== 0) return sortMode === 'countAsc' ? diff : -diff;
+            return displayName(a.kind, a.name).localeCompare(displayName(b.kind, b.name), undefined,
+                { numeric: true, sensitivity: 'base' });
         });
         return list;
+    }
+
+    // 排序按钮的图标与提示：跟着当前模式变（点击顺序 数量降序 → 数量升序 → 字典序 → 数量降序）
+    const SORT_MODES = ['countDesc', 'countAsc', 'name'];
+    function sortModeLabel(mode) {
+        if (mode === 'countAsc') return t('sortCountAsc');
+        if (mode === 'name') return t('sortName');
+        return t('sortCountDesc');
+    }
+
+    function sortModeIcon(mode) {
+        if (mode === 'countAsc') return 'fa-sort-amount-asc';
+        if (mode === 'name') return 'fa-sort-alpha-asc';
+        return 'fa-sort-amount-desc';
+    }
+
+    function renderResourceSortButton() {
+        const button = el('resourceSortBtn');
+        if (!button) return;
+        const label = sortModeLabel(sortMode);
+        button.title = t('sortTitle') + '：' + label;
+        button.innerHTML = '<i class="fa ' + sortModeIcon(sortMode) + '"></i>';
     }
 
     function plainIconImg(kind, name) {
@@ -216,8 +359,9 @@
     }
 
     function renderResources() {
-        // 正在合成的物品要排最前面：每次重画前按运行中的流程重算一遍
+        // 正在合成的物品仍然会被标上 .crafting 高亮：每次重画前按运行中的流程重算一遍
         activeCraftKeys = craftingKeys();
+        renderResourceSortButton();
         const list = visibleResources();
         queueTranslateNames(list);
         if (list.length === 0) {
@@ -537,10 +681,14 @@
     }
 
     // 点「发送」时的滑动动画：待发送卡片的一份副本从原位置飞到「发送中」里的对应位置（经典 FLIP）
+    // 1.6.11 修复「动画丢失」：以前只在 append 后直接 requestAnimationFrame 改 transform ——
+    // 如果 append 和改样式落在同一帧里，浏览器从没画过“初始位置”，transition 就不会触发（等于没动画）。
+    // 现在 append 之后先强制一次布局（读 offsetWidth）把初始样式落地，再在下一帧改 transform。
     function animateSendToDelivery(pairs) {
         const ghosts = [];
         pairs.forEach(function (pair) {
-            if (!pair.fromRect || !pair.toRect || !pair.node) return;
+            if (!pair.fromRect || !pair.node) return;
+            if (!pair.fromRect.width && !pair.fromRect.height) return;      // 起点量不到（面板刚显示）：不做动画
             const ghost = pair.node.cloneNode(true);
             ghost.classList.add('send-ghost');
             ghost.style.left = pair.fromRect.left + 'px';
@@ -548,7 +696,19 @@
             ghost.style.width = pair.fromRect.width + 'px';
             ghost.style.height = pair.fromRect.height + 'px';
             document.body.appendChild(ghost);
-            ghosts.push({ node: ghost, from: pair.fromRect, to: pair.toRect });
+            // 关键：强制同步布局，保证浏览器已经用“起点样式”算过一遍这个元素
+            void ghost.offsetWidth;
+            // 终点量不到（例如占位卡片还没画出来）时退到「发送中」这一栏的左上角，至少飞向正确区域
+            let toRect = pair.toRect;
+            if (!toRect || (!toRect.width && !toRect.height)) {
+                const grid = el('deliveryGrid');
+                toRect = grid ? grid.getBoundingClientRect() : null;
+            }
+            if (!toRect) {
+                ghost.remove();
+                return;
+            }
+            ghosts.push({ node: ghost, from: pair.fromRect, to: toRect });
         });
         if (ghosts.length === 0) return;
         // 下一帧再改位置，保证 transition 真的生效

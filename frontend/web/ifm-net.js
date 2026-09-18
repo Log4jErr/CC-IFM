@@ -425,6 +425,7 @@
             renderGraph();
         }
         if (dirty.status) renderStatus();
+        if (dirty.status) renderSettings();
         if (dirty.workers) renderWorkers();
         dirty = {};
         refreshTooltip();

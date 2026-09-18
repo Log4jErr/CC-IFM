@@ -519,7 +519,8 @@ function Recipe:resumePendingMove(token)
     if record.kind == "fluid" then
         moved, err = self.Containers:pushFluid(record.container, record.want, record.fluid, record.target)
     else
-        moved, err = self.Containers:pushItem(record.container, record.slot, record.want, record.target, record.toSlot)
+        moved, err = self.Containers:pushItem(record.container, record.slot, record.want, record.target,
+            record.toSlot, record.mode)
     end
     if err == "pending" then
         return nil, "pending"
@@ -531,10 +532,15 @@ end
 --- 输入：从存储容器搬运匹配资源到目标容器（itemTargets / fluidTargets 分别对应物品与流体输入容器）
 --- token：调用方的一致性标记（同一逻辑搬运每次都要传同一个值，见在飞搬运的记忆）
 --- 返回：实际搬运量, 失败原因（未搬运到任何东西时才有；"pending" = 已交给 worker）
-function Recipe:transferIn(spec, itemTargets, fluidTargets, toSlot, amount, token)
+--- opts（可选，1.6.11）：
+---   storageOrder  从存储容器抽取时的顺序（"speed" = 先拿最多的堆，机器要料求快；
+---                 "fragment" = 先拿最少的那堆，发货/输出容器求少碎片）
+---   insertMode    往目标容器放入时的策略（见 pushItem 的 mode 参数）
+function Recipe:transferIn(spec, itemTargets, fluidTargets, toSlot, amount, token, opts)
     if amount <= 0 then
         return 0, nil
     end
+    opts = opts or {}
     local moved = 0
     local reason
     if token then
@@ -551,7 +557,7 @@ function Recipe:transferIn(spec, itemTargets, fluidTargets, toSlot, amount, toke
             return moved, nil
         end
     end
-    local stacks, tanks = self.Containers:matchSpec(spec, "storage")
+    local stacks, tanks = self.Containers:matchSpec(spec, "storage", opts.storageOrder)
     if #itemTargets > 0 and spec.kind ~= "fluid" then
         for _, stack in ipairs(stacks) do
             if moved >= amount then
@@ -577,7 +583,8 @@ function Recipe:transferIn(spec, itemTargets, fluidTargets, toSlot, amount, toke
                     end
                     local want = math.min(amount - moved, stack.count)
                     if want > 0 then
-                        local got, err = self.Containers:pushItem(stack.container, stack.slot, want, target, toSlot)
+                        local got, err = self.Containers:pushItem(stack.container, stack.slot, want, target, toSlot,
+                            opts.insertMode)
                         if err == "pending" then
                             --- IFMWorker 正在搬：记住这条请求（下个 tick 继续等它，绝不重新扫源）
                             self:rememberPendingMove(token, {
@@ -587,6 +594,7 @@ function Recipe:transferIn(spec, itemTargets, fluidTargets, toSlot, amount, toke
                                 want = want,
                                 target = target,
                                 toSlot = toSlot,
+                                mode = opts.insertMode,
                             })
                             --- 返回已经取回的 moved（可能 > 0）：调用方要拿它记账，否则会重复搬
                             return moved, "pending"
@@ -762,7 +770,9 @@ function Recipe:transferOut(spec, machine, amount, token)
                             end
                             local want = math.min(amount - moved, stack.count)
                             if want > 0 then
-                                local got, err = self.Containers:pushItem(source, stack.slot, want, target)
+                                local got, err = self.Containers:pushItem(source, stack.slot, want, target, nil,
+                                    --- 机器产物进存储容器要**快**：优先放进能一次放下、余量最小的槽位（1.6.11）
+                                    self.Containers.INSERT_SPEED)
                                 if err == "pending" then
                                     self:rememberPendingMove(token, {
                                         kind = "item",
@@ -770,6 +780,7 @@ function Recipe:transferOut(spec, machine, amount, token)
                                         slot = stack.slot,
                                         want = want,
                                         target = target,
+                                        mode = self.Containers.INSERT_SPEED,
                                     })
                                     return moved, "pending"
                                 end
@@ -1235,7 +1246,9 @@ function Recipe:stepInput(process, record, machine, now)
                         fluidTargets,
                         element.slot,
                         short,
-                        "in:" .. tostring(process.name) .. "\1" .. tostring(key)
+                        "in:" .. tostring(process.name) .. "\1" .. tostring(key),
+                        --- 给机器送料要**快**：从存储容器优先抽数量最多的那几堆（1.6.11）
+                        { storageOrder = self.Containers.ORDER_SPEED }
                     )
                 end
                 if reason == "pending" then
@@ -1763,7 +1776,9 @@ function Recipe:processDeliveries(now)
                     remaining,
                     --- token 按发货任务 id：同一条发货在 worker 回报之前只会有一条在飞请求
                     --- （以前每次重扫源都会新发一条 → 64 个变成 63 + 64 = 127 个）
-                    "delivery:" .. tostring(delivery.id or delivery.name)
+                    "delivery:" .. tostring(delivery.id or delivery.name),
+                    --- 发货到**输出容器**要少碎片：从存储容器优先抽数量最少的那几堆（1.6.11）
+                    { storageOrder = self.Containers.ORDER_FRAGMENT }
                 )
                 if reason == "pending" then
                     -- 发送搬运已交给 IFMWorker：本 tick 不改状态（下个 tick 继续等同一个任务），
@@ -2258,13 +2273,23 @@ end
 --- 节奏与代扫限流配合：每 INPUT_DRAIN_INTERVAL 毫秒扫一轮，每轮最多搬 INPUT_DRAIN_OPS 次
 --- （每次搬运都是 pushItem/pushFluid，可能交给 worker；pending 时下轮继续）。
 local INPUT_DRAIN_INTERVAL = 2000
+
+--- 应用「输入容器扫描间隔」设置（毫秒）：网页「设置」面板可改，缺省 2000
+function Recipe:applyScanSettings(inputScanMs)
+    local value = tonumber(inputScanMs)
+    if value and value > 0 then
+        self.inputDrainMs = math.max(250, math.floor(value))
+    end
+    return self.inputDrainMs or INPUT_DRAIN_INTERVAL
+end
 local INPUT_DRAIN_OPS = 2
 
 function Recipe:drainInputContainers(now)
     now = now or os.epoch("utc")
     self.inputDrain = self.inputDrain or { items = 0, fluids = 0, lastAt = 0, lastLogAt = 0 }
     local state = self.inputDrain
-    if now - (state.lastAt or 0) < INPUT_DRAIN_INTERVAL then
+    local interval = self.inputDrainMs or INPUT_DRAIN_INTERVAL
+    if now - (state.lastAt or 0) < interval then
         return 0
     end
     state.lastAt = now
@@ -2292,14 +2317,17 @@ function Recipe:drainInputContainers(now)
             if ops >= INPUT_DRAIN_OPS or pending then
                 return
             end
-            for _, stack in ipairs(self.Containers:stacks(source)) do
+            for _, stack in ipairs(self.Containers:orderStacks(self.Containers:stacks(source),
+                self.Containers.ORDER_FRAGMENT)) do
                 if ops >= INPUT_DRAIN_OPS or pending then
                     return
                 end
                 local amount = tonumber(stack.count) or 0
                 if amount > 0 then
                     for _, target in ipairs(targets.item) do
-                        local got, err = self.Containers:pushItem(source, stack.slot, amount, target)
+                        local got, err = self.Containers:pushItem(source, stack.slot, amount, target, nil,
+                            --- 输入容器 → 存储容器：先并入同类槽位，少留碎片（1.6.11）
+                            self.Containers.INSERT_LEAST)
                         if err == "pending" then
                             pending = true              -- 已交给 worker：下轮接着排
                             return

@@ -5,7 +5,13 @@
 local Store = {}
 Store.__index = Store
 
-Store.KINDS = { "containers", "signals", "filters", "machineTypes", "machines", "processes" }
+Store.KINDS = { "containers", "signals", "filters", "machineTypes", "machines", "processes", "settings" }
+
+--- 全局设置（1.6.11）：目前只有一条记录 "scan"（容器扫描间隔），
+--- 由网页「设置」面板通过 set_settings 请求写入；缺省值见 Store.SCAN_DEFAULTS。
+Store.SETTINGS_NAME = "scan"
+Store.SCAN_DEFAULTS = { storageScanMs = 1200, inputScanMs = 2000 }
+Store.SCAN_LIMITS = { min = 250, max = 600000 }
 
 local VALID_ROLES = { storage = true, interaction = true, output = true, input = true }
 --- 容器定义的种类：item = 物品容器（inventory 外设），fluid = 流体容器（fluid_storage 外设）。
@@ -90,6 +96,25 @@ function Store.emptyData()
         machineTypes = {},
         machines = {},
         processes = {},
+        settings = {},
+    }
+end
+
+--- 容器扫描间隔设置（毫秒）：缺省 + 逐字段回退，保证任何时候都拿得到可用值
+function Store:scanSettings()
+    local saved = self:get("settings", Store.SETTINGS_NAME) or {}
+    local defaults = Store.SCAN_DEFAULTS
+    local function pick(value, fallback)
+        local number = tonumber(value)
+        if not number then
+            return fallback
+        end
+        local limits = Store.SCAN_LIMITS
+        return math.max(limits.min, math.min(limits.max, math.floor(number)))
+    end
+    return {
+        storageScanMs = pick(saved.storageScanMs, defaults.storageScanMs),
+        inputScanMs = pick(saved.inputScanMs, defaults.inputScanMs),
     }
 end
 
@@ -887,6 +912,21 @@ function Store:validate(kind, name, obj)
             local ok, err = self:validateElement(el, true, i, "\\u8F93\\u51FA")
             if not ok then
                 return false, err
+            end
+        end
+        return true
+    elseif kind == "settings" then
+        -- 全局设置：目前只有“容器扫描间隔”（毫秒，250 ~ 600000）
+        local limits = Store.SCAN_LIMITS
+        for _, field in ipairs({ "storageScanMs", "inputScanMs" }) do
+            if obj[field] ~= nil then
+                local value = tonumber(obj[field])
+                if not value then
+                    return false, field .. " must be a number (milliseconds)"
+                end
+                if value < limits.min or value > limits.max then
+                    return false, field .. " out of range (" .. limits.min .. " ~ " .. limits.max .. " ms)"
+                end
             end
         end
         return true

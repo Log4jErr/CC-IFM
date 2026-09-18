@@ -213,7 +213,11 @@
         sendList.clear();
         addOptimisticDeliveries(items);
         renderSend();
-        // 材料从「待发送」滑到「发送中」：量一下占位卡片的位置，让副本从旧位置飞过去
+        // 材料从「待发送」滑到「发送中」：量一下占位卡片的位置，让副本从旧位置飞过去。
+        // 先强制一次布局：底部面板可能是刚被 renderSend 显示出来的（display 从 none 变回来），
+        // 不先读取一次布局的话 getBoundingClientRect 会拿到全 0（动画就飞不见了，1.6.11 修）。
+        const deliveryGrid = el('deliveryGrid');
+        if (deliveryGrid) void deliveryGrid.offsetHeight;
         const pairs = items.map(function (entry) {
             const key = resourceKey(entry.kind, entry.name);
             const grid = el('deliveryGrid');
@@ -1096,6 +1100,58 @@
             });
     }
 
+    // ===== 设置面板：容器扫描间隔（1.6.11，任务 8）=====
+    // 存储容器扫描间隔 = 主控读容器内容的缓存时长；输入容器扫描间隔 = 输入容器“排空扫描”的节奏。
+    // 两个值都由服务端持久化（config.json -> settings.scan）并通过 status.scanSettings 回传。
+    function renderSettings() {
+        const body = el('settingsBody');
+        if (!body) return;
+        const settings = (status && status.scanSettings) || {};
+        const storage = Number(settings.storageScanMs) || 1200;
+        const input = Number(settings.inputScanMs) || 2000;
+        const signature = storage + '/' + input;
+        if (body.getAttribute('data-scan') === signature) return;             // 值没变：不重画
+        if (document.activeElement && body.contains(document.activeElement)) return;  // 正在输入：不打断
+        body.setAttribute('data-scan', signature);
+        body.innerHTML =
+            '<div class="editor-row"><label for="settingsStorageMs">' + escapeHtml(t('settingsStorageScan')) +
+            '</label><input type="number" id="settingsStorageMs" min="250" max="600000" step="50" value="' +
+            escapeHtml(String(storage)) + '"></div>' +
+            '<div class="editor-row"><label for="settingsInputMs">' + escapeHtml(t('settingsInputScan')) +
+            '</label><input type="number" id="settingsInputMs" min="250" max="600000" step="50" value="' +
+            escapeHtml(String(input)) + '"></div>' +
+            '<div class="muted" style="margin:-2px 0 8px 0">' + escapeHtml(t('settingsHint')) + '</div>' +
+            '<button class="btn-pixel primary" type="button" id="settingsSaveBtn"><i class="fa fa-check"></i> ' +
+            escapeHtml(t('save')) + '</button>';
+        const button = el('settingsSaveBtn');
+        if (button) button.addEventListener('click', saveScanSettings);
+    }
+
+    function saveScanSettings() {
+        const storage = Number(el('settingsStorageMs') && el('settingsStorageMs').value);
+        const input = Number(el('settingsInputMs') && el('settingsInputMs').value);
+        if (!isFinite(storage) || !isFinite(input)) {
+            toast(t('settingsHint'), 'error');
+            return;
+        }
+        busyButton('settingsSaveBtn', sendRequest('set_scan_settings', {
+            storageScanMs: Math.round(storage),
+            inputScanMs: Math.round(input),
+        })).then(function (response) {
+            const result = response.result || {};
+            if (result.error) {
+                toast(t('requestFailed', { error: result.error }), 'error');
+                return;
+            }
+            if (status && result.scanSettings) status.scanSettings = result.scanSettings;
+            const applied = result.scanSettings || { storageScanMs: storage, inputScanMs: input };
+            renderSettings();
+            toast(t('settingsSaved', { storage: applied.storageScanMs, input: applied.inputScanMs }), 'success');
+        }).catch(function (err) {
+            toast(t('requestFailed', { error: err.message }), 'error');
+        });
+    }
+
     function bindToolbar() {
         el('connectBtn').addEventListener('click', function () {
             connect(el('roomInput').value);
@@ -1188,8 +1244,12 @@
             toast(peripheralSortLabelText(), 'info');
         });
         el('resourceSortBtn').addEventListener('click', function () {
-            sortMode = sortMode === 'default' ? 'name' : (sortMode === 'name' ? 'count' : 'default');
+            // 数量降序（默认）→ 数量升序 → 字典序 → 数量降序（1.6.11：
+            // 以前 'default' 与 'count' 都是“数量降序”，点两下才能回到数量排序，现在一轮只有三种模式）
+            const index = SORT_MODES.indexOf(sortMode);
+            sortMode = SORT_MODES[(index < 0 ? 0 : index + 1) % SORT_MODES.length];
             renderResources();
+            toast(t('sortTitle') + '：' + sortModeLabel(sortMode), 'info');
         });
         el('editorSaveBtn').addEventListener('click', saveEditor);
         el('editorDeleteBtn').addEventListener('click', deleteEditor);
