@@ -6,7 +6,7 @@
 --   IFMMaster.lua --room myfactory123   -- 用指定房间号，并写入配置
 --   IFMMaster.lua --room myfactory123 --relay ws://localhost:8765/c/
 --   IFMMaster.lua --help
--- 房间号保存在 <脚本目录>/ifm/config.json 的 room 字段里；整个运行期间固定不变
+-- 房间号保存在 <脚本目录>/data/config.json 的 room 字段里；整个运行期间固定不变
 -- （断线重连始终复用同一个 wsUrl），进程重启后也沿用配置里的房间号。
 -- 浏览器端：打开 index.html，填入同样的房间号与中转地址即可连接。
 -- 注意：终端输出一律使用 ASCII 英文（CC:T 终端字形不含中日韩字符）。
@@ -16,7 +16,7 @@ local args = { ... }
 --- 版本号：前端 web/ifm-core.js 里的 IFM_CLIENT_VERSION 必须与此保持一致。
 --- 网页连上后会比对两边的版本号，不一致时弹出警告并主动停止连接，
 --- 避免“新前端 + 旧后端”（或反过来）产生难以定位的怪问题。
-local IFM_VERSION = "1.6.15"
+local IFM_VERSION = "1.6.16"
 
 local DEFAULT_RELAY = "wss://itty.ws/c/"
 
@@ -52,7 +52,7 @@ end
 local function printUsage()
     print("IFM (Integrated Factory Manager) - server")
     print("Usage: IFMMaster.lua [--room <room>] [--relay <ws-base-url>] [--random-room]")
-    print("  --room         room name shared with the browser (saved into ifm/config.json)")
+    print("  --room         room name shared with the browser (saved into data/config.json)")
     print("                 (default: the room stored in config.json, else a new random 12-char room)")
     print("  --random-room  ignore the stored room, generate a new random one (saved into config.json)")
     print("  --relay        websocket relay base url (default: " .. DEFAULT_RELAY .. ")")
@@ -62,7 +62,7 @@ local function printUsage()
     print("  IFMMaster.lua --room myfactory123")
     print("  IFMMaster.lua --room myfactory123 --relay ws://localhost:8765/c/")
     print("Note: the room never changes while this program runs (reconnects reuse it),")
-    print("      and it is kept in ifm/config.json so restarts reuse the same room.")
+    print("      and it is kept in data/config.json so restarts reuse the same room.")
     print("      --room wins over --random-room.")
 end
 
@@ -108,14 +108,16 @@ if (not room or room == "") and #unknown == 1 and unknown[1]:sub(1, 1) ~= "-" th
     print("[IFM] note: positional room argument is deprecated, use --room <room>")
 end
 
---- 定位脚本目录（config.json / cache.json 都放在这里）
+--- 定位脚本目录：**代码**在 <脚本目录>/ifm/，**数据**在 <脚本目录>/data/（1.6.16 起）
+--- 以前 config.json / cache.json 和代码混在 ifm/ 里，升级时会自动把老数据搬到 data/（只搬一次）
 local scriptPath = shell and shell.getRunningProgram and shell.getRunningProgram() or "IFMMaster.lua"
 local baseDir = fs.getDir(scriptPath)
 if baseDir == "" then
     baseDir = "/"
 end
 local moduleDir = fs.combine(baseDir, "ifm")
-local dataDir = moduleDir
+local legacyDataDir = moduleDir
+local dataDir = fs.combine(baseDir, "data")
 
 for _, value in ipairs(unknown) do
     print("[IFM] warning: unknown argument ignored: " .. tostring(value))
@@ -154,6 +156,33 @@ local Transfer = loadModule("transfer")
 if not fs.exists(dataDir) then
     fs.makeDir(dataDir)
 end
+
+--- 一次性迁移：老版本的 config.json / cache.json 放在 ifm/ 里，
+--- 这里在 data/ 还没有对应文件时把它复制过来（复制成功后再删掉老文件；删不掉也无妨）。
+local function migrateLegacyData(fileName)
+    local target = fs.combine(dataDir, fileName)
+    local legacy = fs.combine(legacyDataDir, fileName)
+    if fs.exists(target) or not fs.exists(legacy) then
+        return false
+    end
+    local handle = fs.open(legacy, "r")
+    if not handle then
+        return false
+    end
+    local text = handle.readAll() or ""
+    handle.close()
+    local out = fs.open(target, "w")
+    if not out then
+        return false
+    end
+    out.write(text)
+    out.close()
+    pcall(fs.delete, legacy)
+    log("Migrated data file %s -> %s", legacy, target)
+    return true
+end
+migrateLegacyData("config.json")
+migrateLegacyData("cache.json")
 local configPath = fs.combine(dataDir, "config.json")
 local cachePath = fs.combine(dataDir, "cache.json")
 

@@ -13,11 +13,9 @@
       /netsync/<name>/           同步根目录, 该目录下所有文件(含子目录)都会下发给客户端
       /netsync/<name>.version    版本号文件(位于同步根目录之外, 不会下发)
 
-    下发规则(会跳过的内容):
-      - 以 "." 开头的文件/目录(客户端自己的状态目录不会被覆盖)
-      - 服务端**自身**的程序文件(它正在运行, 不参与同步)
-      - 根目录下任何 *.version 文件(版本信息由 netserver 自己管理)
-      - 同步根目录**顶层**的 rom/ 与 disk/ 目录(只读系统盘 / 软盘, 不该下发)
+    下发规则: 不做任何过滤 —— 同步根目录下的**所有文件与子目录**都会递归下发,
+    包括以 "." 开头的隐藏项、服务端脚本自身、*.version、rom/ 与 disk/。
+    注意: 别把客户端自己的状态目录(客户端的 /.netsync)放进同步根目录, 否则会被下发给所有客户端。
 
     多客户端:
       - 每个客户端的请求各自排队, 服务端**轮转**处理(每个 tick 服务若干次),
@@ -40,7 +38,6 @@ local DATA_ROOT = "/netsync"        -- 服务端数据根目录
 local ID_CHANNEL_MOD = 65500        -- 电脑 ID 通道取模(保证通道号在 0-65535 内)
 local MAX_SERVES_PER_TICK = 6       -- 每个 tick 最多回复多少个请求(公平轮转)
 local CLIENT_TIMEOUT_MS = 60000     -- 客户端队列的保活时间(超过就丢掉它的统计)
-local TOP_LEVEL_SKIP = { rom = true, disk = true }   -- 同步根目录下不下发的顶层目录
 
 -- ==========================================
 -- 通用工具
@@ -99,38 +96,26 @@ end
 -- 同步根目录
 -- ==========================================
 
-local function isHidden(name)
-    return name:sub(1, 1) == "."
-end
 
--- 递归收集目录下所有文件, 返回 { {path = "a/b.lua", size = 123}, ... }
--- 递归收集同步根目录下的所有文件, 返回 { {path = "a/b.lua", size = 123}, ... }
--- 跳过规则见文件头: 隐藏项 / 服务端自身 / *.version / 顶层 rom 与 disk
-local function collectFiles(root, selfPath)
+-- 递归收集同步根目录下的所有文件(含子目录/隐藏项), 返回 { {path = "a/b.lua", size = 123}, ... }
+-- 1.6.16 起不再做任何过滤: 目录里有什么就下发什么(见文件头说明)
+local function collectFiles(root)
     local files = {}
-    local function walk(dir, prefix, depth)
+    local function walk(dir, prefix)
         local entries = fs.list(dir)
         table.sort(entries)
         for _, entry in ipairs(entries) do
             local abs = fs.combine(dir, entry)
             local rel = (prefix == "") and entry or (prefix .. "/" .. entry)
-            local skip = isHidden(entry)
-                -- 顶层的 rom / disk 不下发(只读系统盘与软盘的内容不该被同步)
-                or (depth == 0 and TOP_LEVEL_SKIP[entry] == true)
-                -- 服务端自己的程序文件正在运行, 不参与同步
-                or (selfPath ~= nil and fs.combine(abs) == selfPath)
-            if not skip then
-                if fs.isDir(abs) then
-                    walk(abs, rel, depth + 1)
-                elseif not entry:match("%.version$") then
-                    -- 根目录下的 *.version 是 netserver 自己的版本信息, 不下发
-                    files[#files + 1] = { path = rel, size = fs.getSize(abs) or 0 }
-                end
+            if fs.isDir(abs) then
+                walk(abs, rel)
+            else
+                files[#files + 1] = { path = rel, size = fs.getSize(abs) or 0 }
             end
         end
     end
     if fs.exists(root) and fs.isDir(root) then
-        walk(root, "", 0)
+        walk(root, "")
     end
     return files
 end
@@ -174,12 +159,11 @@ local version = 0              -- 当前对外版本号
 local modem                    -- modem 外设
 local myChannel = 0            -- 本机直连通道
 local name = ""                -- 服务端名称
-selfPath = nil                 -- 本程序自身路径(收集文件时跳过, Main 段赋值)
 
 -- 回复文件清单
 local function sendList(targetChannel, clientId)
     -- 注意要带上自身路径：正在运行的 netserver 自己不参与同步
-    local files = collectFiles(root, selfPath)
+    local files = collectFiles(root)
     modem.transmit(targetChannel, myChannel, {
         ns = PROTOCOL,
         type = "list_reply",
@@ -321,11 +305,6 @@ end
 root = fs.combine(DATA_ROOT, name)
 versionPath = fs.combine(DATA_ROOT, name .. ".version")
 
--- 自身程序路径: 收集文件时跳过它(它正在运行, 不参与同步)
-selfPath = nil
-if shell and shell.getRunningProgram then
-    selfPath = fs.combine(shell.getRunningProgram())
-end
 
 -- 首次运行时创建同步根目录(只创建, 不删除任何文件)
 if not fs.exists(root) then
@@ -359,7 +338,7 @@ local function announce()
     })
 end
 
-local fileCount = #collectFiles(root, selfPath)
+local fileCount = #collectFiles(root)
 log("server started: name=%s version=%d local channel=%d", name, version, myChannel)
 log("sync root: %s (%d file(s))", root, fileCount)
 if fileCount == 0 then

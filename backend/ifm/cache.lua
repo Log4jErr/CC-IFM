@@ -51,7 +51,7 @@ function Cache.new(opts)
         error("cache.lua needs the jsonfile module: pass opts.JsonFile (loadModule(\"jsonfile\"))", 0)
     end
     self.file = JsonFile.new({
-        path = opts.path or "/ifm/cache.json",
+        path = opts.path or "/data/cache.json",
         log = opts.log,
         writeDebounce = opts.writeDebounce,
     })

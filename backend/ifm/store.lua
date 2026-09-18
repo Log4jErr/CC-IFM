@@ -134,7 +134,7 @@ function Store.new(opts)
         error("store.lua needs the jsonfile module: pass opts.JsonFile (loadModule(\"jsonfile\"))", 0)
     end
     self.file = JsonFile.new({
-        path = opts.path or "/ifm/config.json",
+        path = opts.path or "/data/config.json",
         log = opts.log,
         writeDebounce = opts.writeDebounce,
     })

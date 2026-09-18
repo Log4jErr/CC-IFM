@@ -86,6 +86,7 @@ IFMMaster --room <房间号>
 shell.run("bg", "IFMWorker.lua")
 ```
 - 改了后端源码之后重新编译：`python backend/build.py`，产物是 `backend/ifm_bundle.lua`。
+- 主控的**数据文件**放在 `<脚本目录>/data/` 下：`data/config.json`（容器/机器/流程等定义）与 `data/cache.json`（运行态缓存）。从 1.6.15 及更早版本升级时，主控启动会**自动**把 `ifm/` 里的老文件搬到 `data/`（只搬一次，搬完删掉老文件），不需要手动操作。
 - 容器扫描间隔在网页「设置」面板里调：存储容器缺省 **8000ms**，含义是**同一个容器从上次被扫描到下次被扫描的最小间隔**（搬运/整理需要最新数据时会强制重读）；输入容器缺省 **1000ms**，是输入容器「排空扫描」的节奏。改完立即生效，并写入 `config.json`。
 
 ## 限制
@@ -98,7 +99,7 @@ shell.run("bg", "IFMWorker.lua")
 
 ### netsync
 - 你有1个主控和一大堆从节点，现在IFM版本更新了，一个个去更新可太麻烦了。工具脚本netserver和netsync是成对使用的，用于自动同步文件。
-- netserver启动时需要指定name，它会把 `/netsync/<name>/` 目录下的文件（含子目录）发送给同名的 netsync 计算机，所以**要分发的文件必须放进 `/netsync/<name>/`**（以 `.` 开头的项、服务端脚本自身、`*.version`、顶层的 `rom/` 与 `disk/` 不会被下发）。
+- netserver启动时需要指定name，它会把 `/netsync/<name>/` 目录下的**所有文件与子目录**递归发送给同名的 netsync 计算机，所以**要分发的文件必须放进 `/netsync/<name>/`**。1.6.16 起**不再做任何过滤**：以 `.` 开头的隐藏项、netserver 脚本自身、`*.version`、`rom/`、`disk/` 都会下发；不要把客户端自己的状态目录（客户端的 `/.netsync`）放进这个目录。
 - netsync启动时需要指定name，然后它会从netserver下载所有文件到本机，下载完成后重启计算机。
 - netserver有一个文件版本信息，修改了文件后你需要使用netserver --update name启动netserver，以更新版本。
 - netsync只会在netserver有更新的版本时才下载。否则会保持等待。
@@ -199,6 +200,7 @@ IFMMaster --room <room name>
 shell.run("bg", "IFMWorker.lua")
 ```
 - Rebuild the backend after changing its source: `python backend/build.py` (writes `backend/ifm_bundle.lua`).
+- Master **data files** live in `<install dir>/data/`: `data/config.json` (container / machine / process definitions) and `data/cache.json` (runtime cache). When upgrading from 1.6.15 or older, the master migrates the old files out of `ifm/` automatically on the next start (one-time, the old file is then deleted).
 - Container scan intervals live in the web **Settings** panel: the storage container one defaults to **8000 ms** and means *the minimum interval between two scans of the same container* (moves/sorting force a fresh read when they need current data); the input container one defaults to **1000 ms** and is the pace of the input-container drain scan. Changes apply immediately and are stored in `config.json`.
 
 ## Tools
@@ -206,7 +208,7 @@ shell.run("bg", "IFMWorker.lua")
 
 ### netsync
 - You have one master computer plus a pile of workers, and IFM just released a new version — updating them one by one is a pain. The `netserver` / `netsync` pair syncs files automatically.
-- `netserver` is started with a name and serves the files inside `/netsync/<name>/` (subdirectories included), so **the files you want to distribute must be placed there** (entries starting with `.`, the server script itself, `*.version` and the top-level `rom/` and `disk/` are never sent).
+- `netserver` is started with a name and serves **every file and subdirectory** inside `/netsync/<name>/`, so **the files you want to distribute must be placed there**. Since 1.6.16 there is **no filtering at all**: hidden entries, the server script itself, `*.version`, `rom/` and `disk/` are all sent. Do not put the client state directory (`/.netsync`) in there.
 - `netsync` is started with a name, downloads all files from that `netserver` to the local computer, and reboots the computer when the download is done.
 - `netserver` keeps a version number: after you change the files, start it with `netserver --update <name>` to bump the version.
 - `netsync` only downloads when the server has a newer version; otherwise it just keeps waiting.
