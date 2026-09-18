@@ -25,6 +25,7 @@
 wget run https://raw.githubusercontent.com/Log4jErr/CC-IFM/main/backend/ifm_bundle.lua
 ```
 - 如果IFM有更新的版本，你可以重新运行这条命令以完成更新。
+- 如果服务器内无法访问Github，你可以单独下载ifm_bundle.lua，然后将此文件拖拽上传至计算机，运行ifm_bundle.lua以完成安装。
 
 ## 启动
 - 在其中一台计算机中运行主控脚本，使用下面这条命令启动（警告：不要有复数台计算机在同一有线网络中运行主控脚本，否则会发生不可预料的结果）
@@ -40,7 +41,7 @@ IFMWorker.lua
 主从节点之间会自动发现，所以不需要你进行其他干预。
 
 ## 网页终端
-- 网页终端是纯静态页面：把 `frontend/` 目录发布到一个静态托管上（例如用一个专门的分支/工作流把它发布到 GitHub Pages，或者本地 `python serve.py`），然后用浏览器打开它。注意仓库里的 raw 链接不能直接用 —— 页面还要加载同目录下的 js/css/图标素材。
+- 浏览器打开[这个页面](https://log4jerr.github.io/CC-IFM/frontend/)，这就是网页终端。
 - 你需要在网页终端输入房间号以连接到你游戏内的IFM系统。
 
 ## 能做什么
@@ -52,7 +53,7 @@ IFMWorker.lua
 
 ## 自动合成系统
 - 就像是AE2里的样板一样，IFM的自动合成需要你进行“流程”和“机器”的定义。
-- 首先是机器定义，你需要先新建“机器类型”，这一层抽象是为了进行机器的并行（例如，你有很多个酿造台，它们每一个能做的事情相同，那么想要IFM使用你的酿造台，不妨创建并命名一个机器类型叫做“炼药”）。
+- 首先是机器定义，你需要先新建“机器类型”，这一层抽象是为了进行机器的并行（例如，你有很多个酿造台，它们每一个都能执行酿造配方，那么想要IFM使用你的酿造台，不妨创建并命名一个机器类型叫做“炼药”）。
 - 接下来，在机器类型卡片下创建“机器”，机器是一个最小的工作单位。机器需要设定输入容器、输出容器、以及一个可选的红石信号（IFM系统中允许接入红石继电器，按照你设定的要求发送或者等待红石信号，这在有些时候很有用）。对于酿造台这个例子，酿造台需要同时添加为输入容器和输出容器（你既对它输入材料，又直接从它抽出成品）。一些机器可能会有多个输入/输出容器（举个例子，机械动力的“机械手装配”，需要同时对机械手和下方的置物台输入材料，那么你应当将它们都设置为输入容器。）
 - 机器定义中还有一些其他参数，例如“并行信号量”是这个机器可以同时接受的合成任务数。默认值为1表示这个机器必须要在输入物品后，产物完全输出后，才能进行下一次物品输入。一些机器可能能够同时支持多个任务，比如通过漏斗+堆肥桶进行堆肥的机器，漏斗可以同时输入多组物品，那么你不妨将这个值设置高一些。（AE2玩家会很明白，这有点像是样板供应器设置为“阻塞直到产物返回”）
 - 一个机器类型下可以有多个机器，这很好理解。如果要使用一类机器合成，可以使用这些机器中任意一个空闲的机器。
@@ -89,6 +90,27 @@ shell.run("bg", "IFMWorker.lua")
 - 由于 CC:Tweaked 的限制，计算机所在区块必须保持加载，否则脚本会停摆（记得准备区块加载手段）。
 - 公共中继 `wss://itty.ws/c/` 在部分地区可能连不上，可以自建 itty-sockets 服务器并用 `--relay` 指过去。
 - 读容器是阻塞调用（有线网络上每个容器约 1 个服务器刻），容器很多时扫描会变慢，可以调大扫描间隔，或者添加更多从节点。
+
+## 小工具
+- backend/tools下是一些其他的CC脚本，提供一些用得着的功能。
+
+### netsync
+- 你有1个主控和一大堆从节点，现在IFM版本更新了，一个个去更新可太麻烦了。工具脚本netserver和netsync是成对使用的，用于自动同步文件。
+- netserver启动时需要指定name，然后它会将本机所有文件发送给指定的name相同的运行了netsync的计算机。
+- netsync启动时需要指定name，然后它会从netserver下载所有文件到本机，下载完成后重启计算机。
+- netserver有一个文件版本信息，修改了文件后你需要使用netserver --update name启动netserver，以更新版本。
+- netsync只会在netserver有更新的版本时才下载。否则会保持等待。
+- 为了使用这个脚本自动更新IFM，你应当在主控节点安装netserver，在从节点安装netsync，并且从节点可以设置netsync和IFMWorker同时开机自启（借助shell.run bg或者fg命令）。每次需要更新IFM版本时，先在主控安装新版IFM，然后在主控运行netserver --update <名称>
+
+### crafter
+- 现在你希望使用IFM自动合成，可Minecraft原版的合成器速度很慢（而且，很卡！），为此你可以使用海龟合成。
+- 在海龟上安装crafter.lua这个脚本，就可以将海龟变为一个批量合成器。你可能需要写一个startup.lua脚本自启crafter脚本，(或者偷懒，直接将crafter脚本重命名为startup.lua)
+- 海龟需要安装工作台，非合成海龟没有合成能力
+- 搞定上面的设置后，海龟在每次接收到红石信号时，会从上方容器中抽取物品，然后将所有物品合成，然后将产物吐到下方容器（或者合成没成功，吐出所有材料）。
+- 上方容器的1-9槽位分别对应工作台安装从左到右，从上到下的9个槽位。你知道的，你可以用IFM精确控制材料输入槽位。
+- 下方可以不为容器，此时海龟会以物品形式吐出产物。如果产物实在是太多了，海龟物品栏装不下，也会以物品形式吐出。（例如，你用64x铁锭+64x燧石合成了64x打火石，海龟只能装下16x打火石，此时会有48x打火石以物品形式掉出）
+- 相比合成器一次红石脉冲只能合成1次，海龟合成器每次可以将所有物品完成合成。（或者你的Minecraft版本比较低，没有合成器，此时这个海龟大概是你唯一的选择。）
+- 为了使用IFM完全操控这个合成器，你应当需要在海龟旁安装一个红石继电器，并且设置IFM流程在输入所有物品后对此继电器发出红石脉冲。
 
 [English](#en) | [中文](#zh)
 <a id="en"></a>
@@ -141,7 +163,7 @@ python serve.py            # http://localhost:8000/index.html
 
 ## Auto-crafting system
 - Just like AE2 patterns, IFM auto-crafting is driven by your **machine** and **process** definitions.
-- First define a **machine type**. This abstraction layer exists for parallelisation: if you own several brewing stands that all do the same thing, create and name a machine type such as “Brewing” and let IFM use them.
+- First define a **machine type**. This abstraction layer exists for parallelisation: if you own several brewing stands that all can do brewing recipes, create and name a machine type such as “Brewing” and let IFM use them.
 - Next create a **machine** under that machine type; a machine is the smallest working unit. It needs input container(s), output container(s) and an optional redstone signal (IFM can drive a redstone relay to send or wait for signals, which is handy in some setups). For the brewing stand example, add it both as input and output container (you feed materials into it and pull products straight out of it). Some machines have several input/output containers (e.g. Create's Mechanical Arm assembly needs materials inserted into both the arm and the depot below it — mark both as input containers).
 - Machines have a few more parameters, e.g. **parallelism** is how many crafting jobs the machine accepts at the same time. The default 1 means the machine must finish a job (products fully extracted) before new materials are inserted. Some machines can handle several jobs at once — e.g. a hopper feeding a composter can accept multiple stacks, so raise the value there. (AE2 players will recognise this as Pattern Provider “block until products return”.)
 - One machine type can contain many machines; when crafting with that type, any idle machine of the type can be used.
@@ -173,6 +195,27 @@ IFMMaster --room <room name>
 shell.run("bg", "IFMWorker.lua")
 ```
 - Rebuild the backend after changing its source: `python backend/build.py` (writes `backend/ifm_bundle.lua`).
+
+## Tools
+- `backend/tools/` holds a few extra CC scripts that provide some handy utilities.
+
+### netsync
+- You have one master computer plus a pile of workers, and IFM just released a new version — updating them one by one is a pain. The `netserver` / `netsync` pair syncs files automatically.
+- `netserver` is started with a name and then sends all files on that computer to every computer running `netsync` with the same name.
+- `netsync` is started with a name, downloads all files from that `netserver` to the local computer, and reboots the computer when the download is done.
+- `netserver` keeps a version number: after you change the files, start it with `netserver --update <name>` to bump the version.
+- `netsync` only downloads when the server has a newer version; otherwise it just keeps waiting.
+- To auto-update IFM with this, install `netserver` on the master and `netsync` on the workers, and start `netsync` together with `IFMWorker` at boot (using `shell.run` with `bg` or `fg`). Whenever IFM updates: install the new version on the master first, then run `netserver --update <name>` on the master.
+
+### crafter
+- You want IFM auto-crafting, but the vanilla Crafter is slow (and laggy!) — use a turtle as a batch crafter instead.
+- Install `crafter.lua` on the turtle and it becomes a batch crafter. You may want a `startup.lua` to launch it automatically (or be lazy and just rename the script to `startup.lua`).
+- The turtle needs a crafting table upgrade; a non-crafting turtle cannot craft.
+- Once set up, on every redstone pulse the turtle pulls items from the container above it, crafts everything, and pushes the products into the container below (or spits all materials back out if crafting failed).
+- Slots 1–9 of the container above map to the crafting grid left-to-right, top-to-bottom — and you can control input slots precisely from IFM.
+- The container below is optional; without it the turtle drops the products as items. If there are too many products for the turtle's inventory they are dropped as items as well (e.g. crafting 64× Flint and Steel from 64× Iron Ingot + 64× Flint: the turtle only holds 16, so 48 are dropped).
+- Unlike the Crafter (one craft per redstone pulse), the turtle crafts everything in one go. (Or, on older Minecraft versions without the Crafter, this turtle is probably your only option.)
+- To control it fully from IFM, put a redstone relay next to the turtle and make the process emit a redstone pulse after all materials have been inserted.
 
 ## Limitation
 - CC:Tweaked keeps a computer running only while its chunk is loaded — use a chunk loader.
