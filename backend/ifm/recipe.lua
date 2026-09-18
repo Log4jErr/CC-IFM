@@ -1839,7 +1839,17 @@ end
 
 --- 推进「整理计划」的计算：每次调用只跑一遍分批计算（预算内），算完就转入执行阶段
 function Recipe:advanceCompactPlan(job, now)
-    local plan, done = self.Containers:compactPlanPass(job.planner)
+    --- 整理计划只用**当前已扫到的容器结果**：计算期间打开“只读缓存模式”——
+    --- 不再触发 worker 代扫 / 本机扫描，物品种类也只读缓存（用户第 12 项要求）。
+    --- 计算一结束就关掉（引擎随后的搬运/判断照旧会刷新缓存）。
+    self.Containers:setCacheOnly(true)
+    --- 用 pcall 包住：算计划中途抛错（非 PLAN_YIELD）时也必须把只读缓存模式关掉，
+    --- 否则引擎后面做搬运判断时也会“只看旧缓存”，那样会漏搬/错判。
+    local okPlan, plan, done = pcall(self.Containers.compactPlanPass, self.Containers, job.planner)
+    self.Containers:setCacheOnly(false)
+    if not okPlan then
+        error(plan, 0)
+    end
     if not done then
         -- 还没算完（这一轮的外设调用预算用光）：下个 tick 接着算。
         -- 每 5 秒报一次进度，方便在网页/终端上看到“确实在算”。
@@ -2031,6 +2041,8 @@ function Recipe:tick(now)
     end
     --- 在飞搬运的记忆（见在飞搬运的记忆一节）：清掉过期的（worker 早已超时的那些）
     self:sweepPendingMoves(now)
+    --- 输入容器：定期扫一遍，把里面的东西搬进存储容器（用户第 13 项要求）
+    self:drainInputContainers(now)
     -- 本 tick 的细分计数：真正读了几次外设（缓存命中不算）与总耗时 —— 慢 tick 的明细里会打出来
     local readsAtStart = self.Containers.readCount or 0
     local readMsAtStart = self.Containers.readMsTotal or 0
@@ -2209,6 +2221,148 @@ function Recipe:currentElement(process, record)
     return entry
 end
 
+--- 当前批次里“**正在合成**”的份数（材料已送达机器、还没出货的那些）：
+---   * 每个材料输入元素有“每份需要多少个”（element.count），已送达数量 / 该比值 = 这一元素够做几份；
+---     取所有输入里的**最小值**（任一材料不够就做不出那么多份），再按当前批次数封顶；
+---   * 没有材料输入的流程（纯等待 / 红石等待）算整批都在合成；
+---   * 用途：网页流程依赖图的材料节点上显示「正在合成 / 剩余目标」（用户第 11 项要求）。
+function Recipe:activeUnits(process, record)
+    local batch = tonumber(record and record.batch) or 0
+    if batch <= 0 then
+        return 0
+    end
+    local progress = (record and record.progress) or {}
+    local units = nil
+    for index, element in ipairs(process.inputs or {}) do
+        if element.kind == "item" or element.kind == "fluid" or element.kind == "filter" then
+            local each = tonumber(element.count) or 0
+            if each > 0 then
+                local transferred = tonumber(progress[tostring(index)]) or 0
+                local covered = math.floor(transferred / each)
+                if units == nil or covered < units then
+                    units = covered
+                end
+            end
+        end
+    end
+    if units == nil then
+        units = batch
+    end
+    return math.max(0, math.min(batch, units))
+end
+
+--- ===== 输入容器（role = "input"）=====
+--- 用途（用户第 13 项要求）：把外设设成“输入容器”后，IFM 会**像扫描存储容器一样定期扫它**，
+--- 一旦里面有东西就搬进存储容器 —— 这样人工/上游丢进去的料会自动进入存储系统，
+--- 参与库存统计与后续合成，不需要手动开容器工具搬。
+--- 节奏与代扫限流配合：每 INPUT_DRAIN_INTERVAL 毫秒扫一轮，每轮最多搬 INPUT_DRAIN_OPS 次
+--- （每次搬运都是 pushItem/pushFluid，可能交给 worker；pending 时下轮继续）。
+local INPUT_DRAIN_INTERVAL = 2000
+local INPUT_DRAIN_OPS = 2
+
+function Recipe:drainInputContainers(now)
+    now = now or os.epoch("utc")
+    self.inputDrain = self.inputDrain or { items = 0, fluids = 0, lastAt = 0, lastLogAt = 0 }
+    local state = self.inputDrain
+    if now - (state.lastAt or 0) < INPUT_DRAIN_INTERVAL then
+        return 0
+    end
+    state.lastAt = now
+    local sources = {
+        item = self.Containers:byRole("input", "item"),
+        fluid = self.Containers:byRole("input", "fluid"),
+    }
+    if #sources.item == 0 and #sources.fluid == 0 then
+        return 0
+    end
+    local targets = {
+        item = self.Containers:byRole("storage", "item", "out"),
+        fluid = self.Containers:byRole("storage", "fluid", "out"),
+    }
+    local ops = 0
+    local movedItems = 0
+    local movedFluids = 0
+    local pending = false
+
+    local function drainItems()
+        if #targets.item == 0 then
+            return
+        end
+        for _, source in ipairs(sources.item) do
+            if ops >= INPUT_DRAIN_OPS or pending then
+                return
+            end
+            for _, stack in ipairs(self.Containers:stacks(source)) do
+                if ops >= INPUT_DRAIN_OPS or pending then
+                    return
+                end
+                local amount = tonumber(stack.count) or 0
+                if amount > 0 then
+                    for _, target in ipairs(targets.item) do
+                        local got, err = self.Containers:pushItem(source, stack.slot, amount, target)
+                        if err == "pending" then
+                            pending = true              -- 已交给 worker：下轮接着排
+                            return
+                        end
+                        got = tonumber(got) or 0
+                        if got > 0 then
+                            self.Containers:invalidate()
+                            state.items = (state.items or 0) + got
+                            movedItems = movedItems + got
+                            ops = ops + 1
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local function drainFluids()
+        if #targets.fluid == 0 then
+            return
+        end
+        for _, source in ipairs(sources.fluid) do
+            if ops >= INPUT_DRAIN_OPS or pending then
+                return
+            end
+            for _, tank in ipairs(self.Containers:tanks(source)) do
+                if ops >= INPUT_DRAIN_OPS or pending then
+                    return
+                end
+                local amount = tonumber(tank.amount) or 0
+                if amount > 0 then
+                    for _, target in ipairs(targets.fluid) do
+                        local got, err = self.Containers:pushFluid(source, amount, tank.name, target)
+                        if err == "pending" then
+                            pending = true
+                            return
+                        end
+                        got = tonumber(got) or 0
+                        if got > 0 then
+                            self.Containers:invalidate()
+                            state.fluids = (state.fluids or 0) + got
+                            movedFluids = movedFluids + got
+                            ops = ops + 1
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    drainItems()
+    drainFluids()
+    local moved = movedItems + movedFluids
+    if moved > 0 and now - (state.lastLogAt or 0) >= 30000 then
+        state.lastLogAt = now
+        self.log("Input containers drained: %d item(s) / %d mB fluid moved into storage (totals %d / %d)",
+            movedItems, movedFluids, state.items or 0, state.fluids or 0)
+    end
+    return moved
+end
+
 --- 流程运行态（推送给网页）
 --- 只下发**有事可做**的流程（idle 的不下发，也不创建记录）：系统里大多数流程大多数时间都是空闲的，
 --- 之前每个 tick 都把它们推一遍，既浪费带宽也让浏览器白重画。
@@ -2226,6 +2380,8 @@ function Recipe:runtime()
                 userCount = record.userCount or 0,
                 downstreamCount = record.downstreamCount or 0,
                 remaining = (record.userCount or 0) + (record.downstreamCount or 0),
+                --- 正在合成的份数（材料已送到机器的那部分）：材料节点显示「active/remaining」
+                active = self:activeUnits(process, record),
                 machine = record.machine,
                 lastError = record.lastError,
                 waitKind = record.wait and record.wait.kind or nil,

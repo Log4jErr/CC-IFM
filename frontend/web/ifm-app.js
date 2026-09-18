@@ -364,7 +364,7 @@
         // 「外设与定义」板块被拆成了四个容器（缺失 / 机器类型 / 存储 / 未分配），
         // 点击委托必须**每个容器都绑一遍** —— 以前只绑了 peripheralList，
         // 结果机器类型卡片上的「+ 机器」与机器卡片都点不动（1.6.5 修）。
-        ['peripheralList', 'machineTypeList', 'storageList', 'missingList'].forEach(function (id) {
+        ['peripheralList', 'machineTypeList', 'storageList', 'inputList', 'missingList'].forEach(function (id) {
             const node = el(id);
             if (node) node.addEventListener('click', handleDefinitionClick);
         });
@@ -376,8 +376,8 @@
 
     function handleDefinitionClick(event) {
         {
-            // 存储卡片里的「×」：删掉这条存储定义（外设回到“未分配”）
-            const removeStorage = event.target.closest('[data-pc-storage-remove]');
+            // 存储 / 输入 卡片里的「×」：删掉这条容器定义（外设回到“未分配”）
+            const removeStorage = event.target.closest('[data-pc-role-remove], [data-pc-storage-remove]');
             if (removeStorage) {
                 event.stopPropagation();
                 const chip = removeStorage.closest('[data-pc-peripheral]');
@@ -871,6 +871,11 @@
             // 存储卡片：只收同种类的容器芯片（信号芯片不收）
             return kind !== null && kind === (storageKind === 'fluid' ? 'fluid' : 'item');
         }
+        const inputKind = target.getAttribute('data-input-drop');
+        if (inputKind) {
+            // 输入容器卡片：规则与存储卡片一样（只收同种类的容器芯片）
+            return kind !== null && kind === (inputKind === 'fluid' ? 'fluid' : 'item');
+        }
         const slotId = target.getAttribute('data-machine-slot');
         if (!slotId) return false;
         if (slotId === 'signal') {
@@ -890,7 +895,7 @@
     // 拖拽开始：把**所有能接收当前芯片**的位置 / 存储卡片都标出来（.drop-ok 边框高亮），
     // 这样不用一个个试就知道能放到哪里；不能接收的（比如流体芯片拖到物品存储卡片）不亮。
     function markDropTargets(payload) {
-        const nodes = document.querySelectorAll('[data-machine-slot], [data-storage-drop]');
+        const nodes = document.querySelectorAll('[data-machine-slot], [data-storage-drop], [data-input-drop]');
         Array.prototype.forEach.call(nodes, function (node) {
             node.classList.toggle('drop-ok', dragAcceptable(node, payload));
         });
@@ -914,6 +919,9 @@
                     fromKind: chip.getAttribute('data-pc-kind'),
                     fromDef: chip.getAttribute('data-pc-def'),
                     fromStorage: chip.getAttribute('data-pc-storage'),
+                    // 存储 / 输入容器卡片上的芯片：记下它属于哪种角色（拖出卡片 = 删掉这条定义）
+                    fromContainerRole: chip.getAttribute('data-pc-role') ||
+                        (chip.getAttribute('data-pc-storage') ? 'storage' : null),
                     dragKind: chip.getAttribute('data-pc-kind'),
                     fromKey: chip.getAttribute('data-edit-container') };
             dragPayload.dropped = false;
@@ -926,7 +934,8 @@
         });
         document.addEventListener('dragover', function (event) {
             if (!dragPayload) return;
-            const target = event.target.closest('[data-machine-slot]') || event.target.closest('[data-storage-drop]');
+            const target = event.target.closest('[data-machine-slot]') ||
+                event.target.closest('[data-storage-drop]') || event.target.closest('[data-input-drop]');
             if (!target) return;
             // 不 preventDefault 的话浏览器不认为这里是可放置目标（drop 事件也不会来）
             event.preventDefault();
@@ -948,13 +957,18 @@
             if (!payload) return;
             const slot = event.target.closest('[data-machine-slot]');
             const storage = event.target.closest('[data-storage-drop]');
-            if (!slot && !storage) return;
+            // 输入容器卡片（1.6.10）：与存储卡片同构，只是角色不一样
+            const input = event.target.closest('[data-input-drop]');
+            if (!slot && !storage && !input) return;
             event.preventDefault();
             payload.dropped = true;
             clearHighlight();
-            // 拖到「存储物品/流体容器」卡片：设成该种类的存储容器（先摘掉原来的机器归属）
-            if (storage) {
-                const kind = storage.getAttribute('data-storage-drop') === 'fluid' ? 'fluid' : 'item';
+            // 拖到「存储/输入 物品/流体容器」卡片：设成该角色 + 该种类的容器
+            if (storage || input) {
+                const role = storage ? 'storage' : 'input';
+                const card = storage || input;
+                const kind = card.getAttribute(role === 'storage' ? 'data-storage-drop' : 'data-input-drop') === 'fluid'
+                    ? 'fluid' : 'item';
                 // 拖的是明确种类的芯片（物品容器/流体容器）时，种类必须与卡片一致
                 if (payload.dragKind === 'signal' || (payload.dragKind && payload.dragKind !== kind)) {
                     toast(t('storageNeedKind', {
@@ -963,9 +977,11 @@
                     }), 'error');
                     return;
                 }
-                const add = function () { return addPeripheralToStorage(kind, payload.peripheral); };
-                if (payload.fromStorage === kind) return;              // 拖回同一种存储卡片：什么都不做
+                const add = function () { return addPeripheralToContainerRole(role, kind, payload.peripheral); };
+                // 拖回同一种卡片（同角色同种类）：什么都不做
+                if (payload.fromContainerRole === role && payload.fromKind === kind) return;
                 if (payload.fromMachine) {
+                    // 从机器位置拖到存储/输入卡片：这是“移出机器”的意图，先摘掉机器归属
                     removePeripheralFromMachine(payload, true).then(add);
                     return;
                 }
@@ -977,16 +993,10 @@
             if (payload.fromMachine) {
                 // 拖回原位：什么都不做
                 if (payload.fromMachine === machineName && payload.fromSlot === slotId) return;
-                if (payload.fromMachine === machineName) {
-                    // 同一台机器内换位置：摘掉旧位置再加新位置（这是“移动”）
-                    removePeripheralFromMachine(payload, true).then(function () {
-                        return addPeripheralToMachine(machineName, slotId, payload.peripheral, payload.dragKind);
-                    });
-                    return;
-                }
-                // 拖到**另一台机器**：只新增，**不摘掉原来那台机器**（1.6.9）——
-                // 交互容器与红石中继器允许被多台机器共用，所以这里是“复制归属”而不是“搬走”。
-                // 想从原机器移除，请把它拖到机器卡片外面（dragend 里处理）。
+                // 拖到**另一个位置**（同一台机器的另一个槽位，或另一台机器）= **复制归属**（1.6.10）：
+                // 输入容器的外设拖到输出容器时，输入容器那张卡片要保留（用户明确要求）；
+                // 交互容器与红石中继器本来就允许被多处引用。
+                // 想从某个位置移除：把它拖到机器卡片外面（dragend 里处理），或点卡片上的 ×。
                 addPeripheralToMachine(machineName, slotId, payload.peripheral, payload.dragKind).then(function (ok) {
                     if (ok) {
                         toast(t('machinePeripheralShared', { name: payload.peripheral, machine: machineName }), 'info');
@@ -1010,15 +1020,15 @@
                 removePeripheralFromMachine(payload);
                 return;
             }
-            // 拖到存储卡片外 ＝ 删掉这条存储定义（这个外设回到“未分配”）
-            if (payload.fromStorage) {
+            // 拖到存储 / 输入卡片外 ＝ 删掉这条容器定义（这个外设回到“未分配”）
+            if (payload.fromContainerRole || payload.fromStorage) {
                 removeStorageContainer(payload.fromKey, payload.peripheral);
             }
         });
     }
 
-    // ===== 存储容器卡片：拖外设卡片进来 = 设为存储容器；拖出去（或点 ×）= 删掉这条存储定义 =====
-    function addPeripheralToStorage(kind, peripheral) {
+    // ===== 存储 / 输入 容器卡片：拖外设卡片进来 = 设成该角色的容器；拖出去（或点 ×）= 删掉这条定义 =====
+    function addPeripheralToContainerRole(role, kind, peripheral) {
         const caps = peripheralCapabilities(peripheral);
         const capability = kind === 'fluid' ? 'fluid_storage' : 'inventory';
         const kindLabel = t(kind === 'fluid' ? 'fluidContainer' : 'itemContainer');
@@ -1031,24 +1041,33 @@
         const priority = existing ? Number(existing.priority || 0) : 0;
         const request = {
             name: name,
-            data: { peripheral: peripheral, kind: kind, role: 'storage', priority: priority }
+            data: { peripheral: peripheral, kind: kind, role: role, priority: priority }
         };
         if (existing) request.previous = containerKeyOf(existing);
         return sendRequest('set_container', request).then(function (response) {
             const result = response.result || {};
             if (result.error) throw new Error(result.error);
             const optimistic = Object.assign({}, existing || {}, {
-                name: name, peripheral: peripheral, kind: kind, role: 'storage', priority: priority
+                name: name, peripheral: peripheral, kind: kind, role: role, priority: priority
             });
             stores.containers.set(containerKeyOf(optimistic), optimistic);
             markDirty('containers');
             renderPeripherals();
-            toast(t('storageSet', { name: peripheral, kind: kindLabel }), 'success');
+            toast(t('containerRoleSet', {
+                name: peripheral,
+                kind: kindLabel,
+                role: t(role === 'input' ? 'inputRole' : 'storage')
+            }), 'success');
             return true;
         }).catch(function (err) {
             toast(t('requestFailed', { error: err.message }), 'error');
             return false;
         });
+    }
+
+    // 兼容旧调用：存储容器
+    function addPeripheralToStorage(kind, peripheral) {
+        return addPeripheralToContainerRole('storage', kind, peripheral);
     }
 
     function removeStorageContainer(defKey, peripheral) {

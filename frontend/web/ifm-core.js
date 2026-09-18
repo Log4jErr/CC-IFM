@@ -9,7 +9,7 @@
     // ===================== 常量 =====================
     // 前端版本号：必须与后端 backend/IFMMaster.lua 里的 IFM_VERSION 完全一致。
     // 连上服务端后会比对 status.version，不一致就弹警告并主动停止连接（见 ifm-net.js）。
-    const IFM_CLIENT_VERSION = '1.6.9';
+    const IFM_CLIENT_VERSION = '1.6.10';
     const DEFAULT_RELAY = 'wss://itty.ws/c/';
     const API_BASE = 'https://blocksitems.com/api/v1';
     const API_ORIGIN = 'https://blocksitems.com';
@@ -137,7 +137,7 @@
             waitSignal: '等待红石信号', emitSignal: '设置红石信号', emitPulse: '发出红石脉冲', waitTime: '等待时间',
             storage: '存储', interaction: '交互', output: '输出',
             containerKind: '容器种类', itemContainer: '物品容器', fluidContainer: '流体容器',
-            storageNameAuto: '只有输出容器需要名称；存储 / 交互容器都用外设名作定义名。',
+            storageNameAuto: '只有输出容器需要名称；存储 / 输入 / 交互容器都用外设名作定义名。',
             machineSlotIn: '输入容器', machineSlotOut: '输出容器', machineSlotSignal: '红石信号',
             machineSlotEmpty: '把外设拖到这里', machineRemove: '移出机器',
             machinePeripheralAdded: '已把 {name} 加到机器 {machine}',
@@ -148,7 +148,12 @@
             storageItemCard: '存储物品容器', storageFluidCard: '存储流体容器',
             storageDropHint: '把外设卡片拖到这里，即可把它设为这种存储容器',
             storageRemove: '移出存储（删掉这条定义）',
-            storageSet: '已把 {name} 设为{kind}', storageRemoved: '已把 {name} 移出存储容器',
+            storageRemoved: '已把 {name} 移出存储容器',
+            inputRole: '输入',
+            inputItemCard: '输入物品容器', inputFluidCard: '输入流体容器',
+            inputDropHint: '把外设卡片拖到这里，即可把它设为这种输入容器（放进去的物品会被自动搬进存储容器）',
+            inputRemove: '移出输入容器（删掉这条定义）',
+            containerRoleSet: '已把 {name} 设为{kind}（{role}容器）',
             storageNeedKind: '{name} 没有{kind}外设，不能作为该存储容器',
             unassigned: '未分配', unassignedHint: '这个功能还没定义：拖到存储卡片或机器位置，也可以点右侧 + 直接建定义',
             createDefinition: '新建定义', clickToEdit: '点击编辑这条定义',
@@ -234,6 +239,7 @@
             searchSyntax: '搜索：关键词 / #标签 / @模组（空格分隔多个条件，同时满足才显示）',
             tipGraphClick: '点击圆点编辑该流程定义',
             tipGraphCraft: '点击节点图标可填入合成数量（只合成，不发送）',
+            tipCrafting: '正在合成', tipCraftTarget: '剩余目标',
             nbtHash: 'NBT 哈希', nbtAny: '留空=无 NBT',
             tagScanning: '标签扫描中 {done}/{total}', tagScanByWorkers: 'worker 代查 {n}', tagsCached: '已缓存 {n} 种物品标签',
             relayHint: '连不上公共中转时可自建广播式中转，把地址填到上面的中转地址栏',
@@ -321,7 +327,7 @@
             waitSignal: 'Wait signal', emitSignal: 'Set signal', emitPulse: 'Emit redstone pulse', waitTime: 'Wait time',
             storage: 'Storage', interaction: 'Interaction', output: 'Output',
             containerKind: 'Container kind', itemContainer: 'Item container', fluidContainer: 'Fluid container',
-            storageNameAuto: 'Only output containers need a name; storage / interaction containers use the peripheral name.',
+            storageNameAuto: 'Only output containers need a name; storage / input / interaction containers use the peripheral name.',
             machineSlotIn: 'Input containers', machineSlotOut: 'Output containers', machineSlotSignal: 'Redstone signals',
             machineSlotEmpty: 'Drag a peripheral here', machineRemove: 'Remove from machine',
             machinePeripheralAdded: 'Added {name} to machine {machine}',
@@ -331,7 +337,12 @@
             storageItemCard: 'Storage: items', storageFluidCard: 'Storage: fluids',
             storageDropHint: 'Drag a peripheral card here to make it a storage container of this kind',
             storageRemove: 'Remove from storage (deletes this definition)',
-            storageSet: '{name} is now a{kind}', storageRemoved: '{name} removed from storage',
+            storageRemoved: '{name} removed from storage',
+            inputRole: 'input',
+            inputItemCard: 'Input: items', inputFluidCard: 'Input: fluids',
+            inputDropHint: 'Drag a peripheral card here to make it an input container (things put in are moved into storage automatically)',
+            inputRemove: 'Remove from input containers (deletes this definition)',
+            containerRoleSet: '{name} is now a{kind} ({role} container)',
             storageNeedKind: '{name} has no {kind} capability, it cannot be that storage container',
             unassigned: 'unassigned',
             unassignedHint: 'This capability has no definition yet: drag it to a storage card or a machine slot, or use + on the right',
@@ -471,7 +482,8 @@
             tipTags: 'Tags',
             searchSyntax: 'Search: keyword / #tag / @mod (space separates conditions, all must match)',
             tipGraphClick: 'Click the dot to edit this process',
-            tipGraphCraft: 'Click the node icon to enter a craft amount (craft only, no send)'
+            tipGraphCraft: 'Click the node icon to enter a craft amount (craft only, no send)',
+            tipCrafting: 'Crafting', tipCraftTarget: 'Left to craft'
         }
     };
 
@@ -804,6 +816,15 @@
         return (meta && meta !== 'missing') ? meta : null;
     }
 
+    // 这个资源的信息还在接口路上吗？（排队中，或正在批量抓取）
+    // 用途：翻译排队时**先别翻兜底文本**——等真名到了再翻（见 queueTranslateNames）。
+    function isMetaPending(kind, name) {
+        const key = resourceKey(kind, name);
+        if (metaCache.has(key)) return false;
+        if (metaQueue.indexOf(key) >= 0) return true;
+        return metaActive > 0 && (metaRetryAt.get(key) || 0) <= Date.now();
+    }
+
     function displayName(kind, name) {
         const english = englishName(kind, name);
         // 开启 Bergamot 名称翻译后优先显示中文（翻译结果由 web/ifm-translate.js 提供）
@@ -824,12 +845,19 @@
     }
 
     // 开了名称翻译时：把要用到的英文名排队交给 Bergamot（翻好后 ifmOnTranslateUpdate 会让界面重画）
+    // 优先用 blocksitems 给的 display_name（接口数据比“注册名去下划线”准得多）；
+    // 接口数据还在路上（metaActive/metaQueue 里有它）时**先不排队** —— 等它到了会再画一次，
+    // 那时用真正的显示名翻译，避免先翻一遍“andesite casing”这种兜底文本（用户要求）。
     function queueTranslateNames(list) {
         const translator = window.IFMTranslate;
         if (!translator || !translator.isEnabled() || translator.status() !== 'ready') return;
-        translator.queueNames(asArray(list).map(function (entry) {
-            return englishName(entry.kind, entry.name);
-        }));
+        const names = [];
+        asArray(list).forEach(function (entry) {
+            const meta = metaOf(entry.kind, entry.name);
+            if (!meta && isMetaPending(entry.kind, entry.name)) return;   // 等接口数据
+            names.push(englishName(entry.kind, entry.name));
+        });
+        if (names.length > 0) translator.queueNames(names);
     }
 
     // 「译」按钮状态文案：未开启 / 下载 45% / 已开启（已翻译 N 个名字）/ 失败

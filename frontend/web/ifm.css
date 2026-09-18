@@ -554,6 +554,9 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     gap: 10px;
     align-items: flex-start;
     margin-top: 10px;
+    /* 与**下方**的方块卡片（#peripheralList）之间也要留出间距：
+       卡片自己 margin:0（见下条规则），不加这一行两块卡片会贴在一起（1.6.10 修） */
+    margin-bottom: 12px;
 }
 /* 宽度取内容需要的最大值，但不超过容器宽度（用户要求：不要总占满整行） */
 .machine-type-list > .card-block {
@@ -599,9 +602,34 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     overflow: visible;
     text-overflow: clip;
 }
-/* 存储容器卡片 / 未分配功能的外设卡片 */
+/* 输入候选浮层（自动补全，见 ifm-editor.js 的 attachAutocomplete）：
+   固定在输入框下方（放不下时翻到上方），可点选，键盘 ↑/↓ 选择 · Tab/Enter 补全 */
+.ifm-ac {
+    position: fixed;
+    z-index: 80;
+    max-height: 220px;
+    overflow-y: auto;
+    background: var(--panel-bg-2);
+    border: 2px solid var(--accent);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, .45);
+    font-size: 12px;
+}
+.ifm-ac-item { padding: 3px 8px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ifm-ac-item.active { background: var(--accent); color: #16181d; }
+
+.ifm-ac-item:empty { display: none; }
 .storage-card { min-width: 0; }
 .storage-card .chip-list { min-width: 0; }
+/* 材料节点上的「正在合成 / 剩余目标」（9/22）：紧跟在图标后面，小字 */
+.ifm-graph-count {
+    display: inline-block;
+    vertical-align: middle;
+    margin-left: 4px;
+    font-size: 11px;
+    line-height: 1;
+    color: var(--accent-2);
+    white-space: nowrap;
+}
 .chip.unassigned { border-style: dashed; color: var(--text-dim); }
 .chip.unassigned .btn-pixel { padding: 1px 6px; }
 .peripheral-section { margin-bottom: 0; }

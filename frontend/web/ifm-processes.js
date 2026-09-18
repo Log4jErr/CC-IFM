@@ -145,6 +145,7 @@
     // ===================== 外设与定义 =====================
     function roleLabel(role) {
         if (role === 'storage') return t('storage');
+        if (role === 'input') return t('inputRole');
         if (role === 'interaction') return t('interaction');
         if (role === 'output') return t('output');
         return role || '';
@@ -266,6 +267,14 @@
         return used;
     }
 
+    function machineUsedSignalNames() {
+        const used = {};
+        Array.from(stores.machines.values()).forEach(function (machine) {
+            asArray(machine.signals).forEach(function (name) { used[String(name)] = true; });
+        });
+        return used;
+    }
+
     function peripheralUnassignedChips(block) {
         const blockName = String(block.name || '');
         // 定义以 stores.containers / stores.signals 为准：乐观更新后界面立刻正确，
@@ -298,11 +307,12 @@
                 '" data-container-kind="' + info[0] + '" title="' + escapeHtml(t('createDefinition')) +
                 '"><i class="fa fa-plus"></i></button></span>');
         });
-        // 红石中继器：**始终**给一个可拖拽的“信号”芯片（拖到机器的红石信号卡片 = 让那台机器用它）。
-        // 1.6.9：信号不再需要命名/定义，所以拖拽源不该因为“已经有定义”而消失 ——
-        // 同一个中继器可以给多台机器用（从一台机器的信号卡片拖到另一台 = 复制归属）。
-        // 若存在旧的信号定义（自定义名字），点芯片仍然能编辑/删除它。
-        if (block.kinds.indexOf('redstone_relay') >= 0) {
+        // 红石中继器：一个可拖拽的“信号”芯片（拖到机器的红石信号卡片 = 让那台机器用它）。
+        // 1.6.10：**已经被机器引用的中继器不再显示方块卡片**——用户要求“被机器引用后卡片应当消失”；
+        // 想再给别的机器用，就从已引用它的那台机器的信号卡片拖过去（拖拽=复制归属）。
+        const usedSignals = machineUsedSignalNames();
+        if (block.kinds.indexOf('redstone_relay') >= 0 && !usedSignals[blockName] &&
+            !usedSignals[String(signalDefs.length ? signalDefs[0].name : '')]) {
             const legacy = signalDefs[0] || null;
             // 有旧定义时可点击编辑（def-chip 的样式）；没有定义时就是一个纯拖拽源。
             chips.push('<span class="chip' + (legacy ? ' def-chip' : '') + ' def-signal" draggable="true"' +
@@ -315,6 +325,7 @@
         // 2) 有定义、但谁也不引用（output 容器 / 没进机器的 interaction 容器）：不能让它从界面上消失
         defs.forEach(function (def) {
             if (def.role === 'storage') return;                                        // 在存储卡片里
+            if (def.role === 'input') return;                                          // 在输入卡片里
             if (def.role === 'interaction' && usedByMachine[String(def.name)]) return;  // 在机器卡片里
             const kind = def.kind === 'fluid' ? 'fluid' : 'item';
             chips.push('<span class="chip def-chip def-' + kind + '" draggable="true"' +
@@ -337,12 +348,14 @@
         return chips;
     }
 
-    // 存储容器卡片：所有 role=storage 的容器外设按种类聚合在这里。
-    // 拖一张外设卡片进来 = 把它设成这种存储容器；把里面的外设卡片拖到卡片外 = 删掉这条存储定义。
-    function storageCardsHtml() {
+    // 存储 / 输入 容器卡片：role=storage（或 input）的容器外设按种类聚合在这里。
+    // 拖一张外设卡片进来 = 把它设成这种角色的容器；把里面的外设卡片拖到卡片外 = 删掉这条定义。
+    //   存储容器：仓库本体（库存统计的来源）
+    //   输入容器（1.6.10 新增）：人工/上游放料的中转箱 —— IFM 会定期扫它并把里面的东西搬进存储容器
+    function containerRoleCardsHtml(role, config) {
         const byKind = { item: [], fluid: [] };
         Array.from(stores.containers.values()).forEach(function (def) {
-            if (def.role !== 'storage') return;
+            if (def.role !== role) return;
             byKind[def.kind === 'fluid' ? 'fluid' : 'item'].push(def);
         });
         const card = function (kind, titleKey, icon) {
@@ -353,7 +366,7 @@
             const chips = defs.map(function (def) {
                 const peripheral = String(def.peripheral || '');
                 const priority = Number(def.priority || 0);
-                const badge = priority !== 0
+                const badge = (role === 'storage' && priority !== 0)
                     ? ' <span class="muted" title="' + escapeHtml(t('containerPriority')) + '">P' +
                       escapeHtml(String(priority)) + '</span>'
                     : '';
@@ -361,25 +374,43 @@
                     ' data-pc-peripheral="' + escapeHtml(peripheral) + '"' +
                     ' data-pc-def="' + escapeHtml(def.name) + '"' +
                     ' data-pc-kind="' + escapeHtml(kind) + '"' +
-                    ' data-pc-storage="' + escapeHtml(kind) + '"' +
+                    ' data-pc-role="' + escapeHtml(role) + '"' +
                     ' data-edit-container="' + escapeHtml(containerKeyOf(def)) + '"' +
-                    ' title="' + escapeHtml(peripheral + ' · ' + t('storage') + ' · ' + t('clickToEdit')) + '">' +
+                    ' title="' + escapeHtml(peripheral + ' · ' + t(config.roleLabelKey) + ' · ' + t('clickToEdit')) + '">' +
                     '<i class="fa ' + (kind === 'fluid' ? 'fa-tint' : 'fa-archive') + '"></i>' +
                     ' <span class="chip-text">' + escapeHtml(peripheral || def.name) + '</span>' + badge +
-                    '<button class="btn-pixel danger chip-del" type="button" data-pc-storage-remove="1" title="' +
-                    escapeHtml(t('storageRemove')) + '"><i class="fa fa-times"></i></button>' +
+                    '<button class="btn-pixel danger chip-del" type="button" data-pc-role-remove="' + escapeHtml(role) + '" title="' +
+                    escapeHtml(t(config.removeKey)) + '"><i class="fa fa-times"></i></button>' +
                     '</span>';
             }).join('');
-            return '<div class="card-block storage-card" data-storage-drop="' + escapeHtml(kind) + '">' +
+            const dropAttr = role === 'storage'
+                ? ' data-storage-drop="' + escapeHtml(kind) + '"'
+                : ' data-input-drop="' + escapeHtml(kind) + '"';
+            return '<div class="card-block storage-card"' + dropAttr + '>' +
                 '<div class="card-head">' +
                 '<h3><i class="fa ' + icon + '"></i> ' + escapeHtml(t(titleKey)) +
                 ' <span class="muted">' + defs.length + '</span></h3>' +
                 '</div>' +
                 '<div class="chip-list">' + (chips ||
-                    ('<span class="muted slot-empty">' + escapeHtml(t('storageDropHint')) + '</span>')) +
+                    ('<span class="muted slot-empty">' + escapeHtml(t(config.hintKey)) + '</span>')) +
                 '</div></div>';
         };
-        return card('item', 'storageItemCard', 'fa-archive') + card('fluid', 'storageFluidCard', 'fa-tint');
+        return card('item', config.itemKey, 'fa-archive') + card('fluid', config.fluidKey, 'fa-tint');
+    }
+
+    function storageCardsHtml() {
+        return containerRoleCardsHtml('storage', {
+            itemKey: 'storageItemCard', fluidKey: 'storageFluidCard',
+            hintKey: 'storageDropHint', removeKey: 'storageRemove', roleLabelKey: 'storage',
+        });
+    }
+
+    // 输入容器卡片（1.6.10）：与存储卡片同构，但角色是 input、drop 属性是 data-input-drop
+    function inputCardsHtml() {
+        return containerRoleCardsHtml('input', {
+            itemKey: 'inputItemCard', fluidKey: 'inputFluidCard',
+            hintKey: 'inputDropHint', removeKey: 'inputRemove', roleLabelKey: 'inputRole',
+        });
     }
 
     function renderPeripherals() {
@@ -424,6 +455,9 @@
         if (machineBox) machineBox.innerHTML = machinesHtml();
         const storageBox = el('storageList');
         if (storageBox) storageBox.innerHTML = storageCardsHtml();
+        // 输入容器卡片（1.6.10）：与存储卡片同构，角色是 input
+        const inputBox = el('inputList');
+        if (inputBox) inputBox.innerHTML = inputCardsHtml();
         const missing = Array.from(stores.missing.values()).filter(function (item) {
             return missingMatchesSearch(item, query);
         }).sort(function (a, b) { return String(a.name).localeCompare(String(b.name)); });
@@ -600,6 +634,28 @@
     }
 
     // ===================== 流程依赖图（mermaid） =====================
+    // 某个材料（kind:id）由哪些流程产出 → 这台材料“正在合成 / 剩余目标”的合计。
+    //   正在合成 = 各产出流程当前批次里材料已送到机器的份数（后端 record.active）
+    //   剩余目标 = 各产出流程还需要合成的份数（后端 record.remaining）
+    // 例：下游流程要 10 份 + 用户手动要 15 份、已合成 3 份 → 剩余 22；当前已送料 9 份 → 显示 9/22
+    function materialCraftCounts(kind, id) {
+        let active = 0;
+        let target = 0;
+        Array.from(stores.processes.values()).forEach(function (process) {
+            const produces = asArray(process.outputs).some(function (element) {
+                const elementKind = element.kind === 'placeholder' ? 'item' : element.kind;
+                const elementId = element.kind === 'placeholder' ? element.item : element.id;
+                return elementKind === kind && String(elementId || '') === String(id || '');
+            });
+            if (!produces) return;
+            const record = stores.runtime.get(process.name);
+            if (!record) return;
+            active += Number(record.active) || 0;
+            target += Number(record.remaining) || 0;
+        });
+        return { active: active, target: target };
+    }
+
     function materialNodeLabel(kind, id) {
         if (kind === 'filter') return t('filterKind2') + ' ' + id;
         return displayName(kind, id);
@@ -687,16 +743,27 @@
             // 记下这个节点代表哪个资源：渲染完成后点图标就能直接弹「合成 N 个」
             nodeMaterial.set(nodeId, { kind: kind, id: id });
             const entry = stores.resources.get(resourceKey(kind, id)) || {};
+            // 「正在合成 / 剩余目标」（例如 9/22）：只有真的有活时才显示，空闲的材料节点保持干净
+            const craft = materialCraftCounts(kind, id);
+            const showCount = craft.target > 0 || craft.active > 0;
+            const countHtml = showCount
+                ? "<span class='ifm-graph-count'>" + escapeHtml(fmtCount(craft.active) + '/' + fmtCount(craft.target)) + '</span>'
+                : '';
             // 正方形材料节点里只放图标：详情（注册名 / 种类 / 库存）放进悬停信息
             const details = [
                 tipField(t('tipRegistry'), id),
                 tipField(t('tipKind'), resourceKindLabel(kind)),
             ];
             if (kind !== 'filter') details.push(tipField(t('tipStored'), fmtCount(entry.count || 0)));
+            if (showCount) {
+                details.push(tipField(t('tipCrafting'), fmtCount(craft.active)));
+                details.push(tipField(t('tipCraftTarget'), fmtCount(craft.target)));
+            }
             if (kind === 'item' || kind === 'fluid') details.push('', t('tipGraphCraft'));
             nodeTooltip.set(nodeId, { title: materialNodeLabel(kind, id), lines: details });
             // 标签里只放定尺占位符：真正的图标在渲染完成之后由 applyGraphIcons 写进去
-            materialLines.push('    ' + nodeId + '["' + GRAPH_ICON_HOLDER.replace(/"/g, '&quot;') + '"]');
+            materialLines.push('    ' + nodeId + '["' + GRAPH_ICON_HOLDER.replace(/"/g, '&quot;') +
+                countHtml.replace(/"/g, '&quot;') + '"]');
             return nodeId;
         };
         const isMaterial = function (element) {

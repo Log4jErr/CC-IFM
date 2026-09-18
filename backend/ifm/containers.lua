@@ -428,12 +428,44 @@ function Containers:requestDelegateScan(peripheralName)
     return state or "local"
 end
 
+--- 只读缓存模式（1.6.10）：整理计划**只用当前已经扫到的结果**，不再触发任何新的扫描 / 外设探测。
+--- 用户要求：「整理容器功能直接使用当前扫描的容器结果，不触发重新扫描，探测物品种类也应当使用缓存」。
+--- 打开后：
+---   * listPeripheral/tanksPeripheral 只读 listCache/tankCache（连 TTL 都不看），没有缓存就返回空表
+---     （这一轮就跳过这个容器；引擎每个 tick 又会跑一遍计划，缓存很快就会有）；
+---   * maxCountOf 只读物品详情字典（不派 worker、不本机读），问不到的按 64 算。
+--- 关闭后行为与以前完全一样（做搬运、做判断时该刷新就刷新）。
+function Containers:setCacheOnly(on)
+    self.cacheOnly = on and true or false
+    if not self.cacheOnly then
+        self.cacheOnlyMisses = 0
+    end
+end
+
+--- 只读缓存模式下的 list 结果：有缓存就直接用（不看 TTL），没有就返回 nil 表示“这一轮没有数据”
+function Containers:cachedList(peripheralName)
+    local cached = self.listCache[peripheralName]
+    if cached and type(cached.value) == "table" then
+        return cached.value
+    end
+    return nil
+end
+
 --- 某外设的槽位表：{slot -> {name, count, nbt}}（失败返回空表）
 --- 带 listTtl 短时缓存（见 Containers.new）：同一批容器在一次推送/一个 tick 里只读一次外设。
 --- 缓存过期时先问 IFMWorker（它读容器对主控零成本），拿不到就用旧值顶着 / 本机读。
 function Containers:listPeripheral(peripheralName)
     local cached = self.listCache[peripheralName]
     local now = os.epoch("utc")
+    --- 只读缓存模式（整理计划）：绝不再触发扫描（worker 代扫 / 本机读），只用当前扫到的结果
+    if self.cacheOnly then
+        local only = self:cachedList(peripheralName)
+        if only then
+            return only
+        end
+        self.cacheOnlyMisses = (self.cacheOnlyMisses or 0) + 1
+        return {}
+    end
     if cached and now - cached.stamp < self:effectiveListTtl() then
         return cached.value
     end
@@ -503,6 +535,14 @@ end
 function Containers:tanksPeripheral(peripheralName)
     local cached = self.tankCache and self.tankCache[peripheralName]
     local now = os.epoch("utc")
+    --- 只读缓存模式（整理计划）：只用当前扫到的结果，不再触发扫描
+    if self.cacheOnly then
+        if cached and type(cached.value) == "table" then
+            return cached.value
+        end
+        self.cacheOnlyMisses = (self.cacheOnlyMisses or 0) + 1
+        return {}
+    end
     if cached and now - cached.stamp < self:effectiveListTtl() then
         return cached.value
     end
@@ -1377,6 +1417,11 @@ local function computeCompactPlan(self, role, planner)
             end
             self.itemMaxCountCache[itemName] = value
             return value
+        end
+        --- 只读缓存模式（整理计划）：物品种类也只用缓存 —— 不派 worker、不本机读，问不到就按 64 算
+        if self.cacheOnly then
+            self.detailDeferred = (self.detailDeferred or 0) + 1
+            return DEFAULT_ITEM_MAX_COUNT
         end
         --- 字典里没有：先问 worker（它就在容器旁边，主控零成本；结果下个 tick 进字典）
         if self:detailsInFlight(itemName, nbt) then

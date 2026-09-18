@@ -282,6 +282,152 @@
         Array.prototype.forEach.call(document.querySelectorAll('#editorBody [data-picker]'), function (node) {
             renderOrderedPicker(node.getAttribute('data-picker'));
         });
+        // 文本输入框的候选列表（物品/流体/过滤器/标签…）：见 attachAutocomplete
+        Array.prototype.forEach.call(
+            document.querySelectorAll('#editorBody input[list="ifmSuggestions"], #editorBody input.rule-value,' +
+                ' #editorBody #toolResource'),
+            function (input) { attachAutocomplete(input); }
+        );
+    }
+
+    // ===================== 输入候选（自动补全，1.6.10）=====================
+    // 需求（用户第 16 项）：输入物品 / 流体 / 过滤器 / 标签…时，根据**已有的资源**给出候选，
+    // 候选以列表形式排在输入框**上方或下方**（取决于输入框在屏幕中的位置），并且支持：
+    //   ↑ / ↓ 选择候选项 · Tab 用候选补全输入框 · Enter 采用候选项 · Esc 关闭 · 鼠标点击采用
+    // 原生 <datalist> 做不到“列表随位置上下翻转 + Tab 补全 + 自定义样式”，所以这里自己画一个浮层。
+    const AC_LIMIT = 12;
+    let acPanel = null;            // 当前打开的候选浮层（同一时刻只开一个）
+    let acState = null;            // { input, items, index, panel }
+    let acApplying = false;        // 正在把候选项写回输入框（此时不要再自动弹出候选）
+
+    function closeAutocomplete() {
+        if (acPanel && acPanel.parentNode) acPanel.parentNode.removeChild(acPanel);
+        acPanel = null;
+        acState = null;
+    }
+
+    // 候选池：资源名（物品/流体）+ 过滤器名 + 常见标签 + 资源上已经出现过的 #标签
+    function acCandidates(query) {
+        const text = String(query || '').trim().toLowerCase();
+        const pool = suggestionValues();
+        Array.from(stores.resources.values()).forEach(function (entry) {
+            asArray(entry.tags).forEach(function (tag) { pool.push('#' + String(tag)); });
+        });
+        const seen = {};
+        const out = [];
+        pool.forEach(function (value) {
+            const candidate = String(value || '');
+            if (!candidate || seen[candidate]) return;
+            seen[candidate] = true;
+            if (text && candidate.toLowerCase().indexOf(text) < 0) return;
+            out.push(candidate);
+        });
+        return out.slice(0, AC_LIMIT);
+    }
+
+    function renderAcPanel() {
+        if (!acState) return;
+        acState.panel.innerHTML = acState.items.map(function (value, index) {
+            return '<div class="ifm-ac-item' + (index === acState.index ? ' active' : '') +
+                '" data-ac-index="' + index + '">' + escapeHtml(value) + '</div>';
+        }).join('');
+        const active = acState.panel.querySelector('.ifm-ac-item.active');
+        if (active && active.scrollIntoView) active.scrollIntoView({ block: 'nearest' });
+    }
+
+    function applyAcIndex(index) {
+        if (!acState) return;
+        const value = acState.items[index];
+        if (value === undefined) return;
+        const input = acState.input;
+        closeAutocomplete();
+        input.value = value;
+        // 通知其它监听器（例如工具输入框的变更处理）：期间不要再次弹出候选（否则列表会“补全后又弹回来”）
+        acApplying = true;
+        input.dispatchEvent(new window.Event('input', { bubbles: true }));
+        acApplying = false;
+    }
+
+    function openAutocomplete(input, index) {
+        const items = acCandidates(input.value);
+        if (items.length === 0) {
+            closeAutocomplete();
+            return;
+        }
+        if (!acPanel || !acState || acState.input !== input) {
+            closeAutocomplete();
+            const panel = document.createElement('div');
+            panel.className = 'ifm-ac';
+            document.body.appendChild(panel);
+            acPanel = panel;
+            acState = { input: input, items: items, index: 0, panel: panel };
+            // 鼠标点候选项：直接采用
+            panel.addEventListener('mousedown', function (event) {
+                const node = event.target.closest('[data-ac-index]');
+                if (!node || !acState) return;
+                event.preventDefault();
+                applyAcIndex(Number(node.getAttribute('data-ac-index')));
+            });
+        }
+        acState.items = items;
+        if (typeof index === 'number') {
+            acState.index = Math.max(0, Math.min(items.length - 1, index));
+        } else if (acState.index >= items.length) {
+            acState.index = 0;
+        }
+        // 位置：默认贴在输入框下面；下面放不下（离屏幕底部太近）就翻到上面
+        const rect = input.getBoundingClientRect();
+        acState.panel.style.width = Math.max(140, Math.round(rect.width)) + 'px';
+        renderAcPanel();
+        const height = acState.panel.offsetHeight || 180;
+        const below = rect.bottom + 4;
+        const flip = below + height > window.innerHeight - 8 && rect.top - height - 4 > 0;
+        acState.panel.style.left = Math.round(rect.left) + 'px';
+        acState.panel.style.top = Math.round(flip ? rect.top - height - 4 : below) + 'px';
+    }
+
+    function attachAutocomplete(input) {
+        if (!input || input.getAttribute('data-ac-ready') === '1') return;
+        input.setAttribute('data-ac-ready', '1');
+        input.setAttribute('autocomplete', 'off');
+        input.addEventListener('input', function () {
+            if (acApplying) return;
+            openAutocomplete(input);
+        });
+        input.addEventListener('focus', function () {
+            if (acApplying) return;
+            openAutocomplete(input);
+        });
+        input.addEventListener('blur', function () { closeAutocomplete(); });
+        input.addEventListener('keydown', function (event) {
+            const key = event.key;
+            if (key === 'ArrowDown' || key === 'ArrowUp') {
+                // ↑/↓：打开候选（还没打开时）或上下移动选择
+                if (!acState || acState.input !== input) {
+                    openAutocomplete(input, 0);
+                } else {
+                    openAutocomplete(input, acState.index + (key === 'ArrowDown' ? 1 : -1));
+                }
+                event.preventDefault();
+                event.stopPropagation();
+                return;
+            }
+            if (!acState || acState.input !== input) {
+                if (key === 'Escape') closeAutocomplete();
+                return;
+            }
+            if (key === 'Tab' || key === 'Enter') {
+                // Tab / Enter：用当前选中的候选项补全输入框
+                applyAcIndex(acState.index);
+                event.preventDefault();
+                event.stopPropagation();      // 别再触发编辑器的“回车即保存”
+                return;
+            }
+            if (key === 'Escape') {
+                closeAutocomplete();
+                event.stopPropagation();
+            }
+        });
     }
 
     window.ifmPickerAdd = function (id) {
@@ -346,7 +492,7 @@
         containers: 'delete_container', signals: 'delete_signal', filters: 'delete_filter',
         machineTypes: 'delete_machine_type', machines: 'delete_machine', processes: 'delete_process'
     };
-    const ROLE_VALUES = ['storage', 'interaction', 'output'];
+    const ROLE_VALUES = ['storage', 'input', 'interaction', 'output'];
     const SIDE_VALUES = ['top', 'bottom', 'left', 'right', 'front', 'back'];
     const OP_VALUES = ['gt', 'ge', 'eq', 'le', 'lt'];
     // 比较符号直接显示数学符号（gt/ge/eq/le/lt 对用户没有意义）

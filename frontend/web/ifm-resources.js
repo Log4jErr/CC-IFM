@@ -449,8 +449,18 @@
             real[sendKeyOf(item)] = item;
         });
         // 服务端已经有这种材料了：乐观项退休（否则会一直重复显示）
+        // 另外两种情况也要退休（1.6.10 修“全量刷新后发送中一直残留”）：
+        //   * 服务端在我这条占位之后**又推过一次发送队列**（说明它已经看过我的请求）：
+        //     队列里没有这种材料 = 已经发完或被拒了；
+        //   * 兜底：超过 1 分钟还没对上，就当它已经不在队列里（离线/丢包时不会永远残留）。
+        const syncedAt = Number(typeof deliveriesSyncedAt === 'number' ? deliveriesSyncedAt : 0);
+        const nowMs = Date.now();
         optimisticDeliveries = optimisticDeliveries.filter(function (entry) {
-            return !real[sendKeyOf(entry)];
+            const at = Number(entry.at) || 0;
+            if (real[sendKeyOf(entry)]) return false;
+            // 给服务端 1.5 秒的处理时间：推送可能在我们发出请求之前就生成了
+            if (syncedAt > at + 1500) return false;
+            return nowMs - at < 60000;
         });
         optimisticDeliveries.slice().reverse().forEach(function (entry) {
             out.push({ kind: entry.kind, name: entry.name, count: entry.count, pending: true });

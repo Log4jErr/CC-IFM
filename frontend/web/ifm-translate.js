@@ -691,11 +691,21 @@
         }
     }
 
+    // 交给翻译模型的文本**只能是“英文显示名”**：绝不能把模组名/注册名（create:andesite_casing）
+    // 或下划线原样丢给模型（翻出来的东西会莫名其妙）。调用方通常已经传了 display_name，
+    // 这里再兜一层：去掉命名空间前缀、下划线换空格（"create:andesite_casing" → "andesite casing"）。
+    function cleanTranslateInput(text) {
+        let value = String(text === undefined || text === null ? '' : text).trim();
+        if (!value) return '';
+        if (value.indexOf(':') >= 0) value = value.split(':').pop();
+        return value.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+
     function queueNames(names) {
         if (!enabled || status !== 'ready') return;
         let added = false;
         (names || []).forEach(function (name) {
-            const text = String(name || '').trim();
+            const text = cleanTranslateInput(name);
             if (!text || cache[text] || pending.indexOf(text) >= 0) return;
             pending.push(text);
             added = true;

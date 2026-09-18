@@ -7,7 +7,7 @@ Store.__index = Store
 
 Store.KINDS = { "containers", "signals", "filters", "machineTypes", "machines", "processes" }
 
-local VALID_ROLES = { storage = true, interaction = true, output = true }
+local VALID_ROLES = { storage = true, interaction = true, output = true, input = true }
 --- 容器定义的种类：item = 物品容器（inventory 外设），fluid = 流体容器（fluid_storage 外设）。
 --- 同一个方块可能同时提供这两种外设（例如 create:basin_0），因此允许分别建立两个容器定义。
 local VALID_CONTAINER_KINDS = { item = true, fluid = true }
@@ -18,7 +18,7 @@ Store.VALID_ROLES = VALID_ROLES
 Store.VALID_CONTAINER_KINDS = VALID_CONTAINER_KINDS
 Store.VALID_SIDES = VALID_SIDES
 Store.VALID_OPS = VALID_OPS
-Store.roleList = { "storage", "interaction", "output" }
+Store.roleList = { "storage", "input", "interaction", "output" }
 Store.containerKindList = { "item", "fluid" }
 Store.sideList = { "top", "bottom", "left", "right", "front", "back" }
 Store.opList = { "gt", "ge", "eq", "le", "lt" }
@@ -793,7 +793,7 @@ function Store:validate(kind, name, obj)
             return false, "\\u5916\\u8BBE\\u540D\\u79F0\\u4E0D\\u80FD\\u4E3A\\u7A7A"
         end
         if not VALID_ROLES[obj.role] then
-            return false, "\\u5BB9\\u5668\\u89D2\\u8272\\u5FC5\\u987B\\u662F storage\\u3001interaction \\u6216 output"
+            return false, "\\u5BB9\\u5668\\u89D2\\u8272\\u5FC5\\u987B\\u662F storage\\u3001input\\u3001interaction \\u6216 output"
         end
         if obj.kind ~= nil and not VALID_CONTAINER_KINDS[obj.kind] then
             return false, "\\u5BB9\\u5668\\u79CD\\u7C7B\\u5FC5\\u987B\\u662F item\\uFF08\\u7269\\u54C1\\uFF09\\u6216 fluid\\uFF08\\u6D41\\u4F53\\uFF09"
