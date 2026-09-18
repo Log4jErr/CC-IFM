@@ -119,7 +119,7 @@ if workerName == nil or workerName == "" then
     workerName = "worker-#" .. tostring(computerId)
 end
 
-local version = "1.6.12"
+local version = "1.6.13"
 
 --- 本机日志（屏幕上看得到，方便直接复制给主控看）
 local function workerLog(text)

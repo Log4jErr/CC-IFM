@@ -6,4 +6,6 @@ __pycache__/
 backend/node_modules/
 
 # 构建产物：用 `python backend/build.py` 重新生成即可（默认不带注释，约 350KB）
-backend/ifm_bundle.lua
+# backend/ifm_bundle.lua **要入库**：README 里的
+#   wget run https://raw.githubusercontent.com/Log4jErr/CC-IFM/main/backend/ifm_bundle.lua
+# 指向的就是仓库里这份产物（改了后端记得 `python backend/build.py` 并提交）。

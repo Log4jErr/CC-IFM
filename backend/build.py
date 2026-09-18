@@ -125,7 +125,16 @@ end
 
 local __ifm_unpack = function()
     local program = (shell and shell.getRunningProgram and shell.getRunningProgram()) or "{main}"
-    local baseDir = fs.getDir(program)
+    --- `wget run <url>` 时“正在运行的程序”在磁盘上并不存在（甚至可能是个 URL 字符串）：
+    --- 这时就解包到 **shell 的当前目录**，不要拿一个不存在的路径去 fs.getDir（会解到奇怪的目录里）
+    local baseDir
+    if fs.exists(program) then
+        baseDir = fs.getDir(program)
+    elseif shell and shell.dir then
+        baseDir = shell.dir()
+    else
+        baseDir = fs.getDir(program)
+    end
     if baseDir == "" then
         baseDir = "/"
     end
@@ -185,6 +194,10 @@ local __ifm_self = (shell and shell.getRunningProgram and shell.getRunningProgra
 local __ifm_entry = __ifm_normalizePath(fs.combine(__ifm_base, "{main}"))
 if __ifm_self == nil then
     print("[IFM] warning: cannot locate this file, please delete it manually")
+elseif not fs.exists(__ifm_self) then
+    -- `wget run <url>` / `pastebin run ...` 这类“直接从 URL 跑”的情况：磁盘上根本没有这个文件，
+    -- 没有东西可删（也不要打印“删不掉”的警告）。（1.6.13）
+    print("[IFM] this bundle was run from a URL (no file on disk): nothing to delete")
 elseif __ifm_normalizePath(__ifm_self) == __ifm_entry
     or __ifm_normalizePath(__ifm_self) == __ifm_normalizePath(fs.combine(__ifm_base, "{worker}")) then
     -- 本产物被命名为 ifm.lua / IFMWorker.lua：它就是入口文件本身，不能删除自己

@@ -241,10 +241,11 @@
         metaQueue = [];
         missingMetaKeys.clear();
         iconFailedKeys.clear();
-        // icon-exports 也一起重来（刷新按钮 = 重新拉一次本地导出元数据）
+        // icon-exports 也一起重来（刷新按钮 = 重新拉一次当前语言的本地导出元数据）
         iconExportIndex = null;
+        iconExportIndexLang = null;
         iconExportUnavailable = false;
-        iconExportLoading = false;
+        iconExportLoadingLang = null;
         iconExportFailedFiles.clear();
         try { localStorage.removeItem(MISSING_META_STORAGE); } catch (err) { /* ignore */ }
     }
@@ -270,27 +271,36 @@
         } catch (err) { /* ignore */ }
     }
 
-    // ===================== icon-exports（本地图标导出，任务 8 / 1.6.12）=====================
+    // ===================== icon-exports（本地图标导出，任务 8 / 1.6.13）=====================
     // 三层优先级：① icon-exports（本地导出的图片 + 元数据）→ ② blocksitems 接口 → ③ Bergamot 翻译/名称字形兜底。
     //
-    // 为什么懒加载：icon-exports-metadata.json 约 7MB / 1.9 万条，开局同步解析会明显拖慢首屏。
-    // 所以页面起来之后在后台抓一次、建索引，抓完再重画一次（那之前先用接口图标）。
-    //   * 文件不存在（没导出 / 没随网页部署）→ 记下失败、不再重试，整条链路自动退回接口图标；
-    //   * 同一个 id 可能有多个“带 components 的变体”（例如染色、画作图案）：
-    //     查图标时优先用 **components 与物品 NBT 一致** 的那一条，其次用不带 components 的默认图标。
+    // 元数据按**语言**分文件：icon-exports-metadata/<lang>.json（例如 zh.json）。
+    //   * **图标**：始终优先用 icon-exports（与语言无关）。当前语言的文件不存在时，会借其它语言
+    //     的那份来建“图标索引”（只借图片，不借名字）。
+    //   * **物品名称**：只有当**当前语言**的元数据文件存在时才用（用户第 1 项要求）。
+    //   * 切换界面语言时会自动重新加载对应语言的文件（重画时发现语言不一致就会重载）。
+    // 懒加载：元数据单文件好几 MB / 近 2 万条，开局同步解析会明显拖慢首屏；
+    // 页面起来之后后台抓一次、建索引，抓完重画一次（那之前先用接口图标）。
     const ICON_EXPORTS_BASE = 'icon-exports/';
-    const ICON_EXPORTS_META = 'icon-exports-metadata.json';
+    const ICON_EXPORTS_META_DIR = 'icon-exports-metadata/';
+    const ICON_EXPORT_LANGS = ['zh', 'en'];
     let iconExportIndex = null;          // Map: "item|minecraft:oak_log" -> { plain, variants, name }
-    let iconExportLoading = false;
-    let iconExportUnavailable = false;
+    let iconExportIndexLang = null;      // 这份索引是哪门语言的元数据建出来的（决定名字能不能用）
+    let iconExportLoadingLang = null;    // 正在加载的语言（避免重复请求）
+    let iconExportUnavailable = false;   // 所有语言的文件都不存在 → 整条链路退回接口图标
     const iconExportFailedFiles = new Set();   // 已 404 的导出图片（避免反复请求）
 
     function iconExportUrl(file) {
         return ICON_EXPORTS_BASE + String(file || '');
     }
 
-    // 导出的中文名只有“像正常中文”时才用：这份导出里 local_name 是乱码（含 U+FFFD），
-    // 这种情况直接跳过，交给 blocksitems / 翻译层（用户要求的三层顺序仍然成立）。
+    /// 语言顺序：当前界面语言优先，其次是其它语言（其它语言只用来拿图标）
+    function iconExportLanguageOrder() {
+        const first = (lang === 'en') ? 'en' : 'zh';
+        return [first].concat(ICON_EXPORT_LANGS.filter(function (code) { return code !== first; }));
+    }
+
+    // 导出的物品名只在**当前语言**下使用（名字与语言相关）；乱码（含 U+FFFD）一律不用
     function iconExportUsableName(text) {
         const value = String(text || '').trim();
         if (!value || value.indexOf('\ufffd') >= 0) return '';
@@ -306,7 +316,7 @@
         }
     }
 
-    function buildIconExportIndex(meta) {
+    function buildIconExportIndex(meta, metaLang) {
         const index = new Map();
         meta.forEach(function (entry) {
             if (!entry || !entry.id || !entry.image_file) return;
@@ -323,50 +333,70 @@
             if (components) record.variants.push({ components: components, file: entry.image_file });
             else if (!record.plain) record.plain = entry.image_file;
         });
+        index.lang = metaLang;      // 记住这份索引来自哪门语言（名字是否可用要看它）
         return index;
     }
 
     function loadIconExports() {
-        if (iconExportIndex || iconExportLoading || iconExportUnavailable) return;
-        iconExportLoading = true;
-        fetch(ICON_EXPORTS_META)
-            .then(function (response) {
-                if (!response.ok) throw new Error('HTTP ' + response.status);
-                return response.json();
-            })
-            .then(function (body) {
-                const meta = body && asArray(body.meta);
-                if (meta.length === 0) throw new Error('元数据为空');
-                iconExportIndex = buildIconExportIndex(meta);
-                console.info('[IFM] icon-exports 已加载：' + iconExportIndex.size + ' 个物品图标（优先于 blocksitems 接口）');
-                ['resources', 'peripherals', 'processes', 'deliveries', 'machines'].forEach(markDirty);
-                scheduleRender();
-            })
-            .catch(function (err) {
+        if (iconExportUnavailable) return;
+        const order = iconExportLanguageOrder();
+        const wanted = order[0];
+        if (iconExportIndex && iconExportIndexLang === wanted) return;   // 当前语言的元数据已经有了
+        if (iconExportLoadingLang) return;                              // 正在加载，别重复请求
+
+        const tryLanguage = function (position) {
+            if (position >= order.length) {
                 iconExportUnavailable = true;
-                console.info('[IFM] 没有可用的 icon-exports（' + ((err && err.message) || err) +
-                    '）：图标继续用 blocksitems 接口 / 名称兜底');
-            })
-            .finally(function () {
-                iconExportLoading = false;
-            });
+                iconExportLoadingLang = null;
+                console.info('[IFM] 没有可用的 icon-exports 元数据（' + ICON_EXPORTS_META_DIR + order.join('.json / ') +
+                    '.json）：图标继续用 blocksitems 接口 / 名称兜底');
+                return;
+            }
+            const code = order[position];
+            const url = ICON_EXPORTS_META_DIR + code + '.json';
+            iconExportLoadingLang = code;
+            fetch(url)
+                .then(function (response) {
+                    if (!response.ok) throw new Error('HTTP ' + response.status);
+                    return response.json();
+                })
+                .then(function (body) {
+                    const meta = body && asArray(body.meta);
+                    if (meta.length === 0) throw new Error('元数据为空');
+                    iconExportIndex = buildIconExportIndex(meta, code);
+                    iconExportIndexLang = code;
+                    iconExportLoadingLang = null;
+                    console.info('[IFM] icon-exports 元数据已加载：' + url + '（' + iconExportIndex.size + ' 个物品图标' +
+                        (code === wanted ? '，物品名也用这份' : '，只借图标：当前语言没有对应文件') + '）');
+                    ['resources', 'peripherals', 'processes', 'deliveries', 'machines'].forEach(markDirty);
+                    scheduleRender();
+                })
+                .catch(function (err) {
+                    iconExportLoadingLang = null;
+                    console.info('[IFM] icon-exports 元数据不可用（' + url + '：' + ((err && err.message) || err) + '）');
+                    tryLanguage(position + 1);
+                });
+        };
+        tryLanguage(0);
+    }
+
+    /// 每次查图标/名字都走这里：语言变了或还没加载就顺手触发加载
+    function ensureIconExports() {
+        if (iconExportUnavailable) return false;
+        if (!iconExportIndex || iconExportIndexLang !== ((lang === 'en') ? 'en' : 'zh')) loadIconExports();
+        return !!iconExportIndex;
     }
 
     // 查一条导出记录：nbt 命中变体优先，其次默认（不带 components）图标
-    function iconExportEntry(kind, name, nbt) {
-        if (iconExportUnavailable) return null;
-        if (!iconExportIndex) {
-            loadIconExports();
-            return null;                 // 索引还没好：这一轮先用接口图标
-        }
+    function iconExportEntry(kind, name) {
+        if (!ensureIconExports()) return null;
         const record = iconExportIndex.get((kind === 'fluid' ? 'fluid' : 'item') + '|' + String(name || ''));
-        if (!record) return null;
-        return record;
+        return record || null;
     }
 
-    // 导出的图标文件名（没有就返回 null，调用方退回接口图标）
+    /// 导出的图标文件名（**与语言无关**，始终优先用；没有就返回 null，调用方退回接口图标）
     function iconExportFile(kind, name, nbt) {
-        const record = iconExportEntry(kind, name, nbt);
+        const record = iconExportEntry(kind, name);
         if (!record) return null;
         const wanted = nbt ? iconExportComponentsKey(nbt) : '';
         if (wanted) {
@@ -378,10 +408,12 @@
         return record.variants.length > 0 ? record.variants[0].file : null;
     }
 
-    // 导出里的中文名（若可用）：displayName 会优先用它（三层里的第一层）
+    /// 导出的物品名：**只在当前语言的元数据文件存在时**才给（否则返回 ''，交给 blocksitems / 翻译层）
     function iconExportName(kind, name, nbt) {
-        const record = iconExportEntry(kind, name, nbt);
-        return record && record.name ? record.name : '';
+        const record = iconExportEntry(kind, name);
+        if (!record) return '';
+        if (iconExportIndexLang !== ((lang === 'en') ? 'en' : 'zh')) return '';
+        return record.name || '';
     }
 
     // 导出图片 404 时别反复请求（但**不**影响接口图标：那是另一层）
