@@ -1,137 +1,184 @@
+```
+      _/_/_/  _/_/_/_/  _/      _/ 
+       _/    _/        _/_/  _/_/    Integrated
+      _/    _/_/_/    _/  _/  _/    Factory
+     _/    _/        _/      _/    Manager
+  _/_/_/  _/        _/      _/     
+```
+
 [English](#en) | [中文](#zh)
 <a id="zh"></a>
-# CC-IFM 集成工厂管理终端
 
+# CC-IFM 集成工厂管理
 ## 这是什么
-- 一个 Minecraft **CC:Tweaked** 脚本 + 网页终端：把工厂里的容器、机器与流程集中起来管理。网页上既能看库存/流体，也能定义流程（合成、输入、输出、等待、红石信号…）、让机器自动取料与产出、往输出容器发货 —— **全程不用打开 Minecraft 客户端**。
-- 一台计算机当**主控**（IFMMaster.lua，跑逻辑与网页通信），同一有线网络上可以再放若干**从节点**（IFMWorker.lua，分担容器扫描与物品/流体搬运）。
-- 多台计算机与浏览器通过 itty-sockets（WebSocket 广播中继）通信，同一个“房间号”就是同一套工厂。
+- 一个 Minecraft **CC:Tweaked** 脚本。通过定义流程进行自动合成，就像AE2、Integrated Dynamics、或者说Super Factory Manager那样。设定好一切后，只需要点击合成目标产物，就可以看着各种材料经过你的机器，逐步合成并呈递你的目标产物。
+- 并且，可以通过浏览器访问并管理你的工厂，而无需打开Minecraft客户端。
+
+## 运行环境说明
+- Minecraft服务器安装了CC:Tweaked。这是必要的废话，IFM在CC:Tweaked的计算机上运行
+- 搭建了正确的网络拓扑结构，你需要使用和线缆将工厂的各个部分连接。具体来说，对于每个 计算机/存储容器（箱子、木桶、或者其他模组提供的抽屉之类，或者各种流体储罐）/机器，需要连接到有线调制解调器(无线的不行，CC:Tweaked提供了片式和块式的两种有线调制解调器，都可以)，并且用线缆连接所有有线调制解调器。
+- 在整个IFM系统中，你至少要接入一台计算机，而由于物品/流体调度非常耗时，为了提高运行速度，你可以尽情添加更多的计算机。IFM是分布式的，其中一台计算机作为主控节点（IFMMaster），其余计算机作为受控节点（IFMWorker）。可以在没有IFMWorker的情况下运行，但不推荐，除非你能忍受蜗牛速度。
 
 ## 安装
-- 在 CC:Tweaked 计算机里运行下面这一条命令即可（会自动解包出 `IFMMaster.lua`、`IFMWorker.lua` 与 `ifm/*.lua`）：
+- 在IFM网络的所有计算机使用下面这一条命令进行安装
 ```
 wget run https://raw.githubusercontent.com/Log4jErr/CC-IFM/main/backend/ifm_bundle.lua
 ```
-- 直接从 URL 运行时计算机磁盘上并没有这个文件，所以脚本**不会删除任何文件**（先 `wget` 下载再运行的情况下，解包器会把自己删掉，避免留下垃圾文件）。
-- 前提条件：安装 CC:Tweaked；有线网络里接上容器外设（`inventory`，例如 Create 的箱子）与流体外设（`fluid_storage`，例如储罐）；红石流程需要 Create 的 `redstone_relay`（其它提供 `redstone_relay` 外设的方块也行）。
+- 如果IFM有更新的版本，你可以重新运行这条命令以完成更新。
 
 ## 启动
-- 主控（房间号任选，但请足够复杂，否则可能撞进别人的房间）：
+- 在其中一台计算机中运行主控脚本，使用下面这条命令启动（警告：不要有复数台计算机在同一有线网络中运行主控脚本，否则会发生不可预料的结果）
 ```
-IFMMaster.lua --room my-complex-room-name
+IFMMaster.lua
 ```
-- 从节点（可选，越多扫描/搬运越快；必须和主控在同一有线网络上）：
+启动后，你会看见屏幕上显示房间号，记下这个房间号，它是你浏览器连接的凭据。
+- （高级）房间号是随机生成的，你可以自己指定房间号，启动参数添加--room <房间号>即可。
+- （可选）在其余计算机启动从节点脚本：
 ```
 IFMWorker.lua
 ```
-- 可选参数：`--relay <ws-base-url>` 换用自建中转、`--random-room` 随机房间号并写回 `config.json`。
+主从节点之间会自动发现，所以不需要你进行其他干预。
 
 ## 网页终端
-- 在 PC 上把 `frontend/` 用 HTTP 提供出来（不要直接双击 index.html：拼音库/翻译模型/图标导出都走相对路径）：
+- 网页终端是纯静态页面：把 `frontend/` 目录部署到 GitHub Pages（或任意静态托管）后打开它即可（仓库里的 raw 链接不能直接用：页面要加载同目录下的 js/css/图标素材）。当前仓库的 Pages 地址是 https://log4jerr.github.io/CC-IFM/ ，本地调试也可以用：
 ```
 cd frontend
-python serve.py            # 默认 http://localhost:8000/index.html
+python serve.py            # http://localhost:8000/index.html
 ```
-- 浏览器打开页面 → 填**同样的房间号**（和 `--room` 一致）→ 连接。
-- 也可以把 `frontend/` 整个目录放到任意静态托管（例如 GitHub Pages）再访问。
+- 你需要在网页终端输入房间号以连接到你游戏内的IFM系统。
 
 ## 能做什么
-- **资源**：库存/流体浏览、搜索（支持中文拼音，例如 `gzt` → 工作台）、排序、点击增减待发送数量、中键设发送数量、Shift+中键设合成数量。
-- **流程**：定义机器的输入/输出/等待/红石步骤，支持按批翻倍、上游按需触发，依赖图上直接显示「正在合成 / 剩余目标」。
-- **外设与定义**：容器角色（存储 / 输入 / 输出 / 交互）、机器类型与机器、红石信号；把外设卡片拖到对应卡片即可设定，拖出即删除。
-- **输入容器**：像扫存储容器一样定期扫描，里面的东西会自动搬进存储容器。
-- **发货**：把存储容器里的物品/流体发送到输出容器，底部面板有「待发送 / 发送中」进度与取消。
-- **整理**：把散落在多个槽位/容器里的同一物品合并，计划分批计算，不卡主控。
+- **库存浏览**：浏览存储的所有物品/流体、支持排序、搜索（支持拼音搜素）。
+- **发货**：设定好一个容器作为输出容器，然后你可以指定物品/流体以及数量，将它们移动至输出容器。
+- **存储优化**：自动在存储容器之间合并，交换物品，从而腾出空间。这个整理算法会基于槽位容量和物品堆叠数进行合理的移动，让数量多的物品移动到大容量槽位（比如抽屉）。
+- **卸货**：设定一个容器作为输入容器，然后里面的物品会被自动取走并放入存储容器。
+- **通用自动合成**：这一部分是最复杂的，不能一句话说清楚，看下面的段落
+
+## 自动合成系统
+- 就像是AE2里的样板一样，IFM的自动合成需要你进行“流程”和“机器”的定义。
+- 首先是机器定义，你需要先新建“机器类型”，这一层抽象是为了进行机器的并行（例如，你有很多个酿造台，它们每一个能做的事情相同，那么想要IFM使用你的酿造台，不妨创建并命名一个机器类型叫做“炼药”）。
+- 接下来，在机器类型卡片下创建“机器”，机器是一个最小的工作单位。机器需要设定输入容器、输出容器、以及一个可选的红石信号（IFM系统中允许接入红石继电器，按照你设定的要求发送或者等待红石信号，这在有些时候很有用）。对于酿造台这个例子，酿造台需要同时添加为输入容器和输出容器（你既对它输入材料，又直接从它抽出成品）。一些机器可能会有多个输入/输出容器（举个例子，机械动力的“机械手装配”，需要同时对机械手和下方的置物台输入材料，那么你应当将它们都设置为输入容器。）
+- 机器定义中还有一些其他参数，例如“并行信号量”是这个机器可以同时接受的合成任务数。默认值为1表示这个机器必须要在输入物品后，产物完全输出后，才能进行下一次物品输入。一些机器可能能够同时支持多个任务，比如通过漏斗+堆肥桶进行堆肥的机器，漏斗可以同时输入多组物品，那么你不妨将这个值设置高一些。（AE2玩家会很明白，这有点像是样板供应器设置为“阻塞直到产物返回”）
+- 一个机器类型下可以有多个机器，这很好理解。如果要使用一类机器合成，可以使用这些机器中任意一个空闲的机器。
+- 接下来，创建“流程”，流程是一个使用机器进行一次合成的完整步骤，比如我们可能希望用1x 下界疣+3x 水瓶合成3x 粗制的药水，不妨将其创建为流程。对于这个药水合成例子，你需要将创建的流程关联到炼药机器，设定输入的材料(1x下界疣+3x水瓶)和抽取的产物(3x粗制的药水)。有的时候机器有多个输入/输出容器，而且你需要控制材料具体输入到哪个容器，那么你得设置“机器序号”。有的时候你还要更精确的控制材料输入到容器的哪个槽位，那么“槽位序号”就是你所需要的设置。（吐槽一句，大多数Minecraft物流/自动合成模组都没有指定槽位输入输出的功能）。
+- IFM的产物抽取行为非常智能，它只会抽取你指定的物品，忽略其他物品。所以对于这个酿造例子，你不用像Minecraft原版自动炼药那样，使用红石线路进行定时门控...并且你还可以更精确地指定抽取的容器和抽取的槽位。
+- 一个流程的运行很简单，首先按顺序将材料输入，然后按顺序将产物抽出。如果没法输入材料，流程会保持等待直到材料输入。如果产物没法抽出，也会保持等待直到能够抽出产物。
+- 流程还有一个“最大翻倍数”的设定，如果你要合成不止一个物品，IFM会按照你设定的翻倍数，将输入材料翻倍，同时输入机器，并且期待翻倍的产物输出。例如你希望用Minecraft原版的合成器合成雪块（1x雪球输入槽位1，1x雪球输入槽位2，1x雪球输入槽位3，1x雪球输入槽位4 -> 1x雪块），那么翻倍数不妨设置为16（因为雪球在合成器内可以按16个堆叠）
+- 除了物品和流体的输入输出，流程中还可以定义其他的操作，定时等待就是按顺序执行到这一步时流程要至少等待这么多时间。红石信号相关操作需要你接入红石继电器，然后可以等待红石继电器有信号，或者靠红石继电器发出信号。（显然，你可以编码一个流程用来演奏红石音乐）
+- NBT忽略：你可以指定忽略物品NBT，默认不开（要求NBT完全匹配）
+- 产物的“最少数量”和“最多数量”：这个设置是针对概率合成的，即产物数量不确定（有时多有时少），计算发配数时会按照“最多数量”计算（IFM很乐观地认为能够得到所有产物，如果做不到就重来以合成剩余部分），并且抽取产物也按照“最多数量”来（也就是说，不会多抽超过最多数量的产物）。“最少数量”则用于判断抽取操作是否完成，也就是最坏情况。
 
 ## 什么原理
-- 浏览器与服务端通过 **itty-sockets** 中转的 WebSocket 互相传递消息；服务端只发**增量**，有变化立刻推送（不做速率硬限制）。
-- 物品图标与元信息三层优先：① 本地 `frontend/icon-exports/` 导出（离线可用、与游戏内一致）→ ② blocksitems.com 接口 → ③ 名称兜底；物品名只在存在**当前语言**的元数据时才用导出的名字。
-- 物品名称可选用 **Bergamot** 本地翻译（英→中）：把模型放进 `frontend/web/models/en-zh/`（或让页面从 CDN 拉）；控制台可用 `await IFMTranslate.translateText('Andesite Casing')` 试效果。
-- 中文拼音搜索由 `frontend/dist/pinyinlite_full.min.js` 提供（缺失时自动退回中英文关键词匹配）。
+- 浏览器与服务端通过 **itty-sockets** 中转的 WebSocket 互相传递消息
+- 前端图标和资源信息按照三个方案获取：本地 `frontend/icon-exports/` 导出（质量最佳，但是需要根据Minecraft示例专门导出）→ blocksitems.com 接口（质量很好，不过有些物品缺失，并且不支持国际化）→ 注册名转换（没有图标。你可以按右上角翻译按钮启用Bergamot翻译器以获取你的语言的物品名称，质量较差）
+- 拼音搜索库借助 `pinyinlite` 提供
+- 前端部署依赖Github Pages
 
 ## 高级
-- 开机自启主控（`startup.lua`）：
+- 开机自启主控（创建一个`startup.lua`脚本，内容如下）：
 ```lua
-shell.run("bg", "IFMMaster.lua", "--room", "YOUR ROOM NAME")
+shell.run("bg", "IFMMaster.lua")
 ```
-- 开机自启从节点：
+- 自定义房间号
+```
+IFMMaster --room <房间号>
+```
+- 开机自启从节点（创建一个`startup.lua`脚本，内容如下）：
 ```lua
 shell.run("bg", "IFMWorker.lua")
 ```
-- 容器扫描间隔（存储容器 / 输入容器）用网页上的「设置」面板调整，写入 `config.json` 的 `settings.scan`。
 - 改了后端源码之后重新编译：`python backend/build.py`，产物是 `backend/ifm_bundle.lua`。
 
 ## 限制
 - 由于 CC:Tweaked 的限制，计算机所在区块必须保持加载，否则脚本会停摆（记得准备区块加载手段）。
 - 公共中继 `wss://itty.ws/c/` 在部分地区可能连不上，可以自建 itty-sockets 服务器并用 `--relay` 指过去。
-- 读容器是阻塞调用（有线网络上每个容器约 1 个服务器刻），容器很多时扫描会变慢 —— 可以调大扫描间隔。
-- 从节点只分担**容器扫描与物品/流体搬运**；流程逻辑始终由主控执行。
-
+- 读容器是阻塞调用（有线网络上每个容器约 1 个服务器刻），容器很多时扫描会变慢，可以调大扫描间隔，或者添加更多从节点。
 
 [English](#en) | [中文](#zh)
 <a id="en"></a>
 # CC-IFM Integrated Factory Manager
 
 ## What is that?
-- A Minecraft **CC:Tweaked** script plus a web terminal that manages a whole factory: browse item/fluid stock, define processes (craft, insert, extract, waits, redstone), let machines pull materials and push products automatically, and deliver items into output containers — **without opening the Minecraft client**.
-- One computer runs as the **master** (`IFMMaster.lua`, logic + web link); optional **workers** (`IFMWorker.lua`) share container scanning and item/fluid moves over the same wired network.
-- Computers and the browser talk through an itty-sockets relay: the same room name means the same factory.
+- A Minecraft **CC:Tweaked** script that auto-crafts through *process definitions*, much like AE2 autocrafting, Integrated Dynamics or Super Factory Manager. Once everything is set up you just request the target product and watch materials flow through your machines, being crafted step by step until the requested items show up.
+- The same factory can be browsed and managed from a web browser — no Minecraft client needed.
+
+## Requirements
+- CC:Tweaked installed on the Minecraft server (IFM runs on a CC:Tweaked computer, obviously).
+- A proper **wired network**: every computer, storage container (chest, barrel, drawer, fluid tank, …) and machine must be attached to a **wired modem** (wired only — CC:Tweaked ships both cased and full-block wired modems, either works), and all wired modems must be joined with networking cable.
+- At least one computer in the IFM network; item/fluid scheduling is expensive, so add as many computers as you like to speed it up. IFM is distributed: one computer is the **master** (`IFMMaster`), the rest are **workers** (`IFMWorker`). Running without a worker is possible but not recommended unless you enjoy snail speed.
 
 ## Installation
-- Run this single command in a CC:Tweaked computer (it unpacks `IFMMaster.lua`, `IFMWorker.lua` and `ifm/*.lua`):
+- Run this single command on **every** computer of the IFM network:
 ```
 wget run https://raw.githubusercontent.com/Log4jErr/CC-IFM/main/backend/ifm_bundle.lua
 ```
-- When run straight from a URL nothing exists on the computer disk, so the script **deletes nothing** (if you downloaded the file first, the unpacker deletes itself to keep the disk clean).
-- Requirements: CC:Tweaked; wired peripherals — `inventory` containers and `fluid_storage` tanks; `redstone_relay` (from Create) for redstone steps.
+- When a new version is released, just run the same command again to update.
 
 ## Booting
-- Master (pick a complex room name, otherwise you may join someone else's room):
+- Start the master script on one of the computers (warning: never run the master on two computers of the same wired network, the result is unpredictable):
 ```
-IFMMaster.lua --room my-complex-room-name
+IFMMaster.lua
 ```
-- Workers (optional, they must share the wired network with the master):
+After it starts, the room name is printed on screen — note it down, it is the credential your browser uses to connect.
+- (Advanced) The room name is generated randomly; pass `--room <room name>` to choose your own.
+- (Optional) Start worker scripts on the remaining computers:
 ```
 IFMWorker.lua
 ```
-- Extra flags: `--relay <ws-base-url>` for your own relay, `--random-room` to generate and store a room name.
+Master and workers discover each other automatically, no further action needed.
 
 ## Web terminal
-- Serve the `frontend/` folder over HTTP (do not open index.html directly — the pinyin library, translation models and icon exports are relative paths):
+- The web client is a static page: deploy `frontend/` to GitHub Pages (or any static host) and open it, or serve it locally for development:
 ```
 cd frontend
-python serve.py            # http://localhost:8000/index.html by default
+python serve.py            # http://localhost:8000/index.html
 ```
-- Open the page, enter the **same room name**, connect. You can also publish `frontend/` on any static host (GitHub Pages works).
+- Enter the room name in the page to connect to your in-game IFM system.
 
 ## Features
-- **Resources**: item/fluid stock, search (Chinese pinyin supported, e.g. `gzt` → crafting table), sorting, click to change the send amount, middle click to set the send amount, Shift+middle to set the craft amount.
-- **Processes**: machine inputs/outputs/waits/redstone steps, batch multiplication, upstream on-demand crafting, live “crafting / left to craft” counters on the dependency graph.
-- **Peripherals & definitions**: container roles (storage / input / output / interaction), machine types, machines, redstone signals — drag peripheral cards onto a card to assign, drag out to remove.
-- **Input containers**: scanned periodically like storage containers; their content is moved into storage automatically.
-- **Sending**: deliver items/fluids from storage into output containers, with pending/in-flight lists and cancel.
-- **Compact**: merge identical stacks scattered over slots/containers, planned in small slices so the master stays responsive.
+- **Stock browsing**: browse all stored items/fluids, with sorting and search (pinyin search supported).
+- **Delivery**: mark a container as an output container, then pick items/fluids and amounts to move them there.
+- **Storage optimisation**: automatically merges and swaps items between storage containers to free space. The compaction algorithm moves stacks according to slot capacity and stack size, e.g. moving large amounts into high-capacity slots (drawers).
+- **Unloading**: mark a container as an input container, and anything inside is taken out and moved into storage automatically.
+- **General-purpose auto-crafting**: the most complex part — see the next section.
+
+
+## Auto-crafting system
+- Just like AE2 patterns, IFM auto-crafting is driven by your **machine** and **process** definitions.
+- First define a **machine type**. This abstraction layer exists for parallelisation: if you own several brewing stands that all do the same thing, create and name a machine type such as “Brewing” and let IFM use them.
+- Next create a **machine** under that machine type; a machine is the smallest working unit. It needs input container(s), output container(s) and an optional redstone signal (IFM can drive a redstone relay to send or wait for signals, which is handy in some setups). For the brewing stand example, add it both as input and output container (you feed materials into it and pull products straight out of it). Some machines have several input/output containers (e.g. Create's Mechanical Arm assembly needs materials inserted into both the arm and the depot below it — mark both as input containers).
+- Machines have a few more parameters, e.g. **parallelism** is how many crafting jobs the machine accepts at the same time. The default 1 means the machine must finish a job (products fully extracted) before new materials are inserted. Some machines can handle several jobs at once — e.g. a hopper feeding a composter can accept multiple stacks, so raise the value there. (AE2 players will recognise this as Pattern Provider “block until products return”.)
+- One machine type can contain many machines; when crafting with that type, any idle machine of the type can be used.
+- Next create a **process**: the complete set of steps that makes one craft on a machine. Say we want 3× Awkward Potion from 1× Nether Wart + 3× Water Bottle — that is a process. For the potion example, link the process to the brewing machine and set the inserted materials (1× Nether Wart + 3× Water Bottle) and the extracted products (3× Awkward Potion). When a machine has multiple input/output containers and you need to control which container receives materials, set the **machine index**; when you need to control which slot inside that container receives them, set the **slot index** (many Minecraft logistics/autocrafting mods cannot do slot-precise I/O at all).
+- Product extraction is smart: IFM only extracts the items you specify and ignores everything else. So for the brewing example you do not need redstone gating like vanilla auto-brewing — and you can be even more precise about which container and which slot to extract from.
+- A process runs simply: materials are inserted in order, then products are extracted in order. If materials cannot be inserted, the process waits until they can; if products cannot be extracted, it waits until they can.
+- Processes also have a **max multiplier**: to craft more than one item, IFM multiplies the input materials by that factor, inserts them together and expects the products to be multiplied as well. For example, to craft Snow Blocks in the vanilla Crafter (1× Snowball into slots 1..4 → 1× Snow Block), set the multiplier to 16 (snowballs stack to 16 in the crafter).
+- Besides item/fluid I/O, processes support other steps: a timed wait holds the process for at least that long when reached in order; redstone steps need a redstone relay and can wait for a signal or emit one (obviously you can encode a process that plays redstone music).
+- **Ignore NBT**: you can ignore item NBT (off by default, which requires NBT to match exactly).
+- Products also have **minimum** and **maximum** counts for chance-based recipes whose output amount varies. Distribution counts are computed from the maximum (IFM optimistically assumes it can get all products, and retries to craft the remainder if it cannot), and product extraction also uses the maximum (so it never over-extracts). The minimum is used to decide whether an extraction is complete, i.e. the worst case.
 
 ## Theorum
-- Browser and script exchange messages over an **itty-sockets** relay; the master pushes incremental changes as soon as they happen (no hard packet rate limit).
-- Icon/metadata lookup has three tiers: ① local `frontend/icon-exports/` export → ② blocksitems.com API → ③ name fallback. Exported display names are used only when the metadata file of the **current language** exists.
-- Item names can be translated locally with **Bergamot** (EN→ZH) using the models in `frontend/web/models/en-zh/`; try it in the console with `await IFMTranslate.translateText('Andesite Casing')`.
-- Chinese pinyin search comes from `frontend/dist/pinyinlite_full.min.js` (falls back to plain keyword search when missing).
+- Browser and script exchange messages over a WebSocket relayed by **itty-sockets**.
+- Icons and resource info are fetched in three fallback tiers: local `frontend/icon-exports/` export (best quality, but must be exported from your own Minecraft instance) → blocksitems.com API (good quality, but some items are missing and it is not internationalised) → registry name conversion (no icon; press the translate button top-right to enable the **Bergamot** translator and get names in your own language — lower quality).
+- Pinyin search is provided by the `pinyinlite` library.
+- Frontend deployment relies on GitHub Pages.
 
 ## Startup
-- Auto-start the master from `startup.lua`:
+- Auto-start the master (create a `startup.lua` with):
 ```lua
-shell.run("bg", "IFMMaster.lua", "--room", "YOUR ROOM NAME")
+shell.run("bg", "IFMMaster.lua")
 ```
-- Auto-start a worker:
+- Custom room name:
+```
+IFMMaster --room <room name>
+```
+- Auto-start a worker (create a `startup.lua` with):
 ```lua
 shell.run("bg", "IFMWorker.lua")
 ```
-- Container scan intervals (storage / input) are configurable from the web “Settings” panel (stored in `config.json` → `settings.scan`).
-- Rebuild the bundle after backend changes: `python backend/build.py` (writes `backend/ifm_bundle.lua`).
+- Rebuild the backend after changing its source: `python backend/build.py` (writes `backend/ifm_bundle.lua`).
 
 ## Limitation
 - CC:Tweaked keeps a computer running only while its chunk is loaded — use a chunk loader.
-- The public relay `wss://itty.ws/c/` is unreachable in some regions; host your own itty-sockets server and pass it with `--relay`.
-- Container reads are blocking (about one server tick per container on wired networks), so scan intervals matter on large factories.
-- Workers only offload container scans and moves; process logic always runs on the master.
+- The public relay `wss://itty.ws/c/` cannot be reached in some regions; host your own itty-sockets server and point to it with `--relay`.
+- Container reads are blocking (about one server tick per container on wired networks), so large factories get slow while scanning — raise the scan intervals, or add more workers.

@@ -120,9 +120,18 @@
         if (tier === 'export') {
             const key = img.getAttribute('data-icon-key') || '';
             const parts1 = splitKey(key);
-            iconExportMarkFailed(String(img.getAttribute('src') || '').replace(ICON_EXPORTS_BASE, ''));
+            const failedFile = String(img.getAttribute('src') || '')
+                .replace(ICON_EXPORTS_BASE, '').replace(/%23/g, '#').replace(/%3F/g, '?');
+            const resourceKind = kind || parts1[0] || 'item';
+            const resourceName = parts1[1] || '';
+            const listed = iconExportListedFile(resourceKind, resourceName);
+            console.info('[IFM] icon-exports 图片加载失败：' + decodeURIComponent(failedFile) +
+                (listed ? '（元数据里登记了这张图，但该文件不在 icon-exports/ 里：导出可能不完整）'
+                    : '（元数据里没有这条，用约定名猜的）') +
+                ' → 退回 blocksitems 接口：' + resourceKind + ':' + resourceName);
+            iconExportMarkFailed(failedFile);
             img.setAttribute('data-icon-tier', 'api');
-            img.setAttribute('src', iconUrl(kind || parts1[0] || 'item', parts1[1] || ''));
+            img.setAttribute('src', iconUrl(resourceKind, resourceName));
             return;
         }
         // 图片加载失败：先把这次失败记下来（见 iconFailedKeys），再换成名称兜底。
@@ -293,7 +302,29 @@
     const iconExportFailedFiles = new Set();   // 已 404 的导出图片（避免反复请求）
 
     function iconExportUrl(file) {
-        return ICON_EXPORTS_BASE + String(file || '');
+        // 文件名里可能有 `{ } ' , # ?` 等字符（带 components 的变体）：其中 `#` / `?` 会把 URL 截断，
+        // 必须先转义，否则浏览器请求的是另一个路径（表现就是“这张图明明有，却没取到”）。
+        const name = String(file || '');
+        return ICON_EXPORTS_BASE +
+            encodeURI(name).replace(/#/g, '%23').replace(/\?/g, '%3F');
+    }
+
+    /// 索引键：统一小写（导出工具的大小写不一定和游戏里一致，实测有 id 大小写不匹配的先例）
+    function iconExportKey(kind, name) {
+        return (kind === 'fluid' ? 'fluid' : 'item') + '|' + String(name || '').toLowerCase();
+    }
+
+    /// 导出文件名的约定：`<命名空间>__<路径>.png`（`:` 与 `/` 都写成 `__`）
+    /// 元数据里没有这个物品时（导出工具漏登记 / 元数据是旧的），用它猜一个名字直接请求图片 ——
+    /// “图标始终优先 icon-exports”，猜错也只是 404 一次（会被记下来，随后退回接口图标）。
+    function iconExportConventionalFile(kind, name) {
+        const text = String(name || '');
+        if (!text) return null;
+        const colon = text.indexOf(':');
+        const namespace = (colon >= 0 ? text.slice(0, colon) : 'minecraft').toLowerCase();
+        const path = (colon >= 0 ? text.slice(colon + 1) : text).toLowerCase();
+        if (!path) return null;
+        return namespace + '__' + path.replace(/\//g, '__') + '.png';
     }
 
     /// 语言顺序：当前界面语言优先，其次是其它语言（其它语言只用来拿图标）
@@ -323,7 +354,7 @@
         meta.forEach(function (entry) {
             if (!entry || !entry.id || !entry.image_file) return;
             const kind = entry.type === 'fluid' ? 'fluid' : 'item';
-            const key = kind + '|' + entry.id;
+            const key = iconExportKey(kind, entry.id);
             let record = index.get(key);
             if (!record) {
                 record = { plain: null, variants: [] };
@@ -410,22 +441,38 @@
     // 查一条导出记录：nbt 命中变体优先，其次默认（不带 components）图标
     function iconExportEntry(kind, name) {
         if (!ensureIconExports()) return null;
-        const record = iconExportIndex.get((kind === 'fluid' ? 'fluid' : 'item') + '|' + String(name || ''));
+        const record = iconExportIndex.get(iconExportKey(kind, name));
         return record || null;
+    }
+
+    /// 元数据里**登记**的图片文件名（诊断用：区分“元数据漏了这条”与“磁盘上缺这张图”）
+    function iconExportListedFile(kind, name) {
+        const record = iconExportEntry(kind, name);
+        if (!record) return null;
+        return record.plain || (record.variants.length > 0 ? record.variants[0].file : null);
     }
 
     /// 导出的图标文件名（**与语言无关**，始终优先用；没有就返回 null，调用方退回接口图标）
     function iconExportFile(kind, name, nbt) {
         const record = iconExportEntry(kind, name);
-        if (!record) return null;
-        const wanted = nbt ? iconExportComponentsKey(nbt) : '';
-        if (wanted) {
-            for (let i = 0; i < record.variants.length; i += 1) {
-                if (record.variants[i].components === wanted) return record.variants[i].file;
+        if (record) {
+            const wanted = nbt ? iconExportComponentsKey(nbt) : '';
+            if (wanted) {
+                for (let i = 0; i < record.variants.length; i += 1) {
+                    if (record.variants[i].components === wanted) return record.variants[i].file;
+                }
             }
+            if (record.plain) return record.plain;
+            if (record.variants.length > 0) return record.variants[0].file;
         }
-        if (record.plain) return record.plain;
-        return record.variants.length > 0 ? record.variants[0].file : null;
+        // 元数据里没有这个物品（导出工具漏登记 / 元数据比图片旧）：按约定名猜一个 ——
+        // 图片真的存在就直接用（图标始终优先 icon-exports）；不存在就 404 一次并退回接口图标。
+        // 只在“元数据已经加载成功”时才猜：这样没部署 icon-exports 的机器不会白刷一堆 404。
+        if (iconExportIndex) {
+            const guess = iconExportConventionalFile(kind, name);
+            if (guess && !iconExportFailedFiles.has(guess)) return guess;
+        }
+        return null;
     }
 
     /// 导出的物品名：**只在当前语言的元数据文件存在时**才给（否则返回 ''，交给 blocksitems / 翻译层）
