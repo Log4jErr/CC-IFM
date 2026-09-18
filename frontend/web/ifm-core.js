@@ -1010,12 +1010,14 @@
         const blockId = blockIdOf(peripheralName);
         if (!blockId) return faGlyphHtml('block', peripheralName);
         const key = resourceKey('block', blockId);
-        // 与 iconHtml 同一原则：接口没明确说“没有这个方块”就先请求图片，
-        // 图片真 404 时再由 onerror 换成名称兜底（以前元信息没到时会先显示通用字形，像图标没引用上）
-        if (metaState(key) !== 'missing' && !iconFailedKeys.has(key)) {
-            return '<img src="' + iconUrl('block', blockId) + '" alt="" title="' + escapeHtml(blockId) +
-                '" style="width:20px;height:20px;image-rendering:pixelated" data-icon-key="' +
-                escapeHtml(key) + '" onerror="window.ifmIconFallback(this, \'block\')">';
+        // 与 iconHtml 同一套优先级：① 本地导出图（icon-exports，方块物品也有导出；接口的方块图标
+        // 只有 /blocks/<id>/icon 一条路，模组没被收录时它必然 404）→ ② 接口图片。
+        // 接口没明确说“没有这个方块”就先请求图片，图片真 404 时再由 onerror 换成名称兜底
+        // （以前元信息没到时会先显示通用字形，像图标没引用上）
+        const exported = iconExportFile('block', blockId);
+        if (exported || (metaState(key) !== 'missing' && !iconFailedKeys.has(key))) {
+            return iconImgTagHtml('block', blockId, ' title="' + escapeHtml(blockId) +
+                '" style="width:20px;height:20px;image-rendering:pixelated"', exported);
         }
         queueMeta('block', blockId);
         return faGlyphHtml('block', peripheralName);

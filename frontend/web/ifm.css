@@ -238,12 +238,26 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 .progress > .bar { height: 100%; background: var(--good); width: 0; }
 .progress > .bar.warn { background: var(--warn); }
 .progress > .bar.bad { background: var(--bad); }
-/* 外设与定义：方块卡片要**贴合内部芯片**的大小 —— 否则一个方块只有 1~2 个芯片时，
-   卡片会被网格列宽撑得很宽（用户第 2 项）。justify-items:start 让卡片按内容收缩，
-   宽度上限仍是列宽；height 也不被同排更高的卡片拉长。 */
-#peripheralList { align-items: start; justify-items: start; }
-#peripheralList .card-block { width: fit-content; max-width: 100%; }
-.row-3 { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 10px; }
+/* 外设与定义：方块卡片既**贴合内部芯片**的大小（一个方块只有 1~2 个芯片时不要被撑宽），
+   又要**紧凑排列** —— 所以用 flex 换行，而不是等宽网格列。
+   * 以前这里用 .row-3 的 repeat(auto-fill, minmax(250px, 1fr))：列宽先按 250px 均分好
+     （宽屏 5~6 列），卡片再 width:fit-content 缩到内容大小，于是每张卡片右边都空着大半列，
+     一行也永远只排得下 5~6 张 —— 看着就是“横向很松、一行只有 6 个”（用户反馈）。
+   * flex + flex-wrap 按卡片**真实宽度**塞满每一行（同样宽度的卡片能挤进更多张），间距固定 10px；
+     宽度取内容需要的最大值、上限 100%（长芯片行不撑破面板），与上面的机器类型卡片（.machine-type-list）
+     同一套做法。align-items:flex-start 让同排更高的卡片不把别的卡片拉长。 */
+#peripheralList {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: flex-start;
+}
+#peripheralList .card-block {
+    flex: 0 1 auto;
+    width: max-content;
+    max-width: 100%;
+    min-width: 0;
+}
 .flow-row {
     display: flex;
     align-items: center;

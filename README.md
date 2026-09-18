@@ -88,6 +88,7 @@ shell.run("bg", "ifm/IFMWorker.lua")
 ```
 - 如果修改后端源码，重新编译为单文件产物：`python backend/build.py`，产物是 `backend/ifm_bundle.lua`。
 - 主控的数据文件放在安装目录下的 `ifm/data/` 里，从节点自身不保存数据。
+- 如果修改前端图标逻辑，在 `frontend/` 下跑一遍图标自测：`node run_icon_tests.js`（用真实的 `icon-exports-metadata/zh.json` 检查每条出图路径是否都优先引用 `icon-exports/` 里的本地导出图，以及导出图 404 时能否退回接口图标）。
 
 ## 限制
 - 计算机所在区块必须保持加载，否则脚本会停摆（记得准备区块加载手段）。
@@ -203,6 +204,7 @@ shell.run("bg", "ifm/IFMWorker.lua")
 ```
 - After changing the backend source, rebuild it into a single file: `python backend/build.py` (writes `backend/ifm_bundle.lua`).
 - The master's data files live in `ifm/data/` inside the install directory; workers keep no data of their own.
+- After changing the frontend icon logic, run the icon self-test from `frontend/`: `node run_icon_tests.js` (drives the real `icon-exports-metadata/zh.json` and checks that every icon path prefers the local `icon-exports/` image, and that a 404 export image falls back to the API icon).
 
 ## Limitations
 - The chunk the computer is in must stay loaded, otherwise the script stalls (get a chunk loader).

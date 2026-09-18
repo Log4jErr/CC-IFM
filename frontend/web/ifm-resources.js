@@ -295,19 +295,14 @@
         const realKind = kind === 'fluid' ? 'fluid' : 'item';
         const key = resourceKey(realKind, name);
         queueMeta(realKind, name);
-        // 三档优先级（1.6.12，任务 8）：
-        //   ① icon-exports 本地导出图片（离线可用、与游戏里一致；NBT 变体优先匹配）
-        //   ② blocksitems 接口图标
-        //   ③ 名称字形兜底（见 ifmIconFallback / iconFallbackText）
+        // 三档优先级（1.6.12，任务 8）：① icon-exports 本地导出图片（离线可用、与游戏里一致；
+        // NBT 变体优先匹配）→ ② blocksitems 接口图标 → ③ 名称字形兜底（见 ifmIconFallback）。
+        // 出图统一走 iconImgTagHtml：与资源网格主图标 / 外设方块卡是同一个实现，
+        // 免得哪条路径漏掉第 ① 层（导出图就会“有文件却没被引用”）。
         const exported = iconExportFile(realKind, name);
-        if (exported) {
-            return '<img src="' + iconExportUrl(exported) + '" alt="" data-icon-key="' + escapeHtml(key) +
-                '" data-icon-tier="export" onerror="window.ifmIconFallback(this, \'' + realKind + '\')">';
-        }
-        // 与 iconHtml 一致：接口没明确说“没有这个资源”就先请求图片（过滤器轮换图标也走这条路）
-        if (metaState(key) !== 'missing' && !iconFailedKeys.has(key)) {
-            return '<img src="' + iconUrl(realKind, name) + '" alt="" data-icon-key="' + escapeHtml(key) +
-                '" data-icon-tier="api" onerror="window.ifmIconFallback(this, \'' + realKind + '\')">';
+        // 本地也没有、接口又明确说“没有这个资源”时别白刷一次 404，直接用名称字形
+        if (exported || (metaState(key) !== 'missing' && !iconFailedKeys.has(key))) {
+            return iconImgTagHtml(realKind, name, '', exported);
         }
         return faGlyphHtml(realKind, name);
     }

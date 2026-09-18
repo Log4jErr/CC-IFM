@@ -86,11 +86,26 @@
         return meta ? 'ready' : 'unknown';
     }
 
-    function iconImgHtml(kind, name, className) {
+    // 图标 <img> 本体（不含外层 span）：**所有**渲染路径（资源网格主图标 / 库存弹窗 / 编辑器元素行 /
+    // 流程图节点 / 外设方块卡）都从这里出图，优先级固定为
+    //   ① icon-exports 本地导出图（离线可用、与游戏里一致；与界面语言无关）
+    //   ② blocksitems 接口图标
+    // 加载失败时由 ifmIconFallback 按 data-icon-tier 继续往下退：导出图打不开 → 先把 src 换成接口地址；
+    // 接口也没有 → 换成名称兜底（iconFallbackText）。
+    // 以前第 ① 层只接在 plainIconImg 那一条路上，资源网格的主图标走的是 iconHtml → iconUrl（接口），
+    // 于是 laowu:cat_fur 这类“接口没收录的模组”的本地导出图（laowu__cat_fur.png）根本没被引用。
+    // exportedFile：调用方已经查过导出文件名时可以传进来（'' / null = 确定没有，不再重查）。
+    function iconImgTagHtml(kind, name, extraAttrs, exportedFile) {
+        const file = (exportedFile === undefined) ? iconExportFile(kind, name) : exportedFile;
+        const src = file ? iconExportUrl(file) : iconUrl(kind, name);
+        return '<img src="' + src + '" alt="" data-icon-key="' + escapeHtml(resourceKey(kind, name)) +
+            '" data-icon-tier="' + (file ? 'export' : 'api') + '"' + (extraAttrs || '') +
+            ' onerror="window.ifmIconFallback(this, \'' + kind + '\')">';
+    }
+
+    function iconImgHtml(kind, name, className, exportedFile) {
         // 同上：图标上不再挂注册名的原生 title（避免与自定义悬停详情重复）
-        return '<span class="' + className + '"><img src="' + iconUrl(kind, name) + '" alt="" data-icon-key="' +
-            escapeHtml(resourceKey(kind, name)) +
-            '" onerror="window.ifmIconFallback(this, \'' + kind + '\')"></span>';
+        return '<span class="' + className + '">' + iconImgTagHtml(kind, name, '', exportedFile) + '</span>';
     }
 
     function faSpanHtml(kind, name, className) {
@@ -101,11 +116,14 @@
         const className = 'icon ' + (extraClass || '');
         const key = resourceKey(kind, name);
         const state = metaState(key);
-        // 只要接口没明确说“没有这个资源”，就先请求图片：<img> 不受 CORS 限制，
+        // ① 本地导出图（icon-exports）永远优先：接口没收录（state === 'missing'）或者接口图
+        // 曾经 404（iconFailedKeys）都不该挡住它 —— 以前的判断只看接口状态，导出图根本没有机会被引用。
+        const exported = forceChar ? null : iconExportFile(kind, name);
+        // ② 接口没明确说“没有这个资源”，就先请求图片：<img> 不受 CORS 限制，
         // 真正 404 时再由 onerror 换成名称兜底。
         // （以前在“元信息还没到”时会直接显示通用字形/名称，图片根本没被请求——图标看起来就是“没引用上”。）
-        if (!forceChar && state !== 'missing' && !iconFailedKeys.has(key)) {
-            return iconImgHtml(kind, name, className);
+        if (!forceChar && (exported || (state !== 'missing' && !iconFailedKeys.has(key)))) {
+            return iconImgHtml(kind, name, className, exported);
         }
         queueMeta(kind, name);
         return faSpanHtml(kind, name, className);
@@ -480,13 +498,21 @@
         const record = iconExportEntry(kind, name);
         if (record) {
             const wanted = nbt ? iconExportComponentsKey(nbt) : '';
+            let file = '';
             if (wanted) {
                 for (let i = 0; i < record.variants.length; i += 1) {
-                    if (record.variants[i].components === wanted) return record.variants[i].file;
+                    if (record.variants[i].components === wanted) {
+                        file = record.variants[i].file;
+                        break;
+                    }
                 }
             }
-            if (record.plain) return record.plain;
-            if (record.variants.length > 0) return record.variants[0].file;
+            if (!file && record.plain) file = record.plain;
+            if (!file && record.variants.length > 0) file = record.variants[0].file;
+            // 已经 404 过的导出图不再返回（元数据登记了、磁盘上却没导出：导出不完整时会有这种情况，
+            // 见 run_icon_tests.js 的统计）。否则每次重画都会再请求一次必然 404 的图片，
+            // 等 onerror 才退回接口图标 —— 界面看起来就是“图标一直闪不出来”。
+            if (file && !iconExportFailedFiles.has(String(file).toLowerCase())) return file;
         }
         // 元数据里没有这个物品（导出工具漏登记 / 元数据比图片旧）：按约定名猜一个 ——
         // 图片真的存在就直接用（图标始终优先 icon-exports）；不存在就 404 一次并退回接口图标。
