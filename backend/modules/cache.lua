@@ -1,4 +1,4 @@
--- IFM :: ifm/cache.lua
+-- IFM :: modules/cache.lua
 -- 运行态数据（cache.json）：流程运行状态、机器占用、机器类型轮换位置、
 -- 待交付（待发送）队列、红石输出状态。全部持久化，用于服务器重启后完整恢复。
 
@@ -45,7 +45,7 @@ function Cache.new(opts)
     opts = opts or {}
     local self = setmetatable({}, Cache)
     self.Util = opts.Util
-    --- 落盘统一交给 ifm/jsonfile.lua（读 / 原子写 / 去抖都在那边）
+    --- 落盘统一交给 modules/jsonfile.lua（读 / 原子写 / 去抖都在那边）
     local JsonFile = opts.JsonFile
     if not JsonFile then
         error("cache.lua needs the jsonfile module: pass opts.JsonFile (loadModule(\"jsonfile\"))", 0)
@@ -128,7 +128,7 @@ function Cache:flush()
 end
 
 --- 取（或创建）流程运行记录
---- 注意：脏标记一律走 self:markDirty()（它转发到 ifm/jsonfile.lua）；直接写 self.dirty 是**无效**的。
+--- 注意：脏标记一律走 self:markDirty()（它转发到 modules/jsonfile.lua）；直接写 self.dirty 是**无效**的。
 function Cache:proc(name)
     local record = self.data.processes[name]
     if not record then
@@ -232,7 +232,7 @@ function Cache:pruneTags(present)
         end
     end
     if removed > 0 then
-        -- 注意：脏标记在 ifm/jsonfile.lua 那边（Cache 自己不再持有 dirty 字段）
+        -- 注意：脏标记在 modules/jsonfile.lua 那边（Cache 自己不再持有 dirty 字段）
         self.file:markDirty()
     end
     return removed

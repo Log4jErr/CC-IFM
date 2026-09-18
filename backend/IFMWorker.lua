@@ -25,19 +25,19 @@
 
 local args = { ... }
 
---- 脚本目录与 ifm/ 模块目录：定位方式与 IFMMaster.lua 完全一致
+--- 脚本目录与 modules/ 模块目录：定位方式与 IFMMaster.lua 完全一致
 local scriptPath = shell and shell.getRunningProgram and shell.getRunningProgram() or "IFMWorker.lua"
 local baseDir = fs.getDir(scriptPath)
 if baseDir == "" then
     baseDir = "/"
 end
-local moduleDir = fs.combine(baseDir, "ifm")
+local moduleDir = fs.combine(baseDir, "modules")
 
 local function loadModule(name)
     local path = fs.combine(moduleDir, name .. ".lua")
     if not fs.exists(path) then
         error("Missing module file: " .. path ..
-            " - keep IFMWorker.lua next to the ifm/ directory (the unpacker bundle writes both)", 0)
+            " - keep IFMWorker.lua next to the modules/ directory (the unpacker bundle writes both)", 0)
     end
     local chunk, err = loadfile(path)
     if not chunk then
@@ -47,7 +47,7 @@ local function loadModule(name)
 end
 
 --- 与主控共用的模块：
----   modems      modem 发现 / 包装 / 发消息（以前这里自带一份，与 ifm/transfer.lua 重复了 60 行）
+---   modems      modem 发现 / 包装 / 发消息（以前这里自带一份，与 modules/transfer.lua 重复了 60 行）
 ---   peripherals 外设枚举（多类型外设也认得：getType 可能返回多个类型）
 ---   transfer    频道 / 协议名常量（worker 与主控必须一致，写死在两边迟早漂）
 local Modems = loadModule("modems")
@@ -69,7 +69,7 @@ local function printUsage()
     print("  --no-move  don't accept item/fluid move jobs")
     print("  --no-query don't accept item/fluid query jobs")
     print("This worker only moves and queries items/fluids. Processes, storage compaction and the")
-    print("web relay always stay on the master. It does need the same ifm/ directory as the master")
+    print("web relay always stay on the master. It does need the same modules/ directory as the master")
     print("(modem discovery, peripheral scan and the channel/protocol constants) - the unpacker")
     print("bundle writes IFMMaster.lua / IFMWorker.lua and ifm/*.lua together, so keep them together.")
     print("Requires a modem (wired recommended: the worker then sees the same containers as the master).")
@@ -100,7 +100,7 @@ while index <= #args do
     index = index + 1
 end
 
---- 找一个 modem（有线优先）并打开频道；实现见 ifm/modems.lua（与主控同一份）
+--- 找一个 modem（有线优先）并打开频道；实现见 modules/modems.lua（与主控同一份）
 local modem, modemSide = Modems.find()
 if not modem then
     print("IFMWorker: no modem found.")
@@ -119,7 +119,7 @@ if workerName == nil or workerName == "" then
     workerName = "worker-#" .. tostring(computerId)
 end
 
-local version = "1.6.16"
+local version = "1.6.17"
 
 --- 本机日志（屏幕上看得到，方便直接复制给主控看）
 local function workerLog(text)
@@ -221,11 +221,11 @@ end
 -- 回报里的 scannedContainers 只会包含这个容器（没扫到就是空表 → 主控本机读）。
 -- 本机扫描**本机能看到**的 inventory / fluid_storage，把每个槽位/储罐原样回报，并附上按名称合计的数量。
 
---- 外设枚举用与主控同一个模块（ifm/peripherals.lua）：多类型外设也认得
+--- 外设枚举用与主控同一个模块（modules/peripherals.lua）：多类型外设也认得
 --- （CC:T 的 peripheral.getType 可能返回多个类型，自己比较第一个会漏掉）。
 local peripherals = Peripherals.new({ log = function() end })
 
---- 一次查询只查**一个容器**（“查询所有容器”由主控拆成多条查询并行派活，见 ifm/transfer.lua）：
+--- 一次查询只查**一个容器**（“查询所有容器”由主控拆成多条查询并行派活，见 modules/transfer.lua）：
 ---   spec.container   容器外设名（主控新版本用这个字段）
 ---   spec.containers = { 容器外设名 }（兼容旧主控：只取第一个）
 --- 注意：调用方（runQuery）必须先 peripherals:scan() 刷一次注册表。

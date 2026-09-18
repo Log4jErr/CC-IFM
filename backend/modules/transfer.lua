@@ -1,4 +1,4 @@
--- IFM :: ifm/transfer.lua
+-- IFM :: modules/transfer.lua
 -- IFMWorker 调度（1.5.0）：worker 只做两件事 —— 「物品/流体搬运」与「物品/流体查询」。
 -- 流程（engine）、存储整理（compact）、网页中继（WebSocket）**一律由主控自己执行**，
 -- 所以 worker 掉线既不会影响流程推进，也不会让网页失联。
@@ -81,7 +81,7 @@ function Transfer.new(opts)
     local self = setmetatable({}, Transfer)
     self.log = opts.log or function() end
     self.Peripherals = opts.Peripherals
-    --- modem 发现 / 包装 / 发消息：与 IFMWorker.lua 共用 ifm/modems.lua（不再各写一份）
+    --- modem 发现 / 包装 / 发消息：与 IFMWorker.lua 共用 modules/modems.lua（不再各写一份）
     self.Modems = opts.Modems
     if not self.Modems then
         error("transfer.lua needs the modems module: pass opts.Modems (loadModule(\"modems\"))", 0)
@@ -142,7 +142,7 @@ function Transfer.new(opts)
     return self
 end
 
---- 找到 modem 外设（有线优先；具体实现见 ifm/modems.lua，worker 用的是同一份）
+--- 找到 modem 外设（有线优先；具体实现见 modules/modems.lua，worker 用的是同一份）
 function Transfer:ensureModem()
     if self.modem and self.listenReady then
         return self.modem
@@ -1021,7 +1021,7 @@ end
 -- worker 几乎永远在扫容器（用户实测），搬运请求只能干等。现在每个 tick 最多派 scanPerTick 条，
 -- 并且同一台 worker 两次代扫之间要留出冷却空档（见 scanCooldown / scanIdleCooldown）。
 --
--- 接口（由 ifm/containers.lua 的 listPeripheral / tanksPeripheral 调用）：
+-- 接口（由 modules/containers.lua 的 listPeripheral / tanksPeripheral 调用）：
 --   Transfer:scanRequest(name, names)
 --     "done", { slots = 槽位表, tanks = 储罐表 }  worker 刚扫过（scanTtl 内）
 --     "pending"                                   已经派活/正在扫（调用方先用旧值顶着）

@@ -1,4 +1,4 @@
--- IFM :: ifm/jsonfile.lua
+-- IFM :: modules/jsonfile.lua
 -- 磁盘读写（config.json / cache.json 共用）：读 JSON、原子写、去抖写盘。
 --
 -- 为什么单独一个模块：Cache 与 Store 以前各写了一份几乎逐行相同的「读 → 解析 → 临时文件 → 删旧 → 改名」

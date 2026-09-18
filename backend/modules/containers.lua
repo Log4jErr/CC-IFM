@@ -1,4 +1,4 @@
--- IFM :: ifm/containers.lua
+-- IFM :: modules/containers.lua
 -- 容器读写：统计、槽位查找、物品/流体搬运。
 -- 对外一律使用“容器定义名称”，内部解析为外设名称后调用 pushItems / pullItems / pushFluid / pullFluid。
 
@@ -27,7 +27,7 @@ local MAX_EMPTY_SLOT_PROBES = 60
 local MAX_ITEM_DETAIL_QUERIES = 40
 --- 一个 tick 里最多请 worker 代查几批物品详情（见 Containers:requestItemDetails）：
 --- 每批 = 一个 modem 请求，worker 那边每批最多查 DETAIL_BATCH_PER_REQUEST 个物品
---- （ifm/transfer.lua）。派太多会把 modem 和 worker 都占满，太少则标签扫描推进很慢。
+--- （modules/transfer.lua）。派太多会把 modem 和 worker 都占满，太少则标签扫描推进很慢。
 local MAX_DETAIL_REQUESTS_PER_PASS = 4
 --- 整理计划等待「worker 代查物品详情」的最多遍数：详情是异步回来的，
 --- 等不到就别再让出（否则 worker 一直不回 = 计划永远算不完），按缺省值 64 继续算完。
@@ -92,12 +92,12 @@ function Containers.new(opts)
     --- 1.6.15：缺省 8000 —— 语义就是“同一个容器从上次被扫描到下次被扫描的**最小间隔**”，
     --- 不足这个间隔就不会再读它（网页「设置」面板可改，见 Containers:applyScanSettings）。
     self.listTtl = opts.listTtl or 8000
-    --- 容器扫描卸载（worker 代读容器，见 ifm/transfer.lua 的 Transfer:scanRequest）：
+    --- 容器扫描卸载（worker 代读容器，见 modules/transfer.lua 的 Transfer:scanRequest）：
     --- 主控自己读一遍全部容器要 1 个服务器刻/个（19 个 ≈950ms），这部分交给 worker 后
     --- 主控只等 modem 消息；没有 worker 时行为与以前完全一样（本机读）。
     self.scanProvider = nil
     --- 缓存过期、但代扫结果还没回来时，旧值最多还能用多久（毫秒）：先顶着别让主循环停下来等。
-    --- 15 秒是配合代扫限流（每个 tick 最多一条、每台 worker 之间有冷却，见 ifm/transfer.lua）：
+    --- 15 秒是配合代扫限流（每个 tick 最多一条、每台 worker 之间有冷却，见 modules/transfer.lua）：
     --- 一轮 19 个容器在 1~2 台 worker 上要 5~10 秒，8 秒的话最后几个容器会退回主控本机读 ——
     --- 那正是“把扫描摊开、别占满 worker”要避免的开销。外来的变化晚几秒看到没关系；
     --- 引擎自己搬过的东西会显式 invalidate()，照旧立刻可见。
@@ -636,14 +636,14 @@ function Containers:tanks(containerName)
     return self:tanksPeripheral(peripheralName)
 end
 
---- 设置搬运提供者（IFMWorker 调度器，见 ifm/transfer.lua）：
+--- 设置搬运提供者（IFMWorker 调度器，见 modules/transfer.lua）：
 --- 设置后 pushItem / pushFluid 会优先把搬运交给它；它返回 nil, "pending" 表示
 --- “任务已发给 worker，这一 tick 先别推进”，等 worker 回报后下个 tick 才会拿到真实结果。
 function Containers:setTransferProvider(provider)
     self.transfer = provider
 end
 
---- 设置容器扫描提供者（IFMWorker 调度器，见 ifm/transfer.lua 的 Transfer:scanRequest）：
+--- 设置容器扫描提供者（IFMWorker 调度器，见 modules/transfer.lua 的 Transfer:scanRequest）：
 --- 设置后 listPeripheral / tanksPeripheral 缓存过期时会先请 worker 代读一遍容器，
 --- 主控自己不再为每次刷新花掉 19 个服务器刻；没有 worker 时自动退回本机读。
 function Containers:setScanProvider(provider)
@@ -1078,7 +1078,7 @@ function Containers:detailsInFlight(itemName, nbt)
     return true
 end
 
---- 请 provider（worker）代查一批物品详情（见 ifm/transfer.lua 的 Transfer:detailRequest）：
+--- 请 provider（worker）代查一批物品详情（见 modules/transfer.lua 的 Transfer:detailRequest）：
 --- samples = { { container = 外设名, slot = 槽位, name = 物品名, nbt = ... }, ... }
 --- 返回：
 ---   "pending"  已经派给 worker（结果回来后由主控 absorbItemDetails 进字典）
@@ -1117,7 +1117,7 @@ function Containers:requestItemDetails(samples)
     return state
 end
 
---- 设置物品详情提供者（IFMWorker 调度器，见 ifm/transfer.lua 的 Transfer:detailRequest）：
+--- 设置物品详情提供者（IFMWorker 调度器，见 modules/transfer.lua 的 Transfer:detailRequest）：
 --- 设置后 requestItemDetails 会把 getItemDetail 打包交给 worker，主控自己不做阻塞调用。
 function Containers:setDetailProvider(provider)
     self.detailProvider = provider

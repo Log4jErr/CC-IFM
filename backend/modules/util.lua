@@ -1,4 +1,4 @@
--- IFM (Integrated Factory Manager) :: ifm/util.lua
+-- IFM (Integrated Factory Manager) :: modules/util.lua
 -- 通用工具模块。除 CC:Tweaked 自带 API 外无外部依赖。
 -- 加载方式：local Util = loadModule("util")
 
@@ -84,7 +84,7 @@ end
 
 --- ===== 日志 =====
 --- CC:T 计算机磁盘有限，日志**不写文件**、也不刷屏终端：只保存最近若干条在内存环形缓冲里，
---- 由 ifm/protocol.lua 推送给网页（浏览器在控制台里打印）。
+--- 由 modules/protocol.lua 推送给网页（浏览器在控制台里打印）。
 local LOG_LIMIT = 200
 local logBuffer = {}
 local logSeq = 0

@@ -1,4 +1,4 @@
--- IFM :: ifm/scheduler.lua
+-- IFM :: modules/scheduler.lua
 -- 轻量非阻塞调度器：一次性延时任务 / 周期任务 / 可取消。
 -- 所有等待都以绝对时间（os.epoch("utc") 毫秒）记录，因此可以随 cache.json 一起持久化。
 

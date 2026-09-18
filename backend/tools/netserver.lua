@@ -9,13 +9,18 @@
       --update  可选; 指定时版本号 +1, 然后对外提供服务
       <name>    服务端名称, 仅允许字母 / 数字 / 下划线 / 连字符
 
-    目录结构:
-      /netsync/<name>/           同步根目录, 该目录下所有文件(含子目录)都会下发给客户端
-      /netsync/<name>.version    版本号文件(位于同步根目录之外, 不会下发)
+    同步范围(1.6.17 起): 不再固定同步某个目录, 而是读**脚本同目录**下的两个文件:
+      syncinclude.txt   每行一个路径, 要同步的内容(目录末尾写 "/", 会递归)
+      syncignore.txt    每行一个路径, 要忽略的内容(目录带不带 "/" 都行)
+      两个文件都支持绝对路径(以 "/" 开头, 相对电脑根目录)与相对路径(相对本脚本所在目录);
+      "#" 开头的行是注释, 空行忽略。两个文件必须存在, 缺哪个就创建哪个(空文件)并报错。
 
-    下发规则: 不做任何过滤 —— 同步根目录下的**所有文件与子目录**都会递归下发,
-    包括以 "." 开头的隐藏项、服务端脚本自身、*.version、rom/ 与 disk/。
-    注意: 别把客户端自己的状态目录(客户端的 /.netsync)放进同步根目录, 否则会被下发给所有客户端。
+    客户端上的落点: 服务端绝对路径去掉开头的 "/" 就是客户端上的路径 ——
+      例: include 写 "ifm/" (脚本在根目录时即 /ifm/) -> 客户端写出 /ifm/IFMMaster.lua 等。
+    注意: 别把客户端自己的状态目录(客户端的 /.netsync)包含进来, 否则会覆盖所有客户端的状态。
+
+    状态文件:
+      /netsync/<name>.version    版本号文件(netserver 自己管理, 与同步范围无关)
 
     多客户端:
       - 每个客户端的请求各自排队, 服务端**轮转**处理(每个 tick 服务若干次),
@@ -34,7 +39,9 @@ local PROTOCOL = "netsync"          -- 消息协议标识
 local ANNOUNCE_CHANNEL = 42001      -- 广播发现频道
 local ANNOUNCE_INTERVAL = 5         -- 广播间隔(秒)
 local CHUNK_SIZE = 4096             -- 单个数据块大小(字节)
-local DATA_ROOT = "/netsync"        -- 服务端数据根目录
+local DATA_ROOT = "/netsync"        -- 服务端状态目录(只放 <name>.version)
+local INCLUDE_FILE = "syncinclude.txt"  -- 同步范围(放在脚本同目录)
+local IGNORE_FILE = "syncignore.txt"    -- 忽略范围(放在脚本同目录)
 local ID_CHANNEL_MOD = 65500        -- 电脑 ID 通道取模(保证通道号在 0-65535 内)
 local MAX_SERVES_PER_TICK = 6       -- 每个 tick 最多回复多少个请求(公平轮转)
 local CLIENT_TIMEOUT_MS = 60000     -- 客户端队列的保活时间(超过就丢掉它的统计)
@@ -97,39 +104,146 @@ end
 -- ==========================================
 
 
--- 递归收集同步根目录下的所有文件(含子目录/隐藏项), 返回 { {path = "a/b.lua", size = 123}, ... }
--- 1.6.16 起不再做任何过滤: 目录里有什么就下发什么(见文件头说明)
-local function collectFiles(root)
-    local files = {}
-    local function walk(dir, prefix)
+-- ==========================================
+-- 同步范围: syncinclude.txt / syncignore.txt
+-- ==========================================
+
+-- 脚本自己所在目录(两个配置文件都放这里)
+local function scriptDir()
+    local program = (shell and shell.getRunningProgram and shell.getRunningProgram()) or "netserver.lua"
+    if fs.exists(program) then
+        local dir = fs.getDir(program)
+        return (dir == "") and "/" or dir
+    end
+    if shell and shell.dir then
+        local dir = shell.dir()
+        return (dir == "") and "/" or dir
+    end
+    return "/"
+end
+
+-- 两个配置文件都必须在; 缺哪个就创建哪个(空文件), 然后报错让用户填好再启动
+local function loadConfigs(dir)
+    local texts, missing = {}, {}
+    for _, fileName in ipairs({ INCLUDE_FILE, IGNORE_FILE }) do
+        local path = fs.combine(dir, fileName)
+        if fs.exists(path) then
+            local handle = fs.open(path, "r")
+            if not handle then
+                error("cannot read " .. path, 0)
+            end
+            texts[fileName] = handle.readAll() or ""
+            handle.close()
+        else
+            local handle = fs.open(path, "w")
+            if handle then
+                handle.close()
+            end
+            log("created empty config file: %s", path)
+            missing[#missing + 1] = path
+        end
+    end
+    if #missing > 0 then
+        error(string.format(
+            "config file(s) missing, empty ones were just created: %s; put one path per line into them (in %s) and start netserver again",
+            table.concat(missing, ", "), dir), 0)
+    end
+    return texts[INCLUDE_FILE], texts[IGNORE_FILE]
+end
+
+-- 逐行解析: 跳过空行与 "#" 注释; 目录标记(末尾 "/")与相对路径都按脚本目录解析
+local function parsePaths(text, dir, kind)
+    local out = {}
+    for line in text:gmatch("[^\r\n]+") do
+        local value = line:gsub("^%s+", ""):gsub("%s+$", "")
+        if value ~= "" and value:sub(1, 1) ~= "#" then
+            local isDir = value:sub(-1) == "/"
+            local raw = isDir and value:sub(1, -2) or value
+            if raw ~= "" then
+                local abs = fs.combine(raw)
+                if abs:sub(1, 1) ~= "/" then
+                    abs = fs.combine(dir, abs)          -- 相对路径: 相对 netserver 脚本所在目录
+                end
+                out[#out + 1] = { kind = kind, raw = value, path = fs.combine(abs), isDir = isDir }
+            end
+        end
+    end
+    return out
+end
+
+local includeEntries = {}     -- syncinclude.txt 解析结果
+local ignoreEntries = {}      -- syncignore.txt 解析结果
+local index = {}              -- 客户端路径 -> 服务端绝对路径(每次扫描时刷新)
+
+-- 这个绝对路径是否被 ignore 命中(同路径, 或在被忽略的目录里)
+local function isIgnored(path)
+    for _, item in ipairs(ignoreEntries) do
+        if item.path == path then
+            return true
+        end
+        if item.isDir and path:sub(1, #item.path + 1) == item.path .. "/" then
+            return true
+        end
+    end
+    return false
+end
+
+-- 按 include 列表扫描: 目录递归, 文件单个; ignore 命中的跳过。
+-- 返回 (排序后的清单 { {path = 客户端路径, size = 字节数}, ... }, 不存在的 include 路径)
+-- 同时刷新 index(客户端路径 -> 服务端绝对路径)
+local function scanIncludes()
+    index = {}
+    local out = {}
+    local missing = {}
+    local function add(abs)
+        if isIgnored(abs) then
+            return
+        end
+        local clientPath = abs:sub(1, 1) == "/" and abs:sub(2) or abs
+        if clientPath == "" or index[clientPath] ~= nil then
+            return
+        end
+        index[clientPath] = abs
+        out[#out + 1] = { path = clientPath, size = fs.getSize(abs) or 0 }
+    end
+    local function walk(dir)
         local entries = fs.list(dir)
         table.sort(entries)
         for _, entry in ipairs(entries) do
             local abs = fs.combine(dir, entry)
-            local rel = (prefix == "") and entry or (prefix .. "/" .. entry)
             if fs.isDir(abs) then
-                walk(abs, rel)
+                if not isIgnored(abs) then
+                    walk(abs)
+                end
             else
-                files[#files + 1] = { path = rel, size = fs.getSize(abs) or 0 }
+                add(abs)
             end
         end
     end
-    if fs.exists(root) and fs.isDir(root) then
-        walk(root, "")
+    for _, item in ipairs(includeEntries) do
+        if not fs.exists(item.path) then
+            missing[#missing + 1] = item.raw
+        elseif fs.isDir(item.path) then
+            walk(item.path)
+        else
+            add(item.path)
+        end
     end
-    return files
+    table.sort(out, function(a, b) return a.path < b.path end)
+    return out, missing
 end
 
--- 把客户端给出的相对路径解析为同步根目录内的绝对路径(阻止 ../ 越界)
-local function resolveFile(root, rel)
-    if type(rel) ~= "string" or rel == "" then
+-- 客户端请求的路径 -> 服务端绝对路径(只允许 include 扫描出来的条目)
+local function resolveFile(clientPath)
+    if type(clientPath) ~= "string" or clientPath == "" then
         return nil
     end
-    local abs = fs.combine(root, rel)
-    if abs:sub(1, #root + 1) ~= root .. "/" then
-        return nil
+    local abs = index[clientPath]
+    if not abs then
+        scanIncludes()                  -- 可能刚加了文件: 刷新一次再找
+        abs = index[clientPath]
     end
-    if not fs.exists(abs) or fs.isDir(abs) then
+    if not abs or not fs.exists(abs) or fs.isDir(abs) then
         return nil
     end
     return abs
@@ -153,17 +267,16 @@ end
 -- 请求处理
 -- ==========================================
 
-local root                     -- 同步根目录
+local configDir = "/"          -- 两个配置文件所在目录(netserver 脚本目录)
 local versionPath              -- 版本号文件
 local version = 0              -- 当前对外版本号
 local modem                    -- modem 外设
 local myChannel = 0            -- 本机直连通道
 local name = ""                -- 服务端名称
 
--- 回复文件清单
+-- 回复文件清单(每次请求都按 include/ignore 重新扫描, 这样新增文件不用重启 netserver)
 local function sendList(targetChannel, clientId)
-    -- 注意要带上自身路径：正在运行的 netserver 自己不参与同步
-    local files = collectFiles(root)
+    local files, missing = scanIncludes()
     modem.transmit(targetChannel, myChannel, {
         ns = PROTOCOL,
         type = "list_reply",
@@ -173,13 +286,20 @@ local function sendList(targetChannel, clientId)
     })
     log("client #%s requested the file list: %d file(s)", tostring(clientId), #files)
     if #files == 0 then
-        log("  nothing to distribute: sync root %s is empty (or everything inside it is excluded)", root)
+        log("  nothing to distribute: check %s and %s in %s",
+            INCLUDE_FILE, IGNORE_FILE, configDir)
+    end
+    for _, raw in ipairs(missing) do
+        log("  include path not found (skipped): %s", raw)
+    end
+    if #missing > 0 then
+        missing = nil
     end
 end
 
 -- 回复一个数据块
 local function sendFile(targetChannel, clientId, rel, offset)
-    local abs = resolveFile(root, rel)
+    local abs = resolveFile(rel)
     local data = abs and (readChunk(abs, offset, CHUNK_SIZE) or "") or ""
     if offset == 0 then
         if abs then
@@ -302,15 +422,16 @@ if not validName(name) then
     error("missing or invalid <name>", 0)
 end
 
-root = fs.combine(DATA_ROOT, name)
 versionPath = fs.combine(DATA_ROOT, name .. ".version")
 
-
--- 首次运行时创建同步根目录(只创建, 不删除任何文件)
-if not fs.exists(root) then
-    fs.makeDir(root)
-    log("created the sync root directory: %s", root)
-end
+--- 同步范围: 两个配置文件都放在 netserver 脚本同目录; 缺哪个就创建哪个(空文件)并报错
+configDir = scriptDir()
+local includeText, ignoreText = loadConfigs(configDir)
+includeEntries = parsePaths(includeText, configDir, "include")
+ignoreEntries = parsePaths(ignoreText, configDir, "ignore")
+log("sync config: %s (%d include path(s)) / %s (%d ignore path(s))",
+    fs.combine(configDir, INCLUDE_FILE), #includeEntries,
+    fs.combine(configDir, IGNORE_FILE), #ignoreEntries)
 
 version = readVersion(versionPath)
 if update then
@@ -338,11 +459,18 @@ local function announce()
     })
 end
 
-local fileCount = #collectFiles(root)
+local startupFiles = scanIncludes()
 log("server started: name=%s version=%d local channel=%d", name, version, myChannel)
-log("sync root: %s (%d file(s))", root, fileCount)
-if fileCount == 0 then
-    log("note: the sync root is empty - put the files you want to distribute into it")
+log("to distribute: %d file(s) (see %s / %s in %s)", #startupFiles, INCLUDE_FILE, IGNORE_FILE, configDir)
+if #startupFiles == 0 then
+    log("note: nothing to distribute - put the paths you want to send into %s in %s",
+        INCLUDE_FILE, configDir)
+end
+for _, item in ipairs(includeEntries) do
+    log("  include: %s -> %s%s", item.raw, item.path, (not fs.exists(item.path)) and " (NOT FOUND)" or "")
+end
+for _, item in ipairs(ignoreEntries) do
+    log("  ignore : %s -> %s", item.raw, item.path)
 end
 log("broadcasting every %d second(s), waiting for clients...", ANNOUNCE_INTERVAL)
 

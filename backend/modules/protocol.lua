@@ -1,4 +1,4 @@
--- IFM :: ifm/protocol.lua
+-- IFM :: modules/protocol.lua
 -- WebSocket 通讯协议（参照 meweb 的实现）：
 --   浏览器 -> 服务端：{ id, action, ...payload }
 --   服务端 -> 浏览器：{ id, action, result }
@@ -703,7 +703,7 @@ end
 --- 用来回答“运行缓慢到底是哪个动作、哪个包太大”。
 --- 注意：方法名不能叫 `stats`：实例上还有一个数据字段 `self.stats`（原始计数表），
 --- 同名字段会把方法**遮蔽**掉（`obj.stats` 拿到的是表，`obj:stats()` 会报 attempt to call a table value），
---- 所以这里叫 `statsSummary`（见 ifm/diagnose.lua 的调用与 build.py 的“方法遮蔽检查”）。
+--- 所以这里叫 `statsSummary`（见 modules/diagnose.lua 的调用与 build.py 的“方法遮蔽检查”）。
 function Protocol:statsSummary()
     local stats = self.stats
     local actions = {}

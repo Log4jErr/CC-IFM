@@ -1,4 +1,4 @@
--- IFM :: ifm/store.lua
+-- IFM :: modules/store.lua
 -- 定义数据模型（config.json）：容器定义、信号定义、过滤器定义、机器类型、机器、流程。
 -- 所有定义都保存在 data[kind][name] 中；set/delete 走校验，变更后自动去抖写盘。
 
@@ -128,7 +128,7 @@ function Store.new(opts)
     opts = opts or {}
     local self = setmetatable({}, Store)
     self.Util = opts.Util
-    --- 落盘统一交给 ifm/jsonfile.lua（读 / 原子写 / 去抖都在那边）
+    --- 落盘统一交给 modules/jsonfile.lua（读 / 原子写 / 去抖都在那边）
     local JsonFile = opts.JsonFile
     if not JsonFile then
         error("store.lua needs the jsonfile module: pass opts.JsonFile (loadModule(\"jsonfile\"))", 0)
@@ -209,7 +209,7 @@ function Store:tick(now)
     return self:flush()
 end
 
---- 立即写盘（原子写由 ifm/jsonfile.lua 负责）
+--- 立即写盘（原子写由 modules/jsonfile.lua 负责）
 function Store:flush()
     return self.file:flush(self.data)
 end
@@ -796,7 +796,7 @@ end
 
 --- 流程里是否含有“虚操作”元素（kind = "virtual"）：含虚操作的流程是**抽象模板** —— 
 --- 不能执行 / 不能被选作上游 / 不能下单合成，只能被网页的“流程设置复制”拷贝到别的流程。
---- 引擎（ifm/recipe.lua）与主控（IFMMaster.lua）都用它做判断。
+--- 引擎（modules/recipe.lua）与主控（IFMMaster.lua）都用它做判断。
 function Store.processHasVirtual(process)
     if type(process) ~= "table" then
         return false

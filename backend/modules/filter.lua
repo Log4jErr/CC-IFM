@@ -1,4 +1,4 @@
--- IFM :: ifm/filter.lua
+-- IFM :: modules/filter.lua
 -- 过滤器求值模块。
 --
 -- 规则类型（对应 task 第 8 条）：

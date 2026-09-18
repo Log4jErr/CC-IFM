@@ -27,16 +27,17 @@ wget run https://raw.githubusercontent.com/Log4jErr/CC-IFM/main/backend/ifm_bund
 - 如果IFM有更新的版本，你可以重新运行这条命令以完成更新。
 - 如果服务器内无法访问Github，你可以单独下载ifm_bundle.lua，然后将此文件拖拽上传至计算机，运行ifm_bundle.lua以完成安装。
 
+- 安装产物会解压到**运行目录下的 `ifm/` 目录**里：`ifm/IFMMaster.lua`（主控入口）、`ifm/IFMWorker.lua`（从节点入口）、`ifm/modules/`（代码模块）。解压完成后产物自身会被删除。
 ## 启动
 - 在其中一台计算机中运行主控脚本，使用下面这条命令启动（警告：不要有复数台计算机在同一有线网络中运行主控脚本，否则会发生不可预料的结果）
 ```
-IFMMaster.lua
+ifm/IFMMaster.lua
 ```
 启动后，你会看见屏幕上显示房间号，记下这个房间号，它是你浏览器连接的凭据。
 - （高级）房间号是随机生成的，你可以自己指定房间号，启动参数添加--room <房间号>即可。
 - （可选）在其余计算机启动从节点脚本：
 ```
-IFMWorker.lua
+ifm/IFMWorker.lua
 ```
 主从节点之间会自动发现，所以不需要你进行其他干预。
 - **主控与从节点的版本必须完全一致**：版本号对不上时，两边互相拒绝执行搬运/查询（主控不派活、从节点拒绝执行并在屏幕上提示），网页上的从节点卡片也会标红。升级时把所有计算机一起升到同一版本。
@@ -70,40 +71,42 @@ IFMWorker.lua
 - 浏览器与服务端通过 **itty-sockets** 中转的 WebSocket 互相传递消息
 - 前端图标和资源信息按照三个方案获取：本地 `frontend/icon-exports/` 导出（质量最佳，但是需要根据Minecraft示例专门导出）→ blocksitems.com 接口（质量很好，不过有些物品缺失，并且不支持国际化）→ 注册名转换（没有图标。你可以按右上角翻译按钮启用Bergamot翻译器以获取你的语言的物品名称，质量较差）
 - 拼音搜索库借助 `pinyinlite` 提供
-- 前端部署依赖Github Pages
+- 前端部署依赖 `Github Pages`
 
 ## 高级
 - 开机自启主控（创建一个`startup.lua`脚本，内容如下）：
 ```lua
-shell.run("bg", "IFMMaster.lua")
+shell.run("bg", "ifm/IFMMaster.lua")
 ```
 - 自定义房间号
 ```
-IFMMaster --room <房间号>
+ifm/IFMMaster --room <房间号>
 ```
 - 开机自启从节点（创建一个`startup.lua`脚本，内容如下）：
 ```lua
-shell.run("bg", "IFMWorker.lua")
+shell.run("bg", "ifm/IFMWorker.lua")
 ```
-- 改了后端源码之后重新编译：`python backend/build.py`，产物是 `backend/ifm_bundle.lua`。
-- 主控的**数据文件**放在 `<脚本目录>/data/` 下：`data/config.json`（容器/机器/流程等定义）与 `data/cache.json`（运行态缓存）。从 1.6.15 及更早版本升级时，主控启动会**自动**把 `ifm/` 里的老文件搬到 `data/`（只搬一次，搬完删掉老文件），不需要手动操作。
-- 容器扫描间隔在网页「设置」面板里调：存储容器缺省 **8000ms**，含义是**同一个容器从上次被扫描到下次被扫描的最小间隔**（搬运/整理需要最新数据时会强制重读）；输入容器缺省 **1000ms**，是输入容器「排空扫描」的节奏。改完立即生效，并写入 `config.json`。
+- 如果修改后端源码，重新编译为单文件产物：`python backend/build.py`，产物是 `backend/ifm_bundle.lua`。
+- 主控的**数据文件**放在安装目录下的 `ifm/data/` 里：`data/config.json`（容器/机器/流程等定义）与 `data/cache.json`（运行态缓存），与代码（`ifm/modules/`）分开。从 1.6.16 及更早版本升级时，主控启动会**自动**把旧位置里的 config/cache 搬到 `data/`（只搬一次，搬完删掉老文件）。
 
 ## 限制
-- 由于 CC:Tweaked 的限制，计算机所在区块必须保持加载，否则脚本会停摆（记得准备区块加载手段）。
+- 计算机所在区块必须保持加载，否则脚本会停摆（记得准备区块加载手段）。
+- 外设在有线线缆上最多传递256格，所以不要让线缆超过这个长度，不然找不到外设。
 - 公共中继 `wss://itty.ws/c/` 在部分地区可能连不上，可以自建 itty-sockets 服务器并用 `--relay` 指过去。
-- 读容器是阻塞调用（有线网络上每个容器约 1 个服务器刻），容器很多时扫描会变慢，可以调大扫描间隔，或者添加更多从节点。
+- 读容器是阻塞调用（每个容器每次读取约1Tick），容器很多时扫描会变慢，可以调大扫描间隔，或者添加更多从节点。
 
 ## 小工具
-- backend/tools下是一些其他的CC脚本，提供一些用得着的功能。这些脚本**各自独立运行**（不依赖 IFM 本体、也不进 bundle），而且提示信息只用 ASCII 英文 —— CC 终端字体没有中日韩字形，非 ASCII 会显示成乱码。
+- backend/tools下是一些其他的CC脚本，提供一些用得着的功能。这些脚本各自独立运行。
 
 ### netsync
 - 你有1个主控和一大堆从节点，现在IFM版本更新了，一个个去更新可太麻烦了。工具脚本netserver和netsync是成对使用的，用于自动同步文件。
-- netserver启动时需要指定name，它会把 `/netsync/<name>/` 目录下的**所有文件与子目录**递归发送给同名的 netsync 计算机，所以**要分发的文件必须放进 `/netsync/<name>/`**。1.6.16 起**不再做任何过滤**：以 `.` 开头的隐藏项、netserver 脚本自身、`*.version`、`rom/`、`disk/` 都会下发；不要把客户端自己的状态目录（客户端的 `/.netsync`）放进这个目录。
-- netsync启动时需要指定name，然后它会从netserver下载所有文件到本机，下载完成后重启计算机。
-- netserver有一个文件版本信息，修改了文件后你需要使用netserver --update name启动netserver，以更新版本。
+- netserver和netsync启动时需要指定name，相同的name之间的netserver会把文件同步给netsync。
+- **同步什么由两个文件决定**（放在 **netserver 脚本同目录**）：`syncinclude.txt` 每行一个要同步的路径（目录末尾写 `/`，会递归），`syncignore.txt` 每行一个要忽略的路径（目录带不带 `/` 都行）；两者都支持**绝对路径**（以 `/` 开头）与**相对路径**（相对 netserver 脚本所在目录），`#` 开头是注释、空行忽略。两个文件缺哪个就**自动创建一个空的并报错**，填好后再启动 netserver。
+- 客户端上的落点 = 服务端绝对路径去掉开头的 `/`：例如 netserver 在根目录、`syncinclude.txt` 里写 `ifm/`，客户端就会写出 `/ifm/IFMMaster.lua`、`/ifm/modules/*.lua` 等。**新增文件不用重启** netserver（每次请求都会重新扫描）。
+- netserver需要两个配置文件，syncinclude.txt和syncignore.txt，前者指定要同步的文件或目录的路径（目录路径末尾加斜杠/），后者指定要排除的路径。
 - netsync只会在netserver有更新的版本时才下载。否则会保持等待。
-- 如果 `/netsync/<name>/` 是空的：netserver 启动时会提示 "the sync root is empty"，客户端拿到 0 个文件会报"server returned 0 files" 并**不算同步成功**（不写盘、不记版本号、不重启），把文件放进该目录后重新运行 `netserver --update <name>` 即可。
+- 每次你更新了文件，需要同步时，使用netserver --update name启动netserver，以更新版本。
+- --update参数可以不加，此时netserver不会更新版本。一句话描述：如果你修改了要同步的文件，启动netserver时加--update。如果文件没有变动，不加--update参数。
 - 为了使用这个脚本自动更新IFM，你应当在主控节点安装netserver，在从节点安装netsync，并且从节点可以设置netsync和IFMWorker同时开机自启（借助shell.run bg或者fg命令）。每次需要更新IFM版本时，先在主控安装新版IFM，然后在主控运行netserver --update <名称>
 
 ### crafter
@@ -136,6 +139,7 @@ wget run https://raw.githubusercontent.com/Log4jErr/CC-IFM/main/backend/ifm_bund
 ```
 - When a new version is released, just run the same command again to update.
 
+- The bundle unpacks into an **`ifm/` directory next to it**: `ifm/IFMMaster.lua` (server entry), `ifm/IFMWorker.lua` (worker entry) and `ifm/modules/` (code modules). The bundle file itself is deleted afterwards.
 ## Booting
 - Start the master script on one of the computers (warning: never run the master on two computers of the same wired network, the result is unpredictable):
 ```
@@ -208,11 +212,12 @@ shell.run("bg", "IFMWorker.lua")
 
 ### netsync
 - You have one master computer plus a pile of workers, and IFM just released a new version — updating them one by one is a pain. The `netserver` / `netsync` pair syncs files automatically.
-- `netserver` is started with a name and serves **every file and subdirectory** inside `/netsync/<name>/`, so **the files you want to distribute must be placed there**. Since 1.6.16 there is **no filtering at all**: hidden entries, the server script itself, `*.version`, `rom/` and `disk/` are all sent. Do not put the client state directory (`/.netsync`) in there.
+- **What gets synced is decided by two files** placed **next to the `netserver` script**: `syncinclude.txt` (one path per line to sync; a directory must end with `/` and is then synced recursively) and `syncignore.txt` (one path per line to ignore; a directory may have a trailing `/` or not). Both accept **absolute paths** (leading `/`) and **relative paths** (relative to the script directory); lines starting with `#` are comments and empty lines are ignored. If either file is missing, an empty one is created and netserver errors out — fill them in and start it again.
+- Client-side layout = the server-side absolute path without the leading `/`: with netserver in the root and `ifm/` in `syncinclude.txt`, clients get `/ifm/IFMMaster.lua`, `/ifm/modules/*.lua`, ... New files are picked up automatically (the list is re-scanned on every request), so no restart is needed.
 - `netsync` is started with a name, downloads all files from that `netserver` to the local computer, and reboots the computer when the download is done.
 - `netserver` keeps a version number: after you change the files, start it with `netserver --update <name>` to bump the version.
 - `netsync` only downloads when the server has a newer version; otherwise it just keeps waiting.
-- If `/netsync/<name>/` is empty: `netserver` prints "the sync root is empty" at startup, and the client logs "server returned 0 files" and does **not** treat it as a successful sync (nothing is written, the version is not recorded and the computer is not rebooted). Put the files there and run `netserver --update <name>` again.
+- If the include list is empty or none of its paths exist: netserver logs "nothing to distribute" and the client logs "server returned 0 files" and does **not** treat it as a successful sync (nothing is written, the version is not recorded and the computer is not rebooted). Fix `syncinclude.txt`, then run `netserver --update <name>` again.
 - To auto-update IFM with this, install `netserver` on the master and `netsync` on the workers, and start `netsync` together with `IFMWorker` at boot (using `shell.run` with `bg` or `fg`). Whenever IFM updates: install the new version on the master first, then run `netserver --update <name>` on the master.
 
 ### crafter

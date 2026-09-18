@@ -1,4 +1,4 @@
--- IFM :: ifm/peripherals.lua
+-- IFM :: modules/peripherals.lua
 -- 外设扫描与包装：inventory（物品容器）、fluid_storage（流体容器）、redstone_relay（红石中继器）。
 
 local Peripherals = {}

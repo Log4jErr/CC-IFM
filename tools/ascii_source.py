@@ -12,7 +12,7 @@
     python tools/ascii_source.py --check IFMMaster.lua   # 指定文件
     python tools/ascii_source.py --list              # 列出违规位置
     python tools/ascii_source.py --write             # 把字符串里的非 ASCII 自动转成 \\uXXXX
-默认目标：IFMMaster.lua 与 ifm/*.lua（相对项目根目录）。build.py 会在打包前做同样的检查。
+默认目标：IFMMaster.lua 与 modules/*.lua（相对项目根目录）。build.py 会在打包前做同样的检查。
 """
 import argparse
 import io
@@ -128,7 +128,7 @@ def target_files(names):
     if names:
         return [os.path.abspath(name) for name in names]
     files = [os.path.join(base, "IFMMaster.lua")]
-    module_dir = os.path.join(base, "ifm")
+    module_dir = os.path.join(base, "modules")
     if os.path.isdir(module_dir):
         files += [os.path.join(module_dir, n) for n in sorted(os.listdir(module_dir)) if n.endswith(".lua")]
     return files
@@ -136,7 +136,7 @@ def target_files(names):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="IFM 源文件 ASCII 检查/转换")
-    parser.add_argument("files", nargs="*", help="要处理的 Lua 文件（默认 IFMMaster.lua 与 ifm/*.lua）")
+    parser.add_argument("files", nargs="*", help="要处理的 Lua 文件（默认 IFMMaster.lua 与 modules/*.lua）")
     parser.add_argument("--check", action="store_true", help="只检查，不修改")
     parser.add_argument("--write", action="store_true", help="把字符串里的非 ASCII 转成 \\uXXXX")
     parser.add_argument("--list", action="store_true", help="列出违规位置")

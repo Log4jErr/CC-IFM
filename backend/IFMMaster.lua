@@ -16,7 +16,7 @@ local args = { ... }
 --- 版本号：前端 web/ifm-core.js 里的 IFM_CLIENT_VERSION 必须与此保持一致。
 --- 网页连上后会比对两边的版本号，不一致时弹出警告并主动停止连接，
 --- 避免“新前端 + 旧后端”（或反过来）产生难以定位的怪问题。
-local IFM_VERSION = "1.6.16"
+local IFM_VERSION = "1.6.17"
 
 local DEFAULT_RELAY = "wss://itty.ws/c/"
 
@@ -108,15 +108,17 @@ if (not room or room == "") and #unknown == 1 and unknown[1]:sub(1, 1) ~= "-" th
     print("[IFM] note: positional room argument is deprecated, use --room <room>")
 end
 
---- 定位脚本目录：**代码**在 <脚本目录>/ifm/，**数据**在 <脚本目录>/data/（1.6.16 起）
---- 以前 config.json / cache.json 和代码混在 ifm/ 里，升级时会自动把老数据搬到 data/（只搬一次）
+--- 定位脚本目录：**代码**在 <脚本目录>/modules/，**数据**在 <脚本目录>/data/（1.6.17 起）
+--- 以前数据文件和代码混在一起（ifm/ 里），升级时会自动把老数据搬到 data/（只搬一次）
 local scriptPath = shell and shell.getRunningProgram and shell.getRunningProgram() or "IFMMaster.lua"
 local baseDir = fs.getDir(scriptPath)
 if baseDir == "" then
     baseDir = "/"
 end
-local moduleDir = fs.combine(baseDir, "ifm")
-local legacyDataDir = moduleDir
+local moduleDir = fs.combine(baseDir, "modules")   -- 代码模块（1.6.17 起目录名是 modules/）
+--- 老版本的数据文件位置：1.6.16 及以前模块目录叫 ifm/，config.json / cache.json 就放在里面，
+--- 也就是现在的 baseDir（<脚本目录>）下；更老的自定义安装里也可能在 modules/ 里，两个都查一遍。
+local legacyDataDirs = { baseDir, moduleDir }
 local dataDir = fs.combine(baseDir, "data")
 
 for _, value in ipairs(unknown) do
@@ -137,7 +139,7 @@ end
 
 local Util = loadModule("util")
 local log = Util.makeLogger("IFM", true)
---- 磁盘读写（config.json / cache.json）：读 / 原子写 / 去抖都在 ifm/jsonfile.lua
+--- 磁盘读写（config.json / cache.json）：读 / 原子写 / 去抖都在 modules/jsonfile.lua
 local JsonFile = loadModule("jsonfile")
 --- modem 发现与包装：与 IFMWorker.lua 共用（worker 不再自带一份）
 local Modems = loadModule("modems")
@@ -161,25 +163,29 @@ end
 --- 这里在 data/ 还没有对应文件时把它复制过来（复制成功后再删掉老文件；删不掉也无妨）。
 local function migrateLegacyData(fileName)
     local target = fs.combine(dataDir, fileName)
-    local legacy = fs.combine(legacyDataDir, fileName)
-    if fs.exists(target) or not fs.exists(legacy) then
+    if fs.exists(target) then
         return false
     end
-    local handle = fs.open(legacy, "r")
-    if not handle then
-        return false
+    for _, dir in ipairs(legacyDataDirs) do
+        local legacy = fs.combine(dir, fileName)
+        if fs.exists(legacy) and legacy ~= target then
+            local handle = fs.open(legacy, "r")
+            if handle then
+                local text = handle.readAll() or ""
+                handle.close()
+                local out = fs.open(target, "w")
+                if not out then
+                    return false
+                end
+                out.write(text)
+                out.close()
+                pcall(fs.delete, legacy)
+                log("Migrated data file %s -> %s", legacy, target)
+                return true
+            end
+        end
     end
-    local text = handle.readAll() or ""
-    handle.close()
-    local out = fs.open(target, "w")
-    if not out then
-        return false
-    end
-    out.write(text)
-    out.close()
-    pcall(fs.delete, legacy)
-    log("Migrated data file %s -> %s", legacy, target)
-    return true
+    return false
 end
 migrateLegacyData("config.json")
 migrateLegacyData("cache.json")
@@ -509,7 +515,7 @@ local function collectPeripherals()
 end
 
 local protocol
---- 搬运卸载调度器（IFMWorker 调度，实现见 ifm/transfer.lua）：在下面 Protocol 建好之后创建并接到 containers 上
+--- 搬运卸载调度器（IFMWorker 调度，实现见 modules/transfer.lua）：在下面 Protocol 建好之后创建并接到 containers 上
 local transfer
 
 --- 汇总推送给网页的全部类别
@@ -1185,7 +1191,7 @@ local function handleRequest(payload)
         log("send_items -> container=%s queued=%d failed=%d", tostring(payload.container), queued, failed)
         return result
     elseif action == "worker_query" then
-        -- 让 IFMWorker 代扫**一个容器**（一条查询只查一个容器，见 ifm/transfer.lua 的 startScanBatch）
+        -- 让 IFMWorker 代扫**一个容器**（一条查询只查一个容器，见 modules/transfer.lua 的 startScanBatch）
         -- payload: { container = 容器外设名, names = {物品名...}, key = "自定义缓存键" }
         if not (transfer and transfer.requestQuery) then
             return { error = "transfer module unavailable" }

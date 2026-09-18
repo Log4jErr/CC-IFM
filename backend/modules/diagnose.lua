@@ -1,4 +1,4 @@
--- IFM :: ifm/diagnose.lua
+-- IFM :: modules/diagnose.lua
 -- 只读诊断：把“为什么材料/产物/发送任务不动”逐条算出来。
 -- 结果作为日志行推给浏览器控制台（同时本地 print），**不写任何文件**（CC:T 磁盘很小）。
 --
