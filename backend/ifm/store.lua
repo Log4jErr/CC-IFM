@@ -10,7 +10,13 @@ Store.KINDS = { "containers", "signals", "filters", "machineTypes", "machines", 
 --- 全局设置（1.6.11）：目前只有一条记录 "scan"（容器扫描间隔），
 --- 由网页「设置」面板通过 set_settings 请求写入；缺省值见 Store.SCAN_DEFAULTS。
 Store.SETTINGS_NAME = "scan"
-Store.SCAN_DEFAULTS = { storageScanMs = 1200, inputScanMs = 2000 }
+--- 缺省扫描间隔（1.6.15 调整）：
+---   storageScanMs = 8000  存储容器：**同一个容器从上次被扫描到下次被扫描的最小间隔**（毫秒）——
+---                         不足这个间隔就不再读它（主控因此少读外设、省性能）；搬运/整理等
+---                         确需最新数据时会强制重读（见 Containers:listPeripheral 的 force 参数）。
+---   inputScanMs   = 1000  输入容器：排空扫描的节奏（毫秒）——每隔这么久看一次输入容器，
+---                         把里面的物品/流体搬进存储容器。
+Store.SCAN_DEFAULTS = { storageScanMs = 8000, inputScanMs = 1000 }
 Store.SCAN_LIMITS = { min = 250, max = 600000 }
 
 local VALID_ROLES = { storage = true, interaction = true, output = true, input = true }

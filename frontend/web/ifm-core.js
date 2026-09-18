@@ -9,7 +9,7 @@
     // ===================== 常量 =====================
     // 前端版本号：必须与后端 backend/IFMMaster.lua 里的 IFM_VERSION 完全一致。
     // 连上服务端后会比对 status.version，不一致就弹警告并主动停止连接（见 ifm-net.js）。
-    const IFM_CLIENT_VERSION = '1.6.14';
+    const IFM_CLIENT_VERSION = '1.6.15';
     const DEFAULT_RELAY = 'wss://itty.ws/c/';
     const API_BASE = 'https://blocksitems.com/api/v1';
     const API_ORIGIN = 'https://blocksitems.com';
@@ -265,7 +265,9 @@
             settingsTitle: '设置',
             settingsStorageScan: '存储容器扫描间隔（毫秒）',
             settingsInputScan: '输入容器扫描间隔（毫秒）',
-            settingsHint: '扫描间隔越大，主控读外设越少、越省性能；越小则库存/输入容器变化越快被看到。范围 250 ~ 600000 毫秒。',
+            settingsStorageHint: '同一存储容器从上次被扫描到下次被扫描的最小间隔；越大主控读外设越少、越省性能，搬运/整理需要最新数据时会强制重读。',
+        settingsInputHint: '输入容器的排空扫描节奏：每隔这么久看一次输入容器，把里面的物品/流体搬进存储容器。',
+        settingsHint: '单位毫秒，范围 250 ~ 600000；保存后立即生效并写入 config.json。',
             settingsSaved: '已保存扫描间隔（存储 {storage}ms / 输入 {input}ms）',
             missingDelete: '删除该外设对应的定义',
             missingDeleted: '已删除定义「{name}」',
@@ -427,7 +429,9 @@
             settingsTitle: 'Settings',
             settingsStorageScan: 'Storage container scan interval (ms)',
             settingsInputScan: 'Input container scan interval (ms)',
-            settingsHint: 'Longer intervals read peripherals less often (lighter on the master); shorter intervals make stock / input container changes show up sooner. Range 250 ~ 600000 ms.',
+            settingsStorageHint: 'Minimum interval between two scans of the same storage container: the longer it is, the less the master reads peripherals; moves/sorting still force a fresh read when they need current data.',
+        settingsInputHint: 'Drain scan interval for input containers: how often the master looks at them and moves their contents into storage containers.',
+        settingsHint: 'In milliseconds, range 250 ~ 600000; applied immediately and stored in config.json.',
             settingsSaved: 'Scan intervals saved (storage {storage}ms / input {input}ms)',
             missingDelete: 'Delete the definition behind this missing peripheral',
             missingDeleted: 'Deleted definition "{name}"',

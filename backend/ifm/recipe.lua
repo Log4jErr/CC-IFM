@@ -2272,9 +2272,9 @@ end
 --- 参与库存统计与后续合成，不需要手动开容器工具搬。
 --- 节奏与代扫限流配合：每 INPUT_DRAIN_INTERVAL 毫秒扫一轮，每轮最多搬 INPUT_DRAIN_OPS 次
 --- （每次搬运都是 pushItem/pushFluid，可能交给 worker；pending 时下轮继续）。
-local INPUT_DRAIN_INTERVAL = 2000
+local INPUT_DRAIN_INTERVAL = 1000
 
---- 应用「输入容器扫描间隔」设置（毫秒）：网页「设置」面板可改，缺省 2000
+--- 应用「输入容器扫描间隔」设置（毫秒）：网页「设置」面板可改，缺省 1000（1.6.15 调整）
 function Recipe:applyScanSettings(inputScanMs)
     local value = tonumber(inputScanMs)
     if value and value > 0 then

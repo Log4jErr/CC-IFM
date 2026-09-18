@@ -39,6 +39,7 @@ IFMMaster.lua
 IFMWorker.lua
 ```
 主从节点之间会自动发现，所以不需要你进行其他干预。
+- **主控与从节点的版本必须完全一致**：版本号对不上时，两边互相拒绝执行搬运/查询（主控不派活、从节点拒绝执行并在屏幕上提示），网页上的从节点卡片也会标红。升级时把所有计算机一起升到同一版本。
 
 ## 网页终端
 - 浏览器打开[这个页面](https://log4jerr.github.io/CC-IFM/frontend/)，这就是网页终端。
@@ -85,6 +86,7 @@ IFMMaster --room <房间号>
 shell.run("bg", "IFMWorker.lua")
 ```
 - 改了后端源码之后重新编译：`python backend/build.py`，产物是 `backend/ifm_bundle.lua`。
+- 容器扫描间隔在网页「设置」面板里调：存储容器缺省 **8000ms**，含义是**同一个容器从上次被扫描到下次被扫描的最小间隔**（搬运/整理需要最新数据时会强制重读）；输入容器缺省 **1000ms**，是输入容器「排空扫描」的节奏。改完立即生效，并写入 `config.json`。
 
 ## 限制
 - 由于 CC:Tweaked 的限制，计算机所在区块必须保持加载，否则脚本会停摆（记得准备区块加载手段）。
@@ -92,7 +94,7 @@ shell.run("bg", "IFMWorker.lua")
 - 读容器是阻塞调用（有线网络上每个容器约 1 个服务器刻），容器很多时扫描会变慢，可以调大扫描间隔，或者添加更多从节点。
 
 ## 小工具
-- backend/tools下是一些其他的CC脚本，提供一些用得着的功能。
+- backend/tools下是一些其他的CC脚本，提供一些用得着的功能。这些脚本**各自独立运行**（不依赖 IFM 本体、也不进 bundle），而且提示信息只用 ASCII 英文 —— CC 终端字体没有中日韩字形，非 ASCII 会显示成乱码。
 
 ### netsync
 - 你有1个主控和一大堆从节点，现在IFM版本更新了，一个个去更新可太麻烦了。工具脚本netserver和netsync是成对使用的，用于自动同步文件。
@@ -144,6 +146,7 @@ After it starts, the room name is printed on screen — note it down, it is the 
 IFMWorker.lua
 ```
 Master and workers discover each other automatically, no further action needed.
+- **Master and workers must run exactly the same version**: when the version strings differ they refuse to run moves/queries for each other (the master stops dispatching, the worker refuses and logs it, and the worker card is flagged in the web UI). Update every computer together.
 
 ## Web terminal
 - The web client is a static page: deploy `frontend/` to GitHub Pages (or any static host) and open it, or serve it locally for development:
@@ -195,9 +198,10 @@ IFMMaster --room <room name>
 shell.run("bg", "IFMWorker.lua")
 ```
 - Rebuild the backend after changing its source: `python backend/build.py` (writes `backend/ifm_bundle.lua`).
+- Container scan intervals live in the web **Settings** panel: the storage container one defaults to **8000 ms** and means *the minimum interval between two scans of the same container* (moves/sorting force a fresh read when they need current data); the input container one defaults to **1000 ms** and is the pace of the input-container drain scan. Changes apply immediately and are stored in `config.json`.
 
 ## Tools
-- `backend/tools/` holds a few extra CC scripts that provide some handy utilities.
+- `backend/tools/` holds a few extra CC scripts that provide some handy utilities. Each of them runs **standalone** (they do not depend on IFM itself and are not part of the bundle) and prints ASCII English only, because the CC terminal font has no CJK glyphs and non-ASCII text would show up as garbage.
 
 ### netsync
 - You have one master computer plus a pile of workers, and IFM just released a new version — updating them one by one is a pain. The `netserver` / `netsync` pair syncs files automatically.

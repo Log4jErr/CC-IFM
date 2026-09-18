@@ -49,10 +49,10 @@ local version = 0
 -- ==========================================
 
 local function usage()
-    print("NetSync 客户端")
-    print("用法: netsync <name>")
-    print("  <name>  服务端名称, 仅允许字母 / 数字 / 下划线 / 连字符")
-    print("示例: netsync alpha")
+    print("NetSync client")
+    print("usage: netsync <name>")
+    print("  <name>  server name (letters / digits / underscore / hyphen only)")
+    print("example: netsync alpha")
 end
 
 -- 校验名称, 避免路径分隔符等字符混入文件名
@@ -120,7 +120,7 @@ local function detachModem(reason)
             modem.close(ANNOUNCE_CHANNEL)
             modem.close(myChannel)
         end)
-        log("已释放 modem(%s): %s", tostring(reason or "detach"), tostring(modemSide or "?"))
+        log("released modem(%s): %s", tostring(reason or "detach"), tostring(modemSide or "?"))
     end
     modem = nil
     modemSide = nil
@@ -140,7 +140,7 @@ local function attachModem()
     myChannel = idChannel(os.getComputerID())
     modem.open(ANNOUNCE_CHANNEL)
     modem.open(myChannel)
-    log("modem 就绪: %s  本机通道=%d", tostring(side), myChannel)
+    log("modem ready: %s  local channel=%d", tostring(side), myChannel)
     return true
 end
 
@@ -152,7 +152,7 @@ local function handlePeripheralEvent(event, side)
     if event == "peripheral_detach" then
         if modem and side == modemSide then
             detachModem("unplugged")
-            log("检测到 modem 被拔出, 等待重新插入...")
+            log("modem unplugged, waiting for it to be plugged back in...")
             return true
         end
         return false
@@ -210,7 +210,7 @@ local function saveLocalVersion(newVersion)
     fs.makeDir(STATE_DIR)
     local file = fs.open(versionPath(), "w")
     if not file then
-        error("无法写入版本文件: " .. versionPath(), 0)
+        error("cannot write version file: " .. versionPath(), 0)
     end
     file.write(tostring(newVersion))
     file.close()
@@ -276,7 +276,7 @@ local function requestList(server)
             return reply.files
         end
         if attempt < MAX_ATTEMPTS then
-            log("请求文件清单失败(第 %d 次), 重试中...", attempt)
+            log("failed to request the file list (attempt %d), retrying...", attempt)
         end
     end
     return nil
@@ -305,7 +305,7 @@ local function fetchFile(server, entry, index, total)
         local data = nil
         for attempt = 1, MAX_ATTEMPTS do
             if not modem then
-                log("modem 已断开, 放弃本次同步(磁盘未改动)")
+                log("modem disconnected, aborting this sync (disk untouched)")
                 return nil
             end
             modem.transmit(server.channel, myChannel, {
@@ -328,12 +328,12 @@ local function fetchFile(server, entry, index, total)
                 break
             end
             if attempt < MAX_ATTEMPTS then
-                log("下载 %s 偏移 %d 失败(第 %d 次), 重试中...", entry.path, written, attempt)
+                log("download of %s at offset %d failed (attempt %d), retrying...", entry.path, written, attempt)
             end
         end
         if not data then
             progressDone()
-            log("下载 %s 失败(已收到 %d/%d 字节)", entry.path, written, size)
+            log("download of %s failed (%d/%d bytes received)", entry.path, written, size)
             return nil
         end
         parts[#parts + 1] = data
@@ -364,40 +364,40 @@ local function writeAll(files, blobs)
         local dest = resolveDest(entry.path)
         local dir = dest and fs.getDir(dest) or ""
         if not dest then
-            log("跳过非法路径: %s", tostring(entry.path))
+            log("skipping unsafe path: %s", tostring(entry.path))
             skipped = skipped + 1
         elseif dir ~= "" and fs.exists(dir) and fs.getDrive(dir) == "rom" then
             -- /rom 只读: 跳过(服务端正常情况下不会下发这里的内容, 这里再兜一层)
-            log("跳过只读路径: %s", entry.path)
+            log("skipping read-only path: %s", entry.path)
             skipped = skipped + 1
         else
             local ok, err = pcall(function()
                 fs.makeDir(dir)
                 local handle, openErr = fs.open(dest, "w")
                 if not handle then
-                    error(tostring(openErr or "无法打开文件"), 0)
+                    error(tostring(openErr or "cannot open file"), 0)
                 end
                 handle.write(blobs[index] or "")
                 handle.close()
             end)
             if not ok then
-                log("写入 %s 失败: %s", tostring(dest), tostring(err))
+                log("writing %s failed: %s", tostring(dest), tostring(err))
                 return false
             end
             writtenCount = writtenCount + 1
         end
     end
-    log("写盘完成: %d 个文件(跳过 %d 个)", writtenCount, skipped)
+    log("wrote %d file(s) (skipped %d)", writtenCount, skipped)
     return true
 end
 
 -- 完整同步一次: 清单 -> 下载到内存 -> 写盘 -> 记版本号(顺序不可颠倒)
 local function syncFrom(server)
-    log("准备同步: 服务端 #%s 版本 %d, 本地版本 %d",
+    log("sync: server #%s version %d, local version %d",
         tostring(server.id), server.version, version)
     local files = requestList(server)
     if not files then
-        log("获取文件清单失败")
+        log("failed to get the file list")
         return false
     end
     local totalBytes = 0
@@ -405,20 +405,20 @@ local function syncFrom(server)
         totalBytes = totalBytes + (entry.size or 0)
     end
     if totalBytes > MAX_TOTAL_BYTES then
-        log("本次同步内容 %s 超过内存上限 %s, 已放弃(需要的话可调大脚本里的 MAX_TOTAL_BYTES)",
+        log("sync payload %s exceeds the memory limit %s, aborted (raise MAX_TOTAL_BYTES in this script if needed)",
             humanSize(totalBytes), humanSize(MAX_TOTAL_BYTES))
         return false
     end
-    log("文件清单: %d 个文件, 共 %s; 先全部下载到内存, 成功后才写盘", #files, humanSize(totalBytes))
+    log("file list: %d file(s), %s total; everything is downloaded into memory first and written to disk only afterwards", #files, humanSize(totalBytes))
 
     local blobs = fetchAll(server, files)
     if not blobs then
-        log("下载未完成, 磁盘保持原样(没有写入任何文件), 版本号也未更新")
+        log("download incomplete: disk untouched (no file written), version unchanged")
         return false
     end
 
     if not writeAll(files, blobs) then
-        log("写盘失败(文件被占用 / 磁盘已满?), 版本号未更新")
+        log("writing to disk failed (file in use / disk full?), version unchanged")
         return false
     end
 
@@ -435,14 +435,14 @@ name = args[1]
 
 if not validName(name) then
     usage()
-    error("缺少或非法的 <name>", 0)
+    error("missing or invalid <name>", 0)
 end
 
 version = readLocalVersion()
-log("客户端已启动: name=%s 本地版本=%d 本机通道=%d", name, version, idChannel(os.getComputerID()))
+log("client started: name=%s local version=%d local channel=%d", name, version, idChannel(os.getComputerID()))
 
 if not attachModem() then
-    log("暂未找到 modem, 等待插入(支持热插拔)...")
+    log("no modem found yet, waiting for one to be plugged in (hot-plug supported)...")
 end
 
 while true do
@@ -452,20 +452,20 @@ while true do
         handlePeripheralEvent(event, p1)
     end
 
-    log("等待服务端广播...")
+    log("waiting for a server broadcast...")
     local server, signal = waitForAnnounce()
     if signal == "peripheral" then
-        log("modem 状态发生变化, 重新开始...")
+        log("modem state changed, restarting...")
     elseif server then
-        log("发现服务端 #%s, 版本 %d > 本地版本 %d", tostring(server.id), server.version, version)
+        log("found server #%s: version %d > local version %d", tostring(server.id), server.version, version)
         if syncFrom(server) then
             version = server.version
-            log("同步完成, 版本 %d 已记录到 %s", version, versionPath())
-            log("重启计算机...")
+            log("sync complete: version %d recorded in %s", version, versionPath())
+            log("rebooting...")
             sleep(1)
             os.reboot()
         else
-            log("本次同步失败, 等待下一次广播后重试...")
+            log("sync failed, retrying after the next broadcast...")
             sleep(1)
         end
     end

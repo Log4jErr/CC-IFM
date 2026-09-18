@@ -119,7 +119,7 @@ if workerName == nil or workerName == "" then
     workerName = "worker-#" .. tostring(computerId)
 end
 
-local version = "1.6.14"
+local version = "1.6.15"
 
 --- 本机日志（屏幕上看得到，方便直接复制给主控看）
 local function workerLog(text)
@@ -599,6 +599,10 @@ local function handleMessage(message)
     if senderId then
         masterId = senderId
     end
+    --- 主控版本：welcome / job / query / detail 都会带，记下来用于“版本不一致就拒绝执行”
+    if type(message.version) == "string" and message.version ~= "" then
+        masterVersion = message.version
+    end
     lastMasterAt = os.epoch("utc")
     masterOnline = true
     if op == "hello" then
@@ -623,6 +627,24 @@ local function handleMessage(message)
             else
                 versionWarning = nil
             end
+        end
+        return
+    end
+    --- ===== 版本闸门 =====
+    --- 主控与 worker 的版本必须完全一致，否则**拒绝执行任何作业**。
+    --- 只在主控版本已知时判断（hello/pong/welcome 不受影响，否则两边连互相认识都做不到）。
+    if masterVersion and masterVersion ~= version then
+        local why = "version mismatch: master " .. tostring(masterVersion) .. " vs worker " .. tostring(version)
+        if op == "job" then
+            reply({ op = "error", id = message.id, moved = 0, error = why })
+        elseif op == "query" then
+            reply({ op = "query_result", id = message.id, ok = false, error = why })
+        elseif op == "detail" then
+            reply({ op = "detail_result", id = message.id, ok = false, error = why })
+        end
+        if lastVersionWarning ~= why then
+            lastVersionWarning = why
+            workerLog(why .. " - job refused; install the same build on master and worker")
         end
         return
     end

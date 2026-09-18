@@ -16,7 +16,7 @@ local args = { ... }
 --- 版本号：前端 web/ifm-core.js 里的 IFM_CLIENT_VERSION 必须与此保持一致。
 --- 网页连上后会比对两边的版本号，不一致时弹出警告并主动停止连接，
 --- 避免“新前端 + 旧后端”（或反过来）产生难以定位的怪问题。
-local IFM_VERSION = "1.6.14"
+local IFM_VERSION = "1.6.15"
 
 local DEFAULT_RELAY = "wss://itty.ws/c/"
 
@@ -233,8 +233,10 @@ local function applyScanSettings()
     engine:applyScanSettings(settings.inputScanMs)
     return settings
 end
+--- 1.6.15：缺省 存储 8000ms（同一容器两次扫描的最小间隔）/ 输入 1000ms
 local scanSettings = applyScanSettings()
-log("Container scan settings: storage=%dms input=%dms (config.json -> settings.scan)",
+log("Container scan settings: storage=%dms (min interval between two scans of the same " ..
+    "container) input=%dms (input container drain interval) (config.json -> settings.scan)",
     scanSettings.storageScanMs, scanSettings.inputScanMs)
 
 --- 房间号：保存在 config.json 顶层的 room 字段里（不再使用 room.txt）

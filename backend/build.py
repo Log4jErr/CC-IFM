@@ -525,6 +525,42 @@ def run_reserved_word_check(files):
     return files
 
 
+def run_tools_check(base_dir):
+    """检查 tools/*.lua（netsync / netserver / crafter 这些**单独运行**的脚本）。
+
+    它们不参与打包，但同样要守规矩（用户第 4 项要求）：
+      * 代码与字符串只允许 ASCII —— 脚本把提示 print 到 CC 终端，终端字形没有中日韩字符，
+        而且 \\uXXXX 转义在 CC:T 的 Lua 5.1 下不会被还原（会原样打印），所以这里必须写英文；
+      * 语法必须是合法的 Lua 5.1（这些脚本运行时没有 bundle 兜底，一报错就整台机器卡住）。
+    """
+    tool_dir = os.path.join(base_dir, "tools")
+    if not os.path.isdir(tool_dir):
+        return
+    files = [("tools/" + name, read_text(os.path.join(tool_dir, name)))
+             for name in sorted(os.listdir(tool_dir)) if name.endswith(".lua")]
+    if not files:
+        return
+    ascii_source = load_ascii_checker()
+    problems = []
+    for rel, content in files:
+        bad = ascii_source.find_violations(content)
+        if not bad:
+            continue
+        problems.append("%s: %d 处非 ASCII（代码/字符串）" % (rel, len(bad)))
+        for line, col, ch, kind in bad[:5]:
+            problems.append("    第 %d 行第 %d 列 [%s] %r" % (line, col, ch, kind))
+        if len(bad) > 5:
+            problems.append("    ...（其余 %d 处省略）" % (len(bad) - 5))
+    if problems:
+        raise SystemExit(
+            "构建中止：tools/ 下的脚本是单独运行、直接 print 到 CC 终端的，"
+            "代码与字符串只允许 ASCII（注释不受限）。\n"
+            "请把这些提示写成英文，不要用 \\uXXXX 转义（Lua 5.1 不会还原，会原样打印）：\n"
+            + "\n".join(problems))
+    print("tools 检查：通过（%d 个独立脚本，代码与字符串均为 ASCII）" % len(files))
+    run_lua_syntax_check(files, base_dir)
+
+
 def run_ascii_check(files, fix=False):
     """ASCII 检查（代码/字符串必须是 ASCII）——构建流程的强制步骤。
 
@@ -583,6 +619,9 @@ def build_bundle(base_dir, output_path, keep_comments=False, fix_ascii=False):
     files = run_method_shadow_check(files)
     # Lua 语法检查（方法调用参数 / 块结构 / 字符串收尾）：本机没有 lua 可执行文件，这里是轻量替代
     files = run_lua_syntax_check(files)
+    # tools/ 下的脚本是**单独运行**的（不进 bundle），但也要过 ASCII 与语法检查：
+    # 它们直接 print 到 CC 终端，字符串里的非 ASCII 会变成乱码（用户第 4 项要求）。
+    run_tools_check(base_dir)
     raw_size = sum(len(content.encode("utf-8")) for _, content in files)
     extra_count = len(extras)
     if not keep_comments:

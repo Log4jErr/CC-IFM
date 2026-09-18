@@ -227,8 +227,14 @@ function Transfer:workerUsable(worker)
     if type(worker) ~= "table" then
         return false
     end
+    --- 主控自己都不知道版本（理论上不该发生）：**一律不派活** ——
+    --- 以前这里返回 true，等于“版本没设好时所有 worker 都能用”，版本不匹配就拦不住了。
     if not self.version then
-        return true
+        if not self.versionMissingLogged then
+            self.versionMissingLogged = true
+            self.log("Master version is not set (setContext was never called): workers are disabled")
+        end
+        return false
     end
     --- 还没上报过版本（刚连上、或老版本 worker 不会报）→ 先不用它，等它的 state 到了再说
     if type(worker.version) ~= "string" or worker.version == "" then
@@ -346,11 +352,21 @@ end
 --- 所以发信人（主控电脑号）放在 sender 字段里 —— 以前没有这个字段，worker 会把
 --- “minecraft:chest_1” 当成主控的电脑号记下来（屏幕上 master 行显示成一串容器名）。
 function Transfer:sendTo(worker, job)
+    --- 兜一层：调用方本该先过 pickWorkerFor，这里再确认一次版本一致 ——
+    --- 版本不匹配的 worker 绝不下发（用户实测“版本不匹配的 worker 还在被使用”就是这样漏出来的）
+    if not self:workerUsable(worker) then
+        self.log("Refusing to send job %s to worker #%s (version mismatch: worker=%s master=%s)",
+            tostring(job.id), tostring(worker and worker.id),
+            tostring(worker and worker.version), tostring(self.version))
+        return false
+    end
     return self:send({
         proto = Transfer.PROTOCOL,
         op = "job",
         target = worker.id,
         sender = os.getComputerID(),
+        --- 主控版本：worker 侧也会核对，不一致就直接拒绝执行
+        version = self.version,
         id = job.id,
         action = job.action,
         from = job.from,
@@ -813,11 +829,17 @@ end
 --- 把一条查询发给指定 worker
 --- （query 里的 containers 是外设名清单，from 这里用作发信人：与 job 不同，注意别混）
 function Transfer:sendQuery(worker, id, spec)
+    --- 版本不一致的 worker 不派查询（worker 侧也会拒绝，这里是第一道闸）
+    if not self:workerUsable(worker) then
+        return false
+    end
     return self:send({
         proto = Transfer.PROTOCOL,
         op = "query",
         target = worker.id,
         sender = os.getComputerID(),
+        --- 主控版本：worker 侧核对，不一致直接拒绝执行
+        version = self.version,
         id = id,
         --- 一条查询只查一个容器（worker 只认这个字段，见 IFMWorker.lua 的 runQuery）
         container = spec.container,
@@ -910,6 +932,7 @@ function Transfer:sendDetail(worker, request)
     return self:send({
         proto = Transfer.PROTOCOL,
         op = "detail",
+        version = self.version,
         target = worker.id,
         sender = os.getComputerID(),
         id = request.id,

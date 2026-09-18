@@ -47,11 +47,11 @@ local TOP_LEVEL_SKIP = { rom = true, disk = true }   -- 同步根目录下不下
 -- ==========================================
 
 local function usage()
-    print("NetSync 服务端")
-    print("用法: netserver [--update] <name>")
-    print("  --update  版本号 +1, 然后开始提供服务")
-    print("  <name>    服务端名称, 仅允许字母 / 数字 / 下划线 / 连字符")
-    print("示例: netserver --update alpha")
+    print("NetSync server")
+    print("usage: netserver [--update] <name>")
+    print("  --update  bump the version number, then start serving")
+    print("  <name>    server name (letters / digits / underscore / hyphen only)")
+    print("example: netserver --update alpha")
 end
 
 -- 校验名称, 避免路径分隔符等字符混入目录名
@@ -89,7 +89,7 @@ local function writeVersion(path, version)
     fs.makeDir(fs.getDir(path))
     local file = fs.open(path, "w")
     if not file then
-        error("无法写入版本文件: " .. path, 0)
+        error("cannot write version file: " .. path, 0)
     end
     file.write(tostring(version))
     file.close()
@@ -187,7 +187,7 @@ local function sendList(targetChannel, clientId)
         version = version,
         files = files,
     })
-    log("客户端 #%s 请求文件清单: %d 个文件", tostring(clientId), #files)
+    log("client #%s requested the file list: %d file(s)", tostring(clientId), #files)
 end
 
 -- 回复一个数据块
@@ -196,9 +196,9 @@ local function sendFile(targetChannel, clientId, rel, offset)
     local data = abs and (readChunk(abs, offset, CHUNK_SIZE) or "") or ""
     if offset == 0 then
         if abs then
-            log("客户端 #%s 开始下载 %s", tostring(clientId), rel)
+            log("client #%s started downloading %s", tostring(clientId), rel)
         else
-            log("客户端 #%s 请求的文件不存在: %s", tostring(clientId), tostring(rel))
+            log("client #%s asked for a missing file: %s", tostring(clientId), tostring(rel))
         end
     end
     -- 文件不存在时返回空数据块, 客户端会判定失败并稍后重试
@@ -225,7 +225,7 @@ local function clientOf(channel, clientId)
     if not entry then
         entry = { id = clientId, queue = {}, served = 0, bytes = 0, lastServe = 0 }
         clients[channel] = entry
-        log("新客户端 #%s 接入(回复通道 %d)", tostring(clientId), channel)
+        log("new client #%s joined (reply channel %d)", tostring(clientId), channel)
     end
     entry.id = clientId or entry.id
     entry.lastSeen = os.epoch("utc")
@@ -246,7 +246,7 @@ local function sweepClients(now)
     for channel, entry in pairs(clients) do
         if entry.queue[1] == nil and now - (entry.lastSeen or now) > CLIENT_TIMEOUT_MS then
             if entry.served > 0 then
-                log("客户端 #%s 结束: 服务 %d 个请求", tostring(entry.id), entry.served)
+                log("client #%s finished: served %d request(s)", tostring(entry.id), entry.served)
             end
             clients[channel] = nil
         end
@@ -306,13 +306,13 @@ for _, value in ipairs(args) do
         name = value
     else
         usage()
-        error("参数过多: " .. tostring(value), 0)
+        error("too many arguments: " .. tostring(value), 0)
     end
 end
 
 if not validName(name) then
     usage()
-    error("缺少或非法的 <name>", 0)
+    error("missing or invalid <name>", 0)
 end
 
 root = fs.combine(DATA_ROOT, name)
@@ -327,19 +327,19 @@ end
 -- 首次运行时创建同步根目录(只创建, 不删除任何文件)
 if not fs.exists(root) then
     fs.makeDir(root)
-    log("已创建同步根目录: %s", root)
+    log("created the sync root directory: %s", root)
 end
 
 version = readVersion(versionPath)
 if update then
     version = version + 1
-    log("版本号自增为 %d", version)
+    log("version bumped to %d", version)
 end
 writeVersion(versionPath, version)
 
 modem = peripheral.find("modem")
 if not modem then
-    error("未找到 modem, 请先给本电脑安装并连接无线/有线 modem", 0)
+    error("no modem found: install and connect a wireless/wired modem first", 0)
 end
 
 myChannel = idChannel(os.getComputerID())
@@ -357,12 +357,12 @@ local function announce()
 end
 
 local fileCount = #collectFiles(root, selfPath)
-log("服务端已启动: name=%s version=%d 本机通道=%d", name, version, myChannel)
-log("同步根目录: %s (%d 个文件)", root, fileCount)
+log("server started: name=%s version=%d local channel=%d", name, version, myChannel)
+log("sync root: %s (%d file(s))", root, fileCount)
 if fileCount == 0 then
-    log("提示: 同步根目录为空, 请把要分发的文件放入该目录")
+    log("note: the sync root is empty - put the files you want to distribute into it")
 end
-log("每 %d 秒广播一次, 等待客户端请求...", ANNOUNCE_INTERVAL)
+log("broadcasting every %d second(s), waiting for clients...", ANNOUNCE_INTERVAL)
 
 announce()
 local timer = os.startTimer(ANNOUNCE_INTERVAL)
@@ -386,10 +386,10 @@ while true do
                 -- 两边同时广播时让“电脑 ID 较大”的一方退出, 这样只会死一台, 另一台继续服务。
                 if tostring(message.id) > tostring(os.getComputerID()) then
                     error(string.format(
-                        "网络内已存在同名服务端 name=%s (电脑 #%s), 本机为 #%d; 请改用别的名称或停掉另一台",
+                        "another server with the same name already exists: name=%s (computer #%s), this one is #%d; use another name or stop the other computer",
                         name, tostring(message.id), os.getComputerID()), 0)
                 else
-                    log("检测到同名服务端 #%s(版本 %s): 本机 ID 更小, 继续服务, 对方应当会自行退出",
+                    log("same-name server #%s detected (version %s): this computer has the lower ID and keeps serving; the other side should exit",
                         tostring(message.id), tostring(message.version))
                 end
             else

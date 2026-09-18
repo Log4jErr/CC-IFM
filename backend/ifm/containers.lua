@@ -89,7 +89,9 @@ function Containers.new(opts)
     --   标签扫描之间通常隔了不止 200ms，等于每次都重扫一遍，主循环被扫描拖死（网页就“连不上”了）。
     --   安全前提：pushItem / pushFluid 会把动过的两个外设记进 self.dirty，invalidate() 只作废它们，
     --   所以“刚搬过的容器”下一次读取一定是新的，引擎不会基于过期槽位做决定。
-    self.listTtl = opts.listTtl or 1200
+    --- 1.6.15：缺省 8000 —— 语义就是“同一个容器从上次被扫描到下次被扫描的**最小间隔**”，
+    --- 不足这个间隔就不会再读它（网页「设置」面板可改，见 Containers:applyScanSettings）。
+    self.listTtl = opts.listTtl or 8000
     --- 容器扫描卸载（worker 代读容器，见 ifm/transfer.lua 的 Transfer:scanRequest）：
     --- 主控自己读一遍全部容器要 1 个服务器刻/个（19 个 ≈950ms），这部分交给 worker 后
     --- 主控只等 modem 消息；没有 worker 时行为与以前完全一样（本机读）。

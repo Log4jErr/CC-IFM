@@ -1105,26 +1105,33 @@
     }
 
     // ===== 设置面板：容器扫描间隔（1.6.11，任务 8）=====
-    // 存储容器扫描间隔 = 主控读容器内容的缓存时长；输入容器扫描间隔 = 输入容器“排空扫描”的节奏。
+    // 存储容器扫描间隔 = **同一个容器从上次被扫描到下次被扫描的最小间隔**（列表缓存时长，缺省 8000）；
+    // 输入容器扫描间隔 = 输入容器“排空扫描”的节奏（缺省 1000）。
     // 两个值都由服务端持久化（config.json -> settings.scan）并通过 status.scanSettings 回传。
     function renderSettings() {
         const body = el('settingsBody');
         if (!body) return;
         const settings = (status && status.scanSettings) || {};
-        const storage = Number(settings.storageScanMs) || 1200;
-        const input = Number(settings.inputScanMs) || 2000;
-        const signature = storage + '/' + input;
+        const storage = Number(settings.storageScanMs) || 8000;
+        const input = Number(settings.inputScanMs) || 1000;
+        // 签名带上语言：中/英切换时按新语言重画（只比数值的话切语言不刷新，面板会停在旧语言）
+        const signature = lang + '|' + storage + '/' + input;
         if (body.getAttribute('data-scan') === signature) return;             // 值没变：不重画
         if (document.activeElement && body.contains(document.activeElement)) return;  // 正在输入：不打断
         body.setAttribute('data-scan', signature);
+        const hint = function (key) {
+            return '<div class="muted" style="margin:-2px 0 8px 0">' + escapeHtml(t(key)) + '</div>';
+        };
         body.innerHTML =
             '<div class="editor-row"><label for="settingsStorageMs">' + escapeHtml(t('settingsStorageScan')) +
             '</label><input type="number" id="settingsStorageMs" min="250" max="600000" step="50" value="' +
             escapeHtml(String(storage)) + '"></div>' +
+            hint('settingsStorageHint') +
             '<div class="editor-row"><label for="settingsInputMs">' + escapeHtml(t('settingsInputScan')) +
             '</label><input type="number" id="settingsInputMs" min="250" max="600000" step="50" value="' +
             escapeHtml(String(input)) + '"></div>' +
-            '<div class="muted" style="margin:-2px 0 8px 0">' + escapeHtml(t('settingsHint')) + '</div>' +
+            hint('settingsInputHint') +
+            hint('settingsHint') +
             '<button class="btn-pixel primary" type="button" id="settingsSaveBtn"><i class="fa fa-check"></i> ' +
             escapeHtml(t('save')) + '</button>';
         const button = el('settingsSaveBtn');
@@ -1216,6 +1223,7 @@
             markDirty('peripherals');
             markDirty('machines');
             markDirty('deliveries');
+            markDirty('status');            // 设置面板的标题/说明也要跟着换语言（renderSettings）
             scheduleRender();
         });
         el('sendBtn').addEventListener('click', sendPendingItems);
