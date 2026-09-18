@@ -40,11 +40,7 @@ IFMWorker.lua
 主从节点之间会自动发现，所以不需要你进行其他干预。
 
 ## 网页终端
-- 网页终端是纯静态页面：把 `frontend/` 目录部署到 GitHub Pages（或任意静态托管）后打开它即可（仓库里的 raw 链接不能直接用：页面要加载同目录下的 js/css/图标素材）。当前仓库的 Pages 地址是 https://log4jerr.github.io/CC-IFM/ ，本地调试也可以用：
-```
-cd frontend
-python serve.py            # http://localhost:8000/index.html
-```
+- 网页终端是纯静态页面：把 `frontend/` 目录发布到一个静态托管上（例如用一个专门的分支/工作流把它发布到 GitHub Pages，或者本地 `python serve.py`），然后用浏览器打开它。注意仓库里的 raw 链接不能直接用 —— 页面还要加载同目录下的 js/css/图标素材。
 - 你需要在网页终端输入房间号以连接到你游戏内的IFM系统。
 
 ## 能做什么
