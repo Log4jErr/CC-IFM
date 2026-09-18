@@ -246,6 +246,7 @@
         iconExportIndexLang = null;
         iconExportUnavailable = false;
         iconExportLoadingLang = null;
+        Object.keys(iconExportLangCache).forEach(function (code) { delete iconExportLangCache[code]; });
         iconExportFailedFiles.clear();
         try { localStorage.removeItem(MISSING_META_STORAGE); } catch (err) { /* ignore */ }
     }
@@ -284,10 +285,11 @@
     const ICON_EXPORTS_BASE = 'icon-exports/';
     const ICON_EXPORTS_META_DIR = 'icon-exports-metadata/';
     const ICON_EXPORT_LANGS = ['zh', 'en'];
-    let iconExportIndex = null;          // Map: "item|minecraft:oak_log" -> { plain, variants, name }
-    let iconExportIndexLang = null;      // 这份索引是哪门语言的元数据建出来的（决定名字能不能用）
+    let iconExportIndex = null;          // 当前展示用的索引（图标来源）
+    let iconExportIndexLang = null;      // 这份索引是哪门语言的元数据（决定名字能不能用）
     let iconExportLoadingLang = null;    // 正在加载的语言（避免重复请求）
     let iconExportUnavailable = false;   // 所有语言的文件都不存在 → 整条链路退回接口图标
+    const iconExportLangCache = {};      // lang -> { index: Map } / { failed: true }（含负缓存）
     const iconExportFailedFiles = new Set();   // 已 404 的导出图片（避免反复请求）
 
     function iconExportUrl(file) {
@@ -339,17 +341,32 @@
 
     function loadIconExports() {
         if (iconExportUnavailable) return;
-        const order = iconExportLanguageOrder();
-        const wanted = order[0];
-        if (iconExportIndex && iconExportIndexLang === wanted) return;   // 当前语言的元数据已经有了
-        if (iconExportLoadingLang) return;                              // 正在加载，别重复请求
+        const wanted = (lang === 'en') ? 'en' : 'zh';
+        const current = iconExportLangCache[wanted];
+        if (current && current.index) {          // 当前语言的已经拿过：直接切过去（不再下载）
+            iconExportIndex = current.index;
+            iconExportIndexLang = wanted;
+            return;
+        }
+        if (current && current.failed) return;   // 当前语言确认没有这个文件：保持现状（借别的语言的图标）
+        if (iconExportLoadingLang) return;       // 正在加载，别重复请求
+
+        // 请求顺序：当前语言优先，其次其它语言（其它语言只借图标）；
+        // 已经拿过/确认没有的语言直接跳过 —— 这样“当前语言没有元数据文件”不会每次重画都重新下载一遍。
+        const order = iconExportLanguageOrder().filter(function (code) {
+            const cached = iconExportLangCache[code];
+            return !(cached && (cached.index || cached.failed));
+        });
+        if (order.length === 0) {
+            iconExportUnavailable = true;
+            console.info('[IFM] 没有可用的 icon-exports 元数据（' + ICON_EXPORTS_META_DIR +
+                iconExportLanguageOrder().join('.json / ') + '.json）：图标继续用 blocksitems 接口 / 名称兜底');
+            return;
+        }
 
         const tryLanguage = function (position) {
             if (position >= order.length) {
-                iconExportUnavailable = true;
                 iconExportLoadingLang = null;
-                console.info('[IFM] 没有可用的 icon-exports 元数据（' + ICON_EXPORTS_META_DIR + order.join('.json / ') +
-                    '.json）：图标继续用 blocksitems 接口 / 名称兜底');
                 return;
             }
             const code = order[position];
@@ -363,15 +380,18 @@
                 .then(function (body) {
                     const meta = body && asArray(body.meta);
                     if (meta.length === 0) throw new Error('元数据为空');
-                    iconExportIndex = buildIconExportIndex(meta, code);
+                    const index = buildIconExportIndex(meta, code);
+                    iconExportLangCache[code] = { index: index };
+                    iconExportIndex = index;
                     iconExportIndexLang = code;
                     iconExportLoadingLang = null;
-                    console.info('[IFM] icon-exports 元数据已加载：' + url + '（' + iconExportIndex.size + ' 个物品图标' +
+                    console.info('[IFM] icon-exports 元数据已加载：' + url + '（' + index.size + ' 个物品图标' +
                         (code === wanted ? '，物品名也用这份' : '，只借图标：当前语言没有对应文件') + '）');
                     ['resources', 'peripherals', 'processes', 'deliveries', 'machines'].forEach(markDirty);
                     scheduleRender();
                 })
                 .catch(function (err) {
+                    iconExportLangCache[code] = { failed: true };   // 负缓存：不再反复请求
                     iconExportLoadingLang = null;
                     console.info('[IFM] icon-exports 元数据不可用（' + url + '：' + ((err && err.message) || err) + '）');
                     tryLanguage(position + 1);
