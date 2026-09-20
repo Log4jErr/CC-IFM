@@ -3229,8 +3229,13 @@ end
 --- 外设缺失的容器定义清单（网页高亮用；种类与外设能力不匹配也算缺失）。
 --- 用户第 1/2 项：**自动生成**的虚拟定义（turtle_crafter 的海龟容器）不列进来 ——
 --- 海龟下线时由 IFMMaster:syncTurtleCrafters 自动把它们撤掉，不是"用户定义缺失"。
+--- 用户第 2/3 项（本轮）：**机器直接引用的外设**也要列进来 —— 现场：关掉有线调制解调器再打开，
+--- 有线网络把外设重新编号（create:millstone_4 → create:millstone_6），机器的输入/输出列表里
+--- 还指着旧名字：以前它既不在缺失面板里，机器卡片上的外设芯片也不标红，网页上完全看不出问题。
+--- 只列"连容器定义都不存在"的名字（定义还在的走上面那条检查，不重复）。
 function Containers:missingPeripherals()
     local out = {}
+    local seen = {}
     for _, def in ipairs(self.Store:list("containers")) do
         if def.virtual ~= true then
             local defKind = self.Util.kindOfDef(def)
@@ -3249,12 +3254,49 @@ function Containers:missingPeripherals()
                 --- containerKind：网页端删除这条缺失定义时要带上的容器种类（item / fluid）
                 out[#out + 1] = { kind = "container", containerKind = defKind, name = def.name,
                     peripheral = def.peripheral }
+                seen["container\\1" .. tostring(def.name)] = true
             end
         end
     end
     for _, def in ipairs(self.Store:list("signals")) do
         if not self.Peripherals:exists(def.peripheral) then
             out[#out + 1] = { kind = "signal", name = def.name, peripheral = def.peripheral }
+            seen["signal\\1" .. tostring(def.name)] = true
+        end
+    end
+    --- 机器（machine 定义）直接引用的外设：容器定义不存在 + 外设也不在 ⇒ 这条引用是坏的。
+    if self.Store and type(self.Store.list) == "function" then
+        local machines = self.Store:list("machines") or {}
+        for _, machine in ipairs(machines) do
+            local function note(peripheralName, kind)
+                if type(peripheralName) ~= "string" or peripheralName == "" then
+                    return
+                end
+                if self.Peripherals:exists(peripheralName) then
+                    return
+                end
+                --- 同名容器定义还在的话，上面那条检查已经报过了（这里不重复）
+                if self.Store.findContainer and self.Store:findContainer(peripheralName, kind or "item") then
+                    return
+                end
+                local key = "machine\\1" .. peripheralName
+                if not seen[key] then
+                    seen[key] = true
+                    out[#out + 1] = { kind = "machine", containerKind = kind or "item",
+                        name = peripheralName, peripheral = peripheralName,
+                        machine = machine.name }
+                end
+            end
+            for _, listKey in ipairs({ "itemInputs", "fluidInputs", "itemOutputs", "fluidOutputs" }) do
+                local kind = string.find(listKey, "^fluid") and "fluid" or "item"
+                for _, name in ipairs(machine[listKey] or {}) do
+                    note(name, kind)
+                end
+            end
+            for _, signal in ipairs(machine.signals or {}) do
+                local peripheralName = type(signal) == "table" and signal.peripheral or signal
+                note(peripheralName, "item")
+            end
         end
     end
     return out

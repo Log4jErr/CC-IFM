@@ -208,6 +208,7 @@
             sendCountTitle: '发送 {name}', craftCountTitle: '合成 {name}',
             craftAmountHint: '填写想要的产物数量；不足一批按一批算',
             missingPeripheral: '外设缺失', current: '当前',
+            missingMachineRef: '机器「{machine}」引用的外设不存在',
             running: '进行中', waiting: '等待中', missing: '缺失', idle: '空闲', machineUsed: '并行占用',
             craftOnly: '只合成（不发送）', cancelProcess: '取消流程', processCanceled: '已取消流程',
             clearSendList: '已清空待发送列表', sent: '已提交发送请求', noOutputContainer: '请先定义 output 角色容器',
@@ -486,6 +487,7 @@
             sendCountTitle: 'Send {name}', craftCountTitle: 'Craft {name}',
             craftAmountHint: 'Amount of the product you want; a partial batch counts as one batch (2 per batch → asking 3 runs 2 batches)',
             missingPeripheral: 'Missing peripheral', current: 'Current',
+            missingMachineRef: 'Machine "{machine}" references a peripheral that is gone',
             running: 'Running', waiting: 'Waiting', missing: 'Missing', idle: 'Idle', machineUsed: 'Parallel usage',
             craftOnly: 'Craft only (no send)', cancelProcess: 'Cancel process', processCanceled: 'Process canceled',
             clearSendList: 'Send list cleared', sent: 'Send request submitted', noOutputContainer: 'Define an output container first',
@@ -1140,10 +1142,22 @@
     // 挤在一行里既看不出重点，也没法一眼扫。现在每个数字前放一个图标，含义全部移到悬停提示里
     // （图标与数字都带 title，鼠标停在谁上面都能看到它是什么）。
     function statusStatHtml(glyph, value, hint) {
-        return '<i class="fa ' + glyph + ' status-icon"' +
-            (hint ? ' title="' + escapeHtml(hint) + '"' : '') + '></i>' +
-            '<span class="status-value">' + escapeHtml(value === null || value === undefined ? '' : String(value)) +
-            '</span>';
+        const tip = hint
+            ? ' title="' + escapeHtml(hint) + '" data-tip-text="' + escapeHtml(hint) + '"'
+            : '';
+        return '<i class="fa ' + glyph + ' status-icon"' + tip + '></i>' +
+            '<span class="status-value"' + tip + '>' +
+            escapeHtml(value === null || value === undefined ? '' : String(value)) + '</span>';
+    }
+
+    /// 用户第 4 项（本轮）：只有内容真的变了才重写 innerHTML。
+    /// 原因：状态推送很密（有变化就推），每次推送都重建同一批节点时，浏览器的悬停提示
+    /// （title）永远等不到显示 —— 顶栏的图标指标就成了"悬停没有详情"。保留节点就不会。
+    function setHtmlIfChanged(node, html) {
+        if (!node || node.__ifmHtml === html) return node;
+        node.__ifmHtml = html;
+        node.innerHTML = html;
+        return node;
     }
 
     // IFMWorker 搬运卸载状态（顶部显示）：有 worker 时显示台数与在途任务，否则显示“本机搬运”
@@ -1155,7 +1169,7 @@
             const scan = info.scan || {};
             const workers = info.workers || 0;
             const pending = info.pending || 0;
-            node.innerHTML = statusStatHtml('fa-truck', workers, t('transferWorkersHint')) +
+            setHtmlIfChanged(node, statusStatHtml('fa-truck', workers, t('transferWorkersHint')) +
                 statusStatHtml('fa-hourglass-half', pending, t('transferInFlight', { pending: pending })) +
                 statusStatHtml('fa-magnifying-glass', scan.cached || 0, t('transferScanHint', {
                     cached: scan.cached || 0,
@@ -1163,7 +1177,7 @@
                     localOnly: scan.localOnly || 0,
                     blind: scan.blind || 0,
                     paused: scan.pauseLeft || 0
-                }));
+                })));
             node.title = t('transferHint', {
                 channel: info.channel,
                 done: info.done || 0,
@@ -1181,6 +1195,7 @@
             return;
         }
         node.innerHTML = info ? statusStatHtml('fa-desktop', t('transferNone'), t('transferHintNone')) : '';
+        node.__ifmHtml = node.innerHTML;
         node.title = t('transferHintNone');
         node.style.color = '';
     }
@@ -1264,6 +1279,7 @@
                 t('dispatchMode', { mode: dispatchModeLabel(info.mode), steps: fmtCount(info.steps || 0) })) +
             statusStatHtml('fa-forward-step', fmtCount(info.steps || 0), t('dispatchSteps')) +
             short.join('');
+        node.__ifmHtml = node.innerHTML;
         node.title = t('dispatchHint', {
             mode: dispatchModeLabel(info.mode), steps: info.steps || 0,
             last: Math.round((info.lastMs || 0) * 10) / 10,

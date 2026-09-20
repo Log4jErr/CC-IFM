@@ -55,14 +55,20 @@
         node.textContent = pendingCount > 0 ? t('pendingRequests', { n: pendingCount }) : '';
     }
 
-    // 用户第 3 项：房间号 / 中继地址在标题行里一律显示成 ****（截图、录屏、直播时不泄露），
-    // 鼠标悬停才显示真实值（title 里放原文）。登录页的输入框保持明文 —— 那个是要编辑的。
-    function maskText(id, value) {
+    // 用户第 3/4 项：房间号 / 中转地址在标题行里显示成 ****（截图、录屏、直播时不泄露），
+    // 鼠标悬停显示真实值：title 走浏览器原生提示，data-tip-text 走网页的即时提示框
+    // （原生提示要等一秒左右，密集推送还会把它顶掉 —— 见 setHtmlIfChanged）。
+    function maskText(id, value, shown) {
         const node = el(id);
         if (!node) return;
         const text = (value === null || value === undefined) ? '' : String(value);
-        node.textContent = text ? '****' : '';
+        node.textContent = text ? (shown || '****') : '';
         node.title = text;
+        if (text) {
+            node.setAttribute('data-tip-text', text);
+        } else {
+            node.removeAttribute('data-tip-text');
+        }
         node.classList.toggle('masked', text !== '');
     }
 
@@ -334,8 +340,16 @@
         setCookie('ifm_relay', relayBase, 365);
         setConnectionStatus('connecting');
         setText('loginError', '');
-        maskText('roomLabel', '#' + room);
-        maskText('relayLabel', relayBase);
+        // 用户第 4 项（本轮）：房间号与中转地址显示到**一起**（一个标签：****@****），
+        // 悬停显示真实值（title + 即时提示框）。原来的两个独立标签会被 flex 换行拆开。
+        maskText('roomLabel', '#' + room + ' @ ' + relayBase, '****@****');
+        const relayNode = el('relayLabel');
+        if (relayNode) {
+            relayNode.textContent = '';
+            relayNode.title = '';
+            relayNode.removeAttribute('data-tip-text');
+            relayNode.hidden = true;
+        }
         let socket;
         try {
             socket = new WebSocket(relayBase + encodeURIComponent(room));
@@ -480,17 +494,19 @@
             const scan = status ? status.tagScan : null;
             if (scan && scan.queued > 0) {
                 // 标签扫描进行中：转圈图标 + 进度数字（提示里写全“标签扫描中 {done}/{total}”）
-                node.innerHTML = statusStatHtml('fa-spinner fa-spin',
+                setHtmlIfChanged(node, statusStatHtml('fa-spinner fa-spin',
                     fmtCount(scan.scanned) + '/' + fmtCount(scan.queued),
                     t('tagScanning', { done: scan.scanned, total: scan.queued }) +
-                    (scan.fromWorkers ? ' · ' + t('tagScanByWorkers', { n: scan.fromWorkers }) : ''));
+                    (scan.fromWorkers ? ' · ' + t('tagScanByWorkers', { n: scan.fromWorkers }) : '')));
                 node.title = t('tagScanning', { done: scan.scanned, total: scan.queued });
             } else if (status && status.tags) {
-                node.innerHTML = statusStatHtml('fa-tags', fmtCount(status.tags), t('statusTags'));
+                setHtmlIfChanged(node, statusStatHtml('fa-tags', fmtCount(status.tags), t('statusTags')));
                 node.title = t('tagsCached', { n: status.tags });
             } else {
                 node.innerHTML = '';
+                node.__ifmHtml = '';
                 node.title = '';
+                node.removeAttribute('data-tip-text');
             }
         }
         renderCapacity();

@@ -242,7 +242,16 @@
 
     // 缺失外设的条目：定义名 → 期望的外设名 + 类型 + 「删除该定义」按钮
     // （外设缺失时以前只能干看着：这里允许直接把背后的定义删掉）
+    // 用户第 3 项（本轮）：机器直接引用的外设没有"定义"可删，所以那条只显示
+    // "哪台机器在引用它"（提示用户去把机器的容器换成新的外设名 / 重新拖一次）。
     function missingChipHtml(item) {
+        if (item.kind === 'machine') {
+            const machine = String(item.machine || '');
+            const hint = t('missingMachineRef', { machine: machine || '?' });
+            return '<span class="chip missing" title="' + escapeHtml(hint) + '">' +
+                escapeHtml(String(item.name || '')) +
+                ' <span class="muted">' + escapeHtml(hint) + '</span></span>';
+        }
         const isSignal = item.kind === 'signal';
         return '<span class="chip missing" title="' + escapeHtml(String(item.peripheral || '')) + '">' +
             escapeHtml(item.name) + ' → ' + escapeHtml(String(item.peripheral || '')) +
@@ -295,11 +304,16 @@
         });
         const usedByMachine = machineUsedContainerNames();
         const chips = [];
+        // 用户第 5 项（本轮）：机器**直接**引用了这个外设（例如输入列表里写着 minecraft:chest_109）时，
+        // 它已经在用了 —— 以前这里还会画一张"未分配功能"的方块卡片，看起来像什么都没配。
+        // （引用坏了的情况由"外设缺失"面板负责提示，见 Containers:missingPeripherals。）
+        const referencedByMachine = usedByMachine[blockName] === true;
         // 1) 功能还没定义 → 未分配。
         //    chip 自己可拖拽（拖到存储卡片 / 机器位置 = 把这个功能分配过去），
         //    方块卡片本身不再整体可拖拽（否则拖里面任何地方都会带动整张卡片）。
         [['item', 'inventory', 'itemContainer', 'fa-archive'],
          ['fluid', 'fluid_storage', 'fluidContainer', 'fa-tint']].forEach(function (info) {
+            if (referencedByMachine) return;
             if (block.kinds.indexOf(info[1]) < 0 || definedByKind[info[0]]) return;
             chips.push('<span class="chip unassigned" draggable="true"' +
                 ' data-drag-peripheral="' + escapeHtml(block.name) + '"' +
@@ -647,7 +661,10 @@
                     // 非输出容器的定义名就是外设名（服务端 Store:containerNameFor）：
                     // 定义还没回推时也能直接显示成外设名，不会闪一下“缺失外设”
                     peripheral: def ? String(def.peripheral || '') : String(name || ''),
-                    missing: refs.has('container:' + String(name || ''))
+                    // 用户第 2 项（本轮）：服务端现在也会把"机器直接引用、但外设已经不在了"的名字
+                    // 放进缺失列表（kind = "machine"）—— 有线调制解调器重连后外设重新编号时就是它。
+                    missing: refs.has('container:' + String(name || '')) ||
+                        refs.has('machine:' + String(name || ''))
                 });
             });
         });

@@ -1994,7 +1994,7 @@
     // 只报 "el(...) is null"，完全看不出是"哪个文件旧了"。这里做两件事：
     //   ① 版本对账：index.html 上写了 data-ifm-build，和 JS 里这份构建号比对，不一致就直接说明；
     //   ② 页面探针：把当前 URL、实际加载到的脚本路径、关键元素在不在打印出来。
-    const IFM_APP_BUILD = '212';
+    const IFM_APP_BUILD = '213';
     function pageBuild() {
         try {
             return document.documentElement && document.documentElement.getAttribute

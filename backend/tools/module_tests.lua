@@ -1912,6 +1912,39 @@ do
         #pushesMulti == 3 and pushesMulti[1].slot == 1 and pushesMulti[2].slot == 2 and pushesMulti[3].slot == 3,
         'pushes=' .. tostring(#pushesMulti))
 
+    --- 6) 用户第 6 项（海龟合成）：材料"记账上到位" ≠ 真的在物品栏里 ——
+    ---    craft 指令必须先看海龟自己上报的内容快照（alreadyInTargets 读的就是快照）。
+    local engineCraft = newDrain()
+    engineCraft.inputContainers = function() return { 'turtle_1' } end
+    engineCraft.alreadyInTargets = function() return 0 end
+    local craftProcess = {
+        name = 'iron_ingot',
+        inputs = {
+            { kind = 'item', id = 'minecraft:iron_nugget', count = 1 },
+            { kind = 'item', id = 'minecraft:iron_nugget', count = 1 },
+        },
+        outputs = {},
+    }
+    local craftRecord = { batch = 1 }
+    local ready, missingText = engineCraft:crafterMaterialsReady(craftProcess, craftRecord, { name = 'turtle_1' })
+    check('the turtle is not asked to craft before the materials really reached its inventory',
+        ready == false and tostring(missingText):find('iron_nugget', 1, true) ~= nil,
+        'ready=' .. tostring(ready) .. ' missing=' .. tostring(missingText))
+    --- 只到位一半（要 2 个、海龟快照里只有 1 个）也不算齐
+    engineCraft.alreadyInTargets = function() return 1 end
+    local halfProcess = { name = 'iron_ingot',
+        inputs = { { kind = 'item', id = 'minecraft:iron_nugget', count = 2 } }, outputs = {} }
+    local halfReady, halfMissing = engineCraft:crafterMaterialsReady(halfProcess, craftRecord,
+        { name = 'turtle_1' })
+    check('a half-filled turtle grid is still not enough to craft',
+        halfReady == false and tostring(halfMissing):find('x1', 1, true) ~= nil,
+        'ready=' .. tostring(halfReady) .. ' missing=' .. tostring(halfMissing))
+    --- 全部到位：这时才允许发 craft
+    engineCraft.alreadyInTargets = function() return 2 end
+    local readyAll = engineCraft:crafterMaterialsReady(halfProcess, craftRecord, { name = 'turtle_1' })
+    check('once the turtle really holds everything the craft may go out', readyAll == true,
+        'ready=' .. tostring(readyAll))
+
     --- 5) onlyPeripheral：只处理"刚扫到的那个输入容器"
     local engine5, pushes5 = newDrain({
         inputs = { 'in_1', 'in_2' },
@@ -2591,6 +2624,65 @@ do
     check('clearSnapshot empties the container but keeps its model',
         #cleared == 0 and c:modelOf('chest_a') ~= nil,
         'resources=' .. tostring(#cleared) .. ' model=' .. tostring(c:modelOf('chest_a') ~= nil))
+end
+
+-- ===================== 缺失外设覆盖"机器直接引用"（用户第 2/3 项）=====================
+-- 现场：关掉有线调制解调器再打开，有线网络把外设重新编号
+-- （create:millstone_4 → create:millstone_6），机器的输入列表还指着旧名字：
+-- 以前它既不在"外设缺失"面板里，机器卡片上的外设芯片也不标红。
+do
+    local containerDefs = { { name = 'store_main', peripheral = 'minecraft:chest_1', kind = 'item', role = 'storage' } }
+    local machines = {
+        { name = 'mill', itemInputs = { 'create:millstone_4' }, itemOutputs = { 'create:millstone_4' },
+            fluidInputs = {}, fluidOutputs = {}, signals = {} },
+        --- 引用的是还活着的容器定义：由容器那条检查负责，不该重复报
+        { name = 'press', itemInputs = { 'store_main' }, itemOutputs = {}, fluidInputs = {}, fluidOutputs = {},
+            signals = {} },
+    }
+    local alive = { ['minecraft:chest_1'] = true }
+    local PeripheralsStub = {
+        exists = function(_, name) return alive[name] == true end,
+        isInventory = function() return true end,
+        isFluid = function() return false end,
+        isTurtle = function() return false end,
+        names = function() return {} end,
+        invalidate = function() end,
+        wrap = function() return {} end,
+        lastScan = 0,
+    }
+    local StoreStub = {
+        list = function(_, kind)
+            if kind == 'containers' then return containerDefs end
+            if kind == 'signals' then return {} end
+            if kind == 'machines' then return machines end
+            return {}
+        end,
+        findContainer = function(_, name)
+            for _, def in ipairs(containerDefs) do
+                if def.name == name then return def end
+            end
+            return nil
+        end,
+    }
+    local c = Containers.new({
+        Util = { kindOfDef = function(def) return def and def.kind or 'item' end },
+        Peripherals = PeripheralsStub,
+        Store = StoreStub,
+        Filter = {},
+        log = function() end,
+    })
+    local missing = c:missingPeripherals()
+    local byName = {}
+    for _, entry in ipairs(missing) do
+        byName[tostring(entry.kind) .. ':' .. tostring(entry.name)] = entry
+    end
+    check('a machine referencing a peripheral that is gone shows up in the missing list',
+        byName['machine:create:millstone_4'] ~= nil and
+            byName['machine:create:millstone_4'].machine == 'mill',
+        'count=' .. tostring(#missing))
+    check('a machine reference that still resolves is not reported as missing',
+        byName['machine:store_main'] == nil and byName['container:store_main'] == nil,
+        'count=' .. tostring(#missing))
 end
 
 print('')

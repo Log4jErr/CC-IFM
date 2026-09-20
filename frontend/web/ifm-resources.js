@@ -389,7 +389,7 @@
 
     // ===================== 悬停详情（仿 meweb 的 item-tooltip） =====================
     // 网格里只显示图标，名称 / 注册名 / 数量 / 操作说明等都在悬停时用这个悬浮框显示。
-    const TIP_SELECTOR = '[data-tip-resource],[data-tip-send],[data-tip-graph]';
+    const TIP_SELECTOR = '[data-tip-resource],[data-tip-send],[data-tip-graph],[data-tip-text]';
     let tooltipNode = null;
     let tooltipTarget = null;
     let tooltipAt = { x: 0, y: 0 };
@@ -425,6 +425,12 @@
 
     // 悬停内容依据当前的本地数据实时生成（不会显示旧值）
     function tipHtmlFor(node) {
+        // 用户第 4 项（本轮）：顶栏指标 / 房间号那类"一句话提示"走这里 ——
+        // 浏览器原生 title 要等一秒左右、密集推送时还会被顶掉，这个提示框是立刻显示的。
+        const plainTip = node.getAttribute('data-tip-text');
+        if (plainTip) {
+            return tipBoxHtml(plainTip, []);
+        }
         const resourceAttr = node.getAttribute('data-tip-resource');
         if (resourceAttr) {
             const parts = splitKey(resourceAttr);

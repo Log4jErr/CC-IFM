@@ -1366,6 +1366,36 @@ function Recipe:stepInput(process, record, machine, now)
         --- craft 指令是"发出去就不管"的（合成器不回报状态），所以这里只看"有没有空闲合成器"：
         --- 没有就停在本相位、下个 tick 再试 —— 免得流程以为已经合成过而直接去抽空气。
         if self.Store.isTurtleCrafter(machine) then
+            --- 用户第 6 项：材料"记账上到位" ≠ 真的进了海龟物品栏（搬运是异步的）。
+            --- 以前这里立刻发 craft ⇒ 海龟只拿到一两个铁粒就开始合成，必然失败。
+            --- 现在先看海龟自己上报的物品栏快照；没到位就停在本相位，下个 tick 再看。
+            --- 兜底：等太久（快照一直不更新 / 合成器不上报）时照样放行，免得流程永久卡住。
+            local ready, missingText = self:crafterMaterialsReady(process, record, machine)
+            if not ready then
+                record.craftWaitSince = record.craftWaitSince or now
+                local waited = now - record.craftWaitSince
+                if waited < CRAFT_READY_TIMEOUT_MS then
+                    record.wait = { kind = "craft", machine = machine.name }
+                    record.lastError = "\\u7B49\\u5F85\\u6750\\u6599\\u771F\\u6B63\\u8FDB\\u5165\\u6D77\\u9F9F" ..
+                        (missingText and ("\\uFF08\\u8FD8\\u5DEE " .. missingText .. "\\uFF09") or "")
+                    if now - (record.lastCraftWaitLogAt or 0) >= 10000 then
+                        record.lastCraftWaitLogAt = now
+                        self.log("Process %s: waiting for the turtle to really hold %s before crafting",
+                            tostring(process.name), tostring(missingText or "the materials"))
+                    end
+                    self.Cache:markDirty()
+                    return
+                end
+                if not record.craftReadyTimedOut then
+                    record.craftReadyTimedOut = true
+                    self.log("Process %s: the turtle never reported %s - crafting anyway (check that " ..
+                        "IFMCrafter.lua is still running and can reach the master)",
+                        tostring(process.name), tostring(missingText or "its materials"))
+                end
+            else
+                record.craftWaitSince = nil
+                record.craftReadyTimedOut = nil
+            end
             local status = self:requestMachineCraft(process, record, machine)
             if status ~= "sent" then
                 record.wait = { kind = "craft", machine = machine.name }
@@ -1383,6 +1413,42 @@ function Recipe:stepInput(process, record, machine, now)
         record.index = index
         self.Cache:markDirty()
     end
+end
+
+--- 海龟合成前"等材料真的进物品栏"的最长时间（用户第 6 项）：超过就照样发 craft 指令，
+--- 免得合成器不上报时流程永久卡在输入相位。
+local CRAFT_READY_TIMEOUT_MS = 30000
+
+--- 材料是否**真的**已经在海龟物品栏里（用户第 6 项）。
+--- 现场：一次把 9 个铁粒送进海龟，海龟只收到 1 个就开始合成 → 合成必然失败。
+--- 原因：材料搬运是异步的 —— Containers:pushItem 一提交就把数量记进 record.progress
+--- （记账：为了避免下个 tick 重复要料），而 record.progress 满了就直接发了 craft 指令。
+--- 海龟合成的 3×3 格子就是它自己的物品栏，格子没填满 craft 一定失败。
+--- 所以这里改成读**海龟自己上报的内容快照**（IFMCrafter 的 op = "inventory"，主控每 2 秒催一次：
+--- 见 IFMMaster 的 refreshCrafterReports）—— 材料真的在格子里才算就绪。
+--- 返回：就绪=true / 就绪=false, "还差什么"的可读描述
+function Recipe:crafterMaterialsReady(process, record, machine)
+    local batch = record.batch or 1
+    local missing = {}
+    for _, element in ipairs(process.inputs or {}) do
+        if element.kind == "item" or element.kind == "fluid" or element.kind == "filter" then
+            local required = elementDemand(element, batch)
+            if required > 0 then
+                local spec = elementSpec(element)
+                local itemTargets = self:inputContainers(machine, "item", element.containerIndex)
+                local fluidTargets = self:inputContainers(machine, "fluid", element.containerIndex)
+                local have = self:alreadyInTargets(spec, itemTargets, fluidTargets)
+                if have < required then
+                    missing[#missing + 1] = tostring(spec.name or element.id or "?") .. " x" ..
+                        tostring(required - have)
+                end
+            end
+        end
+    end
+    if #missing == 0 then
+        return true, nil
+    end
+    return false, table.concat(missing, ", ")
 end
 
 --- 请这台机器的海龟合成（turtle_crafter）：返回 "sent" = 指令已发出 / "idle" = 没有空闲合成器。

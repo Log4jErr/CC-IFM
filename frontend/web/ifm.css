@@ -336,6 +336,8 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 .status-value { margin: 0 10px 0 4px; }
 /* 房间号 / 中继地址默认显示 ****（悬停看真实值，见 maskText） */
 .muted.masked { cursor: help; }
+/* 顶栏里被 JS 隐藏的标签（relayLabel 并进 roomLabel 之后）不能占位 */
+.app-header [hidden] { display: none !important; }
 /* 容器管理（用户第 5 项）：按槽位画格子，空格子也要显示，左上角是 #槽位号 */
 .slot-grid {
     display: grid;
@@ -432,7 +434,12 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     padding: 6px;
     cursor: pointer;
     /* 用户第 2 项：左右排列（0 增长 = 卡片保持等宽、不拉伸），放不下就换行 */
-    flex: 0 1 210px;
+    /* 用户第 1 项（本轮修正）：宽度必须**固定** —— 以前是 flex: 0 1 210px：卡片本身按 210px 排版，
+       但它的 max-content 可能大得多（长芯片行 / 长外设名），而机器类型卡片是 width: max-content
+       会把那个大得多的 max-content 当成真实宽度 → 类型卡片比里面的机器宽出一大截、右侧全是留白。 */
+    flex: 0 0 210px;
+    width: 210px;
+    max-width: 100%;
     min-width: 0;
 }
 .machine-card:hover { border-color: var(--accent); }
