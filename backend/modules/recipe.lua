@@ -2582,18 +2582,24 @@ function Recipe:drainInputContainers(now, onlyPeripheral)
     local movedItems = 0
     local movedFluids = 0
     local pending = false
+    --- 用户第 4 项：输入容器里同时有好几格东西时，一轮里**能提交的搬运全部提交**（并行）。
+    --- 以前是"第一条交给 worker（err = pending）就 return"，于是每个扫描周期只搬走一格 ——
+    --- 现场看就是"输入容器里的东西没有被并行搬走"。上限只用于防止一次塞爆队列；
+    --- 去重与源槽位预留由 Containers:pushItem / reserveOut 负责（同一格不会被提交两次）。
+    local INPUT_DRAIN_MAX_MOVES = 32
+    local submitted = 0
 
     local function drainItems()
         if #targets.item == 0 then
             return
         end
         for _, source in ipairs(sources.item) do
-            if pending then
+            if submitted >= INPUT_DRAIN_MAX_MOVES then
                 return
             end
             for _, stack in ipairs(self.Containers:orderStacks(self.Containers:stacks(source),
                 self.Containers.ORDER_FRAGMENT)) do
-                if pending then
+                if submitted >= INPUT_DRAIN_MAX_MOVES then
                     return
                 end
                 local amount = tonumber(stack.count) or 0
@@ -2603,8 +2609,10 @@ function Recipe:drainInputContainers(now, onlyPeripheral)
                             --- 输入容器 → 存储容器：先并入同类槽位，少留碎片（1.6.11）
                             self.Containers.INSERT_LEAST, "inventoryIn")
                         if err == "pending" then
-                            pending = true              -- 已交给 worker：下轮接着排
-                            return
+                            --- 这一格已经交给 worker / 本机池了：继续排下一格（不再中断整轮）
+                            pending = true
+                            submitted = submitted + 1
+                            break
                         end
                         got = tonumber(got) or 0
                         if got > 0 then
@@ -2625,11 +2633,11 @@ function Recipe:drainInputContainers(now, onlyPeripheral)
             return
         end
         for _, source in ipairs(sources.fluid) do
-            if pending then
+            if submitted >= INPUT_DRAIN_MAX_MOVES then
                 return
             end
             for _, tank in ipairs(self.Containers:tanks(source)) do
-                if pending then
+                if submitted >= INPUT_DRAIN_MAX_MOVES then
                     return
                 end
                 local amount = tonumber(tank.amount) or 0
@@ -2637,8 +2645,10 @@ function Recipe:drainInputContainers(now, onlyPeripheral)
                     for _, target in ipairs(targets.fluid) do
                         local got, err = self.Containers:pushFluid(source, amount, tank.name, target, "inventoryIn")
                         if err == "pending" then
+                            --- 同一个道理（用户第 4 项）：继续排下一罐，不再中断整轮
                             pending = true
-                            return
+                            submitted = submitted + 1
+                            break
                         end
                         got = tonumber(got) or 0
                         if got > 0 then

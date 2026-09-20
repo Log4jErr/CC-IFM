@@ -336,6 +336,39 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 .status-value { margin: 0 10px 0 4px; }
 /* 房间号 / 中继地址默认显示 ****（悬停看真实值，见 maskText） */
 .muted.masked { cursor: help; }
+/* 容器管理（用户第 5 项）：按槽位画格子，空格子也要显示，左上角是 #槽位号 */
+.slot-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
+    gap: 6px;
+}
+.slot-cell {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-height: 66px;
+    padding: 16px 8px 8px 8px;
+    background: var(--panel-bg-2);
+    border: 2px solid var(--border);
+}
+.slot-cell.empty { opacity: .5; }
+.slot-index {
+    position: absolute;
+    top: 2px;
+    left: 4px;
+    font-size: 11px;
+    color: var(--text-dim);
+}
+.slot-empty { font-size: 11px; color: var(--text-dim); }
+.slot-icon { font-size: 16px; }
+.slot-name {
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.slot-count { font-size: 12px; color: var(--accent); }
 #editorModal .modal-content, #promptModal .modal-content, #diagnoseModal .modal-content {
     background: var(--panel-bg);
     color: var(--text);

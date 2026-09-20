@@ -719,6 +719,51 @@
     // 现在只在“编辑容器定义”里出现，并且以服务端的“种类:名称”键为准（不再靠种类猜测）。
     let containerTarget = null;      // { key, name, kind }
 
+    /// 用户第 5 项：容器管理里按**槽位**画格子 —— 有东西的格子显示物品与「取出」，
+    /// 空格子写「空槽位」。每格左上角都标 #槽位号；服务端只发"有东西的槽位"，空格子由前端补全。
+    function containerCellHtml(slot, entry, kind) {
+        const head = '<span class="slot-index" title="' + escapeHtml(t('slotNumber', { n: slot })) + '">#' +
+            escapeHtml(String(slot)) + '</span>';
+        if (!entry) {
+            return '<div class="slot-cell empty">' + head +
+                '<span class="slot-empty">' + escapeHtml(t('containerEmptySlot')) + '</span></div>';
+        }
+        const isFluid = kind === 'fluid';
+        const itemKind = isFluid ? 'fluid' : 'item';
+        const name = entry.name;
+        const count = isFluid ? entry.amount : entry.count;
+        const ref = isFluid ? entry.tank : entry.slot;
+        queueMeta(itemKind, name);
+        return '<div class="slot-cell" data-take-resource="' + escapeHtml(name) + '" data-take-count="' +
+            escapeHtml(String(count || 0)) + '">' + head +
+            '<span class="slot-icon">' + plainIconImg(itemKind, name, entry.nbt) + '</span>' +
+            '<span class="slot-name" title="' + escapeHtml(name) + '">' +
+            escapeHtml(displayName(itemKind, name)) + '</span>' +
+            '<span class="slot-count">' + escapeHtml(fmtCount(count || 0)) + '</span>' +
+            '<button class="btn-pixel" type="button" data-take-now="' + escapeHtml(String(ref)) + '">' +
+            escapeHtml(t('containerTake')) + '</button>' +
+            '</div>';
+    }
+
+    /// 按槽位总数把整张网格画出来（1 … view.slots）。
+    /// 服务端只发有东西的槽位；槽位号超出 view.slots 的（槽位数那一刻读不准）也照画，不能把东西藏起来。
+    function containerSlotGridHtml(view) {
+        const total = Math.max(0, Math.floor(Number(view.slots) || 0));
+        const bySlot = {};
+        asArray(view.items).forEach(function (entry) {
+            const slot = Math.floor(Number(entry.slot) || 0);
+            if (slot > 0) bySlot[slot] = entry;
+        });
+        const cells = [];
+        for (let slot = 1; slot <= total; slot += 1) {
+            cells.push(containerCellHtml(slot, bySlot[slot], 'item'));
+        }
+        Object.keys(bySlot).map(Number).sort(function (a, b) { return a - b; }).forEach(function (slot) {
+            if (slot > total) cells.push(containerCellHtml(slot, bySlot[slot], 'item'));
+        });
+        return '<div class="slot-grid">' + cells.join('') + '</div>';
+    }
+
     function parseContainerKey(key) {
         const text = String(key || '');
         return {
@@ -789,16 +834,22 @@
             contents.innerHTML = '<span class="muted">' + escapeHtml((view && view.error) || t('noData')) + '</span>';
             return;
         }
-        const rows = [];
-        asArray(view.items).forEach(function (entry) {
-            rows.push(containerRowHtml('item', entry.name, entry.count, entry.slot, entry.nbt));
-        });
-        asArray(view.fluids).forEach(function (entry) {
-            rows.push(containerRowHtml('fluid', entry.name, entry.amount, entry.tank));
-        });
-        contents.innerHTML = rows.length
-            ? '<div class="stock-list">' + rows.join('') + '</div>'
-            : '<span class="muted">' + escapeHtml(t('containerEmpty')) + '</span>';
+        // 用户第 5 项：物品容器一律画成"槽位网格"（含空槽位 + #槽位号）；
+        // 流体容器没有槽位总数的数据，退回原来的行列表（每行也带 #储罐号）。
+        if (view.kind === 'item' && Math.floor(Number(view.slots) || 0) > 0) {
+            contents.innerHTML = containerSlotGridHtml(view);
+        } else {
+            const rows = [];
+            asArray(view.items).forEach(function (entry) {
+                rows.push(containerRowHtml('item', entry.name, entry.count, entry.slot, entry.nbt));
+            });
+            asArray(view.fluids).forEach(function (entry) {
+                rows.push(containerRowHtml('fluid', entry.name, entry.amount, entry.tank));
+            });
+            contents.innerHTML = rows.length
+                ? '<div class="stock-list">' + rows.join('') + '</div>'
+                : '<span class="muted">' + escapeHtml(t('containerEmpty')) + '</span>';
+        }
         renderContainerSuggestions(view);
     }
 
@@ -1943,7 +1994,7 @@
     // 只报 "el(...) is null"，完全看不出是"哪个文件旧了"。这里做两件事：
     //   ① 版本对账：index.html 上写了 data-ifm-build，和 JS 里这份构建号比对，不一致就直接说明；
     //   ② 页面探针：把当前 URL、实际加载到的脚本路径、关键元素在不在打印出来。
-    const IFM_APP_BUILD = '211';
+    const IFM_APP_BUILD = '212';
     function pageBuild() {
         try {
             return document.documentElement && document.documentElement.getAttribute

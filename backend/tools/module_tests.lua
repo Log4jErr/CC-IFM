@@ -1897,6 +1897,21 @@ do
     check('a move handed to a worker stops this round (no duplicate submission)',
         engine4:drainInputContainers(os.epoch('utc')) == 0 and #pushes4 == 1, 'pushes=' .. tostring(#pushes4))
 
+    --- 4b) 用户第 4 项：一个输入容器里有多格东西时，一轮里**每一格都要提交**（并行搬运），
+    ---     而不是"第一条交给 worker（err = pending）就停下"（那样每个扫描周期只搬走一格）。
+    local engineMulti, pushesMulti = newDrain({
+        stacks = { in_1 = {
+            { slot = 1, name = 'minecraft:sand', count = 64 },
+            { slot = 2, name = 'minecraft:gravel', count = 32 },
+            { slot = 3, name = 'minecraft:dirt', count = 16 },
+        } },
+        pending = true,
+    })
+    engineMulti:drainInputContainers(os.epoch('utc'))
+    check('every filled slot of an input container is submitted in the same round (user item 4)',
+        #pushesMulti == 3 and pushesMulti[1].slot == 1 and pushesMulti[2].slot == 2 and pushesMulti[3].slot == 3,
+        'pushes=' .. tostring(#pushesMulti))
+
     --- 5) onlyPeripheral：只处理"刚扫到的那个输入容器"
     local engine5, pushes5 = newDrain({
         inputs = { 'in_1', 'in_2' },
@@ -2513,6 +2528,69 @@ do
         'warnings=' .. tostring(#logWarnings) .. ' last=' .. tostring(logWarnings[#logWarnings]))
     t.onQueryDropped = nil
     t.onQueryResult = nil
+end
+
+-- ===================== 归零：容器被清空时资源必须归零（用户第 2 项）=====================
+-- 现场：容器里有 64 个沙子，一次全拿走时网页上的数量一直停在 64（只拿一半却正常更新），
+-- 沙子散在多个容器时也是"最后一个容器清空"这一下不生效。
+-- 模块层必须先保证：读到空容器的快照是**权威**的（把旧内容清掉），
+-- 否则主控再怎么做都对不了。
+do
+    local defs = { { name = 'chest', peripheral = 'chest_a', kind = 'item', role = 'storage', priority = 0 } }
+    local PeripheralsStub = {
+        exists = function() return true end,
+        isInventory = function() return true end,
+        isFluid = function() return false end,
+        isTurtle = function() return false end,
+        names = function() return {} end,
+        invalidate = function() end,
+        wrap = function() return { size = function() return 27 end } end,
+        lastScan = 0,
+    }
+    local StoreStub = {
+        list = function() return defs end,
+        findContainer = function(_, name)
+            for _, def in ipairs(defs) do
+                if def.name == name then return def end
+            end
+            return nil
+        end,
+    }
+    local c = Containers.new({
+        Util = { kindOfDef = function() return 'item' end },
+        Peripherals = PeripheralsStub,
+        Store = StoreStub,
+        Filter = {},
+        log = function() end,
+        --- 聚合快照默认缓存 600ms；这里要立刻看到结果，关掉缓存（线上由扫描节拍自然过期）
+        cacheTtl = 0,
+    })
+    c:applyScan('chest_a', { { slot = 1, name = 'minecraft:sand', count = 64 } }, nil, os.epoch('utc'))
+    local before = c:resources()
+    --- 第二次扫描：一个槽位都没有（玩家把沙子一次全部拿走）
+    c:applyScan('chest_a', {}, nil, os.epoch('utc'))
+    local after = c:resources()
+    check('an empty scan clears the item from the resource list (user item 2)',
+        #before == 1 and before[1].count == 64 and before[1].name == 'minecraft:sand' and #after == 0,
+        'before=' .. tostring(#before) .. ' after=' .. tostring(#after))
+    --- 反过来也要对：清空之后再扫到东西，数量必须重新出现（不是被永久拉黑）
+    c:applyScan('chest_a', { { slot = 2, name = 'minecraft:sand', count = 32 } }, nil, os.epoch('utc'))
+    local again = c:resources()
+    check('a later scan brings the item back with the new count',
+        #again == 1 and again[1].count == 32, 'count=' .. tostring(again[1] and again[1].count))
+    --- 空扫描的结果也必须被判成"真的扫到了"（主控按 scanned 判定，0 会被当成"没读到"丢掉）
+    check('an empty reply still counts as "the container was read"',
+        Containers.scanCountOfReply({ scanned = 1 }) == 1 and
+            Containers.scanCountOfReply({ scannedContainers = {} }) == 0 and
+            Containers.scanCountOfReply({}) == nil,
+        'scanned=' .. tostring(Containers.scanCountOfReply({ scanned = 1 })))
+    --- clearSnapshot（主控连续读不到时用，见 IFMMaster 的 blind 分支）：清内容但不丢模型
+    c:applyScan('chest_a', { { slot = 1, name = 'minecraft:sand', count = 12 } }, nil, os.epoch('utc'))
+    c:clearSnapshot('chest_a', 'test')
+    local cleared = c:resources()
+    check('clearSnapshot empties the container but keeps its model',
+        #cleared == 0 and c:modelOf('chest_a') ~= nil,
+        'resources=' .. tostring(#cleared) .. ' model=' .. tostring(c:modelOf('chest_a') ~= nil))
 end
 
 print('')

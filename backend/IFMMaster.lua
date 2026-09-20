@@ -1892,6 +1892,15 @@ transfer.onQueryDropped = function(key, reason)
     noteScanFailure(name, reason)
 end
 
+--- 用户第 2 项：连续多少次"读不到"之后清掉该容器的快照（见 Containers:clearSnapshot）。
+--- 为什么要它：**旧版 worker 对"空容器"也会报 scanned = 0**（新 worker 报 1），
+--- 于是"读到空容器"会被当成"没读到"而保留旧快照 ⇒ 网页上的数量永远停在旧值
+--- （现场：一次把 64 个沙子全拿走，网页一直显示 64；只拿一半却正常）。
+--- 连续多次都读不到就说明"我们确实没法从这个容器读到内容" —— 那就不能再拿旧内容当真。
+local BLIND_CLEAR_AFTER = 3
+local BLIND_CLEAR_WINDOW_MS = 15000
+local blindStreak = {}      -- 容器外设名 -> { count = 连续次数, lastAt = 上次时间 }
+
 --- worker 代扫回来了：写进容器快照，并结束对应的扫描队列任务（在飞 → 出队）
 transfer.onQueryResult = function(_, key, message)
     local name = tostring(key or ""):match("^scan:(.+)$")
@@ -1926,8 +1935,26 @@ transfer.onQueryResult = function(_, key, message)
             containers:scanNow(name)
             afterScan(name, os.epoch("utc"))
         end
+        --- 用户第 2 项（数量不归零）：连续多次都读不到时，旧快照不能再当真 ——
+        --- 清掉它的内容（网页归零），下一次成功扫描会重新读回来。
+        local blindNow = os.epoch("utc")
+        local streak = blindStreak[name]
+        if not streak or blindNow - (streak.lastAt or 0) > BLIND_CLEAR_WINDOW_MS then
+            streak = { count = 0 }
+            blindStreak[name] = streak
+        end
+        streak.count = streak.count + 1
+        streak.lastAt = blindNow
+        if streak.count == BLIND_CLEAR_AFTER and containers:clearSnapshot(name,
+                "scan reply said scanned=0 " .. tostring(streak.count) .. " times in a row") then
+            log("Container %s could not be read %d times in a row: its cached contents were cleared so " ..
+                "the page cannot keep showing stale items; if it is not really empty, check that " ..
+                "peripheral (chunk loaded? cable? was it removed?)",
+                tostring(name), streak.count)
+        end
         return
     end
+    blindStreak[name] = nil                 -- 又读到了：连续计数清零
     containers:applyScan(name, message.items, message.tanks, tonumber(message.at) or os.epoch("utc"))
     finishScanInflight(name)
     --- 用户第 7 项（输入容器里的东西始终没被取走）：扫描之后的后续任务生成（输入容器 → 入库 /
@@ -2194,6 +2221,19 @@ diagnose.engine = engine
 local lastPeripheralScanAt = 0
 local peripheralScanPending = false
 
+--- 外设集合的"指纹"（种类:名字 排序后拼起来）：用户第 3 项 —— 有线调制解调器被关掉再打开时，
+--- 外设会整批 detach → attach，比完指纹才能知道"集合是不是真的变了"（变了就立刻推一次网页）。
+local function peripheralSignature()
+    local parts = {}
+    for _, kind in ipairs({ "inventory", "fluid", "redstone", "turtle" }) do
+        for _, name in ipairs(peripherals:names(kind)) do
+            parts[#parts + 1] = kind .. ":" .. name
+        end
+    end
+    table.sort(parts)
+    return parts
+end
+
 local function refreshPeripheralsIfNeeded(now)
     if not peripheralScanPending or now - lastPeripheralScanAt < 1000 then
         return
@@ -2201,11 +2241,26 @@ local function refreshPeripheralsIfNeeded(now)
     peripheralScanPending = false
     lastPeripheralScanAt = now
     log("Peripherals changed, rescanning")
+    local before = peripheralSignature()
     timed("peripheral scan", peripherals.scan, peripherals)
     containers:invalidate()
     --- 用户第 3 项：外设被拔掉 / 被换掉之后，之前从这里读到的内容必须**立刻**清掉
     --- （否则网页上会一直留着那些已经读不到的物品），并马上把删除推给网页。
     forgetRemovedContainers("peripheral removed")
+    --- 用户第 3 项（"外设回来了，面板还写着缺失"）：集合真的变了就**立刻推一次** ——
+    --- 只靠每 2 秒的兜底推送时，网页上的"外设缺失"会看起来一直没有恢复。
+    local after = peripheralSignature()
+    if table.concat(before, "\1") ~= table.concat(after, "\1") then
+        cache:markDirty()
+        log("Peripheral set changed: %d -> %d peripheral(s)", #before, #after)
+        --- 数量没变但名字变了：有线网络重连后外设会重新编号，而容器定义是按**外设名**存的
+        --- ⇒ 那些定义会一直显示"缺失"。这里明确提示用户重新添加（或删掉缺失定义）。
+        if #before == #after then
+            log("Peripheral names changed (a wired modem renumbers its peripherals when it is reconnected):" ..
+                " container definitions pointing at the old names stay 'missing' - re-add them" ..
+                " or use the missing list to delete them")
+        end
+    end
 end
 
 --- 一次主控调度执行（只在 timer 事件里跑；见下面的 mainLoop）。

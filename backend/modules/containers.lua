@@ -2119,6 +2119,30 @@ function Containers:forgetPeripheral(peripheralName, reason)
     return forgot
 end
 
+--- 清空某个容器**读到的内容**（用户第 2 项）：连续多次"读不到"之后不能再留着旧内容 ——
+--- 否则网页上会一直显示早就被拿走的物品（现场：容器里 64 个沙子一次全拿走，数量停在 64）。
+--- 只清内容（槽位 / 储罐），保留模型、槽位数缓存与在飞搬运：
+--- 搬运失败由 settleMove / 60 秒兜底清理处理，下一次成功扫描会把内容重新读回来。
+function Containers:clearSnapshot(peripheralName, reason)
+    if type(peripheralName) ~= "string" or peripheralName == "" then
+        return false
+    end
+    local model = self:modelOf(peripheralName)
+    if not model then
+        return false
+    end
+    model.slots = {}
+    model.tanks = {}
+    model.stamp = os.epoch("utc")
+    model.gen = (model.gen or 0) + 1
+    model.cleared = (model.cleared or 0) + 1
+    self.snapshots = {}                 -- 聚合缓存（resources / snapshot）立刻作废
+    self.log("Cleared the cached contents of %s (%s) - nothing could be read from it for a while" ..
+        " (check whether it is empty, or whether that peripheral is reachable)",
+        tostring(peripheralName), tostring(reason or "unreadable"))
+    return true
+end
+
 --- 清理"已经读不到的容器"：外设不在网络上，或者没有任何容器定义再引用它（定义被删 / 换外设）。
 --- 返回清掉的外设数量（调用方据此决定要不要立刻把这些变化推给网页）。
 function Containers:pruneMissingPeripherals(reason)
