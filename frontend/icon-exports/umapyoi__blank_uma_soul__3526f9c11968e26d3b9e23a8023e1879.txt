@@ -1,0 +1,1 @@
+{"minecraft:rarity":"epic","umapyoi:data_location":{name:"umapyoi:sakura_bakushin_o_sports"},"umapyoi:ranking":{ranking:"ssr"}}

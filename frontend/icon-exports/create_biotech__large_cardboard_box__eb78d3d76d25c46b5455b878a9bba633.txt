@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"minecraft:magma_cube"},CapturedEntityDescId:"entity.minecraft.magma_cube"}}

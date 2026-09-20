@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{Cooked:1b,FailedSkewerSource:"custom",SkewerIngredients:["minecraft:apple","kaleidoscope_grilling:beef_chunks","minecraft:brown_mushroom"],SkewerModelVariants:[I;4,8,6]}}

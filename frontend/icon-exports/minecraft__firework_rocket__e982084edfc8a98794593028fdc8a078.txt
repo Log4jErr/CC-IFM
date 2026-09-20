@@ -1,0 +1,1 @@
+{"minecraft:fireworks":{flight_duration:2b}}

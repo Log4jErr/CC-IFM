@@ -1,0 +1,1 @@
+{"netmusic:song_info":{artists:["ハンバート ハンバート"],name:"明日の朝には",time_second:182,trans_name:"明日清晨",url:"https://music.163.com/song/media/outer/url?id=740611.mp3",vip:1b}}

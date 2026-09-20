@@ -1,0 +1,1 @@
+{"minecraft:rarity":"epic","umapyoi:data_location":{name:"umapyoi:curren_chan_dress"},"umapyoi:ranking":{ranking:"ssr"}}

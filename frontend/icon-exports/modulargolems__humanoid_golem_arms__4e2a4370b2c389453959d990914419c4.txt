@@ -1,0 +1,1 @@
+{"modulargolems:part_material":"l2complements:shulkerate"}

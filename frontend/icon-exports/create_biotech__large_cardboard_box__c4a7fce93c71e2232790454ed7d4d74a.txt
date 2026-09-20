@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"minecraft:camel"},CapturedEntityDescId:"entity.minecraft.camel"}}

@@ -1,0 +1,1 @@
+{"modulargolems:golem_materials":{parts:[{material:"cataclysm:witherite",part:"modulargolems:metal_golem_arm"},{material:"cataclysm:witherite",part:"modulargolems:metal_golem_body"},{material:"cataclysm:witherite",part:"modulargolems:metal_golem_arm"},{material:"cataclysm:witherite",part:"modulargolems:metal_golem_legs"}]}}

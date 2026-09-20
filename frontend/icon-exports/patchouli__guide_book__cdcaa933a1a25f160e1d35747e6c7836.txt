@@ -1,0 +1,1 @@
+{"patchouli:book":"modulargolems:golem_guide"}

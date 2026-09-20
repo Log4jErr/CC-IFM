@@ -1,0 +1,1 @@
+{"sophisticatedstorage:wood_type":"dark_oak"}

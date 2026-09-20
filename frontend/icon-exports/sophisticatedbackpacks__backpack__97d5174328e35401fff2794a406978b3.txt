@@ -1,0 +1,1 @@
+{"sophisticatedcore:accent_color":-425955,"sophisticatedcore:main_color":-425955,"sophisticatedcore:number_of_inventory_slots":27,"sophisticatedcore:number_of_upgrade_slots":1}

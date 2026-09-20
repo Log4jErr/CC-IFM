@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"laowu:butter_cat"},CapturedEntityDescId:"entity.laowu.butter_cat"}}

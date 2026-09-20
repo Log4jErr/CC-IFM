@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"irons_spellbooks:archevoker"},CapturedEntityDescId:"entity.irons_spellbooks.archevoker"}}

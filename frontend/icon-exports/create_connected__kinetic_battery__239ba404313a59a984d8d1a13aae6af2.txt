@@ -1,0 +1,1 @@
+{"create_connected:kinetic_battery_charge":3.6864E7d}

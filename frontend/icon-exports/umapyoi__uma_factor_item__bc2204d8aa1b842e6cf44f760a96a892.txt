@@ -1,0 +1,1 @@
+{"umapyoi:data_location":{name:"umapyoi:common_uma"},"umapyoi:factor_data":[{factor:"umapyoi:telent_factor",level:1}]}

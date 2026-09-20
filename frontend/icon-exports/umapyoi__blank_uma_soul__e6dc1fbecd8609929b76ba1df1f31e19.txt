@@ -1,0 +1,1 @@
+{"minecraft:rarity":"uncommon","umapyoi:data_location":{name:"umapyoi:jungle_pocket"},"umapyoi:ranking":{ranking:"sr"}}

@@ -1,0 +1,1 @@
+{"minecraft:rarity":"uncommon","umapyoi:data_location":{name:"umapyoi:satono_crown"},"umapyoi:ranking":{ranking:"sr"}}

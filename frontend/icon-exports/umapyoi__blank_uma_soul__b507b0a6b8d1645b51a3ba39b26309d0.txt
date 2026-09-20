@@ -1,0 +1,1 @@
+{"minecraft:rarity":"uncommon","umapyoi:data_location":{name:"umapyoi:taiki_shuttle"},"umapyoi:ranking":{ranking:"sr"}}

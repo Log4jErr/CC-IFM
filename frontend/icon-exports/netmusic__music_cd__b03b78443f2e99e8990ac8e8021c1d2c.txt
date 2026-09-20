@@ -1,0 +1,1 @@
+{"netmusic:song_info":{artists:["Fritz Kreisler","Franz Rupp"],name:"Londonderry Air (arr. F. Kreisler)",time_second:221,trans_name:"伦敦德里小调（F·克莱斯勒改编）",url:"https://music.163.com/song/media/outer/url?id=464740274.mp3"}}

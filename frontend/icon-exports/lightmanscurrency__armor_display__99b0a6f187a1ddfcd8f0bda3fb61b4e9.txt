@@ -1,0 +1,1 @@
+{"lightmanscurrency:model_variant":"lightmanscurrency:armor_display/skin/1/default"}

@@ -1,0 +1,1 @@
+{"minecraft:rarity":"uncommon","umapyoi:data_location":{name:"umapyoi:symboli_rudolf"},"umapyoi:ranking":{ranking:"sr"}}

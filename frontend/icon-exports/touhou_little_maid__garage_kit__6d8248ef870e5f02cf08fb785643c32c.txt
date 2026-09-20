@@ -1,0 +1,1 @@
+{"touhou_little_maid:maid_info":{IsYsmModel:0b,id:"touhou_little_maid:maid",model_id:"authors_and_credits:cyra_b2eb6fe570df68d353aa9d07b127b902"}}

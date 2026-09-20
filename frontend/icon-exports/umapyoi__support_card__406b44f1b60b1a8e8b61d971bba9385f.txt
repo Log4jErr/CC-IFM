@@ -1,0 +1,1 @@
+{"minecraft:damage":0,"minecraft:max_damage":3,"minecraft:rarity":"epic","umapyoi:data_location":{name:"umapyoi:ssr_kiryuuin_aoi"},"umapyoi:ranking":{ranking:"ssr"}}

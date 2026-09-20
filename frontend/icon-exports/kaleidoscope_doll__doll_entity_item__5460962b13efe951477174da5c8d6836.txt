@@ -1,0 +1,1 @@
+{"kaleidoscope_doll:doll_entity":{custom_doll_id:"geometry.hailuo"}}

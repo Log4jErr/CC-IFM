@@ -1,0 +1,1 @@
+{"irons_spellbooks:spell_container":{data:[{id:"irons_spellbooks:wither_skull",index:0,level:4,locked:1b}],maxSpells:1,mustEquip:0b,spellWheel:0b}}

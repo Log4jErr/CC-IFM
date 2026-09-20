@@ -1,0 +1,1 @@
+{"minecraft:rarity":"epic","umapyoi:data_location":{name:"umapyoi:syameimaru_zheng"},"umapyoi:ranking":{ranking:"easter_egg"}}

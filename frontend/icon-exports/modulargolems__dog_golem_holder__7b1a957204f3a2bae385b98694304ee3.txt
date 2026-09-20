@@ -1,0 +1,1 @@
+{"modulargolems:golem_materials":{parts:[{material:"modulargolems:netherite",part:"modulargolems:dog_golem_body"},{material:"modulargolems:netherite",part:"modulargolems:dog_golem_legs"}]}}

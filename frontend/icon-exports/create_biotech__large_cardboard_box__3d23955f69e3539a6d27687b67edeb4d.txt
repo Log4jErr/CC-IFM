@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"cataclysm:ancient_remnant"},CapturedEntityDescId:"entity.cataclysm.ancient_remnant"}}

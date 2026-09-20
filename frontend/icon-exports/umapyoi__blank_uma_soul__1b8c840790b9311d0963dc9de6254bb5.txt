@@ -1,0 +1,1 @@
+{"minecraft:rarity":"uncommon","umapyoi:data_location":{name:"umapyoi:dantsu_flame"},"umapyoi:ranking":{ranking:"sr"}}

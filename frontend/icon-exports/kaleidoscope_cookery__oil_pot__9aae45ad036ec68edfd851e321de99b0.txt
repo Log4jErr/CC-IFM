@@ -1,0 +1,1 @@
+{"kaleidoscope_cookery:oil_pot_oil_count":64,"minecraft:custom_data":{grilling_oil_type:"canola"},"minecraft:custom_name":'{"translate":"item.kaleidoscope_grilling.oil_pot.canola"}'}

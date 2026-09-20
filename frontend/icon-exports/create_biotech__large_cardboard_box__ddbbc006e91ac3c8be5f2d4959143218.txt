@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"cataclysm:the_harbinger"},CapturedEntityDescId:"entity.cataclysm.the_harbinger"}}

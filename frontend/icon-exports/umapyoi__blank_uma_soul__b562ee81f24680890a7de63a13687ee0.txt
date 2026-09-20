@@ -1,0 +1,1 @@
+{"minecraft:rarity":"uncommon","umapyoi:data_location":{name:"umapyoi:tm_opera_o"},"umapyoi:ranking":{ranking:"sr"}}

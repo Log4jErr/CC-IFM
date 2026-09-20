@@ -1,0 +1,1 @@
+{"lightmanscurrency:wallet_data":{AutoExchange:1b,BonusSlots:0,Items:[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}

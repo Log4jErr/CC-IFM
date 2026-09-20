@@ -1,0 +1,1 @@
+{"netmusic:song_info":{artists:["スタジオネネム"],name:"ホシボシノマホウ",time_second:151,url:"https://music.163.com/song/media/outer/url?id=37132083.mp3"}}

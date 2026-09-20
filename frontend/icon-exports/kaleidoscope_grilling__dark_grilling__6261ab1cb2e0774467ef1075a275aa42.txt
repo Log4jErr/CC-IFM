@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{FailedSkewerSource:"kaleidoscope_grilling:raw_beef_skewer"}}

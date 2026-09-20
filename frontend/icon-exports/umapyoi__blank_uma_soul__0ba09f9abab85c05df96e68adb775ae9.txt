@@ -1,0 +1,1 @@
+{"minecraft:rarity":"epic","umapyoi:data_location":{name:"umapyoi:tamamo_cross_festival"},"umapyoi:ranking":{ranking:"ssr"}}

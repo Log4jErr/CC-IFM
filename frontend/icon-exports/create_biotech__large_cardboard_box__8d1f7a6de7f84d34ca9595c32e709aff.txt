@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"cataclysm:cindaria"},CapturedEntityDescId:"entity.cataclysm.cindaria"}}

@@ -1,0 +1,1 @@
+{"minecraft:rarity":"uncommon","umapyoi:data_location":{name:"umapyoi:narita_brian"},"umapyoi:ranking":{ranking:"sr"}}

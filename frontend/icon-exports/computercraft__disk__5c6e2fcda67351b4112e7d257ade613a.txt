@@ -1,0 +1,1 @@
+{"minecraft:dyed_color":{rgb:15905484,show_in_tooltip:0b}}

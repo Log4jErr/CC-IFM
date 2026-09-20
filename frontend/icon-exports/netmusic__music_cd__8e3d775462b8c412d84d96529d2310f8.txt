@@ -1,0 +1,1 @@
+{"netmusic:song_info":{artists:["央广网"],name:"CNR CGTN Radio",time_second:31536000,trans_name:"CNR CGTN Radio",url:"https://sk.cri.cn/am846.m3u8"}}

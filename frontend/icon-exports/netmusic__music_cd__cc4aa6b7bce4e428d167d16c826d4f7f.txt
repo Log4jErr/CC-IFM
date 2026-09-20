@@ -1,0 +1,1 @@
+{"netmusic:song_info":{artists:["桑田貴子"],name:"きみの窓から",time_second:232,url:"https://music.163.com/song/media/outer/url?id=487598857.mp3"}}

@@ -1,0 +1,1 @@
+{"minecraft:rarity":"epic","umapyoi:data_location":{name:"umapyoi:nice_nature_cheer"},"umapyoi:ranking":{ranking:"ssr"}}

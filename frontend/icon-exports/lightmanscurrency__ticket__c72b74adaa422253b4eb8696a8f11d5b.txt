@@ -1,0 +1,1 @@
+{"lightmanscurrency:ticket_id":-1L,"minecraft:dyed_color":{rgb:16776960,show_in_tooltip:0b}}

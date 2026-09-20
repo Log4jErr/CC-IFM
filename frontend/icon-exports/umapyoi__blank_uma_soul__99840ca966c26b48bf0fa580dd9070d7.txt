@@ -1,0 +1,1 @@
+{"minecraft:rarity":"uncommon","umapyoi:data_location":{name:"umapyoi:mr_cb"},"umapyoi:ranking":{ranking:"sr"}}

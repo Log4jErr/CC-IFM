@@ -1,0 +1,1 @@
+{"modulargolems:golem_materials":{parts:[{material:"cataclysm:ignitium",part:"modulargolems:dog_golem_body"},{material:"cataclysm:ignitium",part:"modulargolems:dog_golem_legs"}]}}

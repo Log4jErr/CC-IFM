@@ -1,0 +1,1 @@
+{"minecraft:rarity":"uncommon","umapyoi:data_location":{name:"umapyoi:daiwa_scarlet"},"umapyoi:ranking":{ranking:"sr"}}

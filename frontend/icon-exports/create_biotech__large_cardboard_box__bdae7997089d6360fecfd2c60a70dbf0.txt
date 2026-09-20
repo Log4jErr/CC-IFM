@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"cataclysm:coral_golem"},CapturedEntityDescId:"entity.cataclysm.coral_golem"}}

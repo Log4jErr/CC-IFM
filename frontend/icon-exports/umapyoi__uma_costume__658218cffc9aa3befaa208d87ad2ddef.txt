@@ -1,0 +1,1 @@
+{"umapyoi:cosmetic":"umapyoi:common_costume"}

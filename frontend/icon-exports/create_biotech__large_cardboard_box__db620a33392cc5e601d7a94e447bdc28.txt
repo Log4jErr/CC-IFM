@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"minecraft:zombie_villager"},CapturedEntityDescId:"entity.minecraft.zombie_villager"}}

@@ -1,0 +1,1 @@
+{"minecraft:rarity":"uncommon","umapyoi:data_location":{name:"umapyoi:daitaku_helios"},"umapyoi:ranking":{ranking:"sr"}}

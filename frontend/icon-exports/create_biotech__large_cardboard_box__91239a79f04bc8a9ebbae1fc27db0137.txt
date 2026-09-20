@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"touhou_little_maid:fairy"},CapturedEntityDescId:"entity.touhou_little_maid.fairy"}}

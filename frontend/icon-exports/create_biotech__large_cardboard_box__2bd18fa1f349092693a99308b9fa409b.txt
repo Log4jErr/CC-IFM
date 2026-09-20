@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"takesapillage:clay_golem"},CapturedEntityDescId:"entity.takesapillage.clay_golem"}}

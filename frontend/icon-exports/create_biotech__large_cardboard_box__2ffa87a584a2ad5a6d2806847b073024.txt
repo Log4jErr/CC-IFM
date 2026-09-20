@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"minecraft:evoker"},CapturedEntityDescId:"entity.minecraft.evoker"}}

@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"minecraft:skeleton_horse"},CapturedEntityDescId:"entity.minecraft.skeleton_horse"}}

@@ -1,0 +1,1 @@
+{"touhou_little_maid:maid_info":{IsYsmModel:0b,id:"touhou_little_maid:maid",model_id:"geckolib:winefox_magical_38ffa7d8d6f062b86c6bf88ac47a4c73"}}

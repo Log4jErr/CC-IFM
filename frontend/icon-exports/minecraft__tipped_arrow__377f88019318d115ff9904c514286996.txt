@@ -1,0 +1,1 @@
+{"minecraft:potion_contents":{potion:"create_biotech:super_rotation_potion"}}

@@ -1,0 +1,1 @@
+{"modulargolems:part_material":"modulargolems:sculk"}

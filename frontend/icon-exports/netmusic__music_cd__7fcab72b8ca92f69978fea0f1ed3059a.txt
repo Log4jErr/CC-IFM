@@ -1,0 +1,1 @@
+{"netmusic:song_info":{artists:["央广网"],name:"CNR 音乐之声",time_second:31536000,trans_name:"CNR Music Radio",url:"https://apicnrapp.cnr.cn/html/play.html?channelId=4"}}

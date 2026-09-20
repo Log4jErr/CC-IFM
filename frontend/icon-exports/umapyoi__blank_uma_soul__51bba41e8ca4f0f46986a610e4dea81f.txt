@@ -1,0 +1,1 @@
+{"minecraft:rarity":"epic","umapyoi:data_location":{name:"umapyoi:grass_wonder_umanet"},"umapyoi:ranking":{ranking:"ssr"}}

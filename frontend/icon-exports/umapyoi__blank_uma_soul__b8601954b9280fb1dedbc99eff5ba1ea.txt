@@ -1,0 +1,1 @@
+{"minecraft:rarity":"epic","umapyoi:data_location":{name:"umapyoi:hokko_tarumae_swim"},"umapyoi:ranking":{ranking:"ssr"}}

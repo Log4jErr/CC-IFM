@@ -1,0 +1,1 @@
+{"lightmanscurrency:atm_card_data":{Locked:0b,Validation:-1}}

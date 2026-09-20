@@ -1,0 +1,1 @@
+{"sophisticatedstorage:flat_top":1b,"sophisticatedstorage:wood_type":"acacia"}

@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"cataclysm:amethyst_crab"},CapturedEntityDescId:"entity.cataclysm.amethyst_crab"}}

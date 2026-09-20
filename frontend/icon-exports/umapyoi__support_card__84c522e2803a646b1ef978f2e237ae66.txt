@@ -1,0 +1,1 @@
+{"minecraft:damage":0,"minecraft:max_damage":21,"minecraft:rarity":"epic","umapyoi:data_location":{name:"umapyoi:guts_master_card"},"umapyoi:ranking":{ranking:"ssr"}}

@@ -1,0 +1,1 @@
+{"irons_spellbooks:furled_map_data":{descriptionOverride:{translate:"item.irons_spellbooks.alchemical_trade_route"},destination:"irons_spellbooks:mangrove_hut",dimension:"minecraft:overworld"},"minecraft:lore":['{"color":"gold","translate":"item.irons_spellbooks.furled_map_descriptor_framing","with":[{"translate":"item.irons_spellbooks.alchemical_trade_route"}]}']}

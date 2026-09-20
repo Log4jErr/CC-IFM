@@ -1,0 +1,1 @@
+{"cataclysm:laser_gatling":0b}

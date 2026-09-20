@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"cataclysm:the_prowler"},CapturedEntityDescId:"entity.cataclysm.the_prowler"}}

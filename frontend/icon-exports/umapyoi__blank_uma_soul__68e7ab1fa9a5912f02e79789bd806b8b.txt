@@ -1,0 +1,1 @@
+{"minecraft:rarity":"uncommon","umapyoi:data_location":{name:"umapyoi:daiichi_ruby"},"umapyoi:ranking":{ranking:"sr"}}

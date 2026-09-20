@@ -1,0 +1,1 @@
+{"minecraft:rarity":"uncommon","umapyoi:data_location":{name:"umapyoi:fujimasa_march"},"umapyoi:ranking":{ranking:"sr"}}

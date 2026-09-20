@@ -1,0 +1,1 @@
+{"minecraft:suspicious_stew_effects":[{duration:120,id:"minecraft:mining_fatigue"}]}

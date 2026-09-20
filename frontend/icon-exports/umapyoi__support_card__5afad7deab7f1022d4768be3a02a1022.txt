@@ -1,0 +1,1 @@
+{"minecraft:damage":0,"minecraft:max_damage":10,"umapyoi:data_location":{name:"umapyoi:r_super_creek"},"umapyoi:ranking":{ranking:"r"}}

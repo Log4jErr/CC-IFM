@@ -1,0 +1,1 @@
+{"umapyoi:factor_data":[{factor:"umapyoi:strength_factor",level:5}]}

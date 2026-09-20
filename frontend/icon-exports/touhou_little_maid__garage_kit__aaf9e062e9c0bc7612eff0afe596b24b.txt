@@ -1,0 +1,1 @@
+{"touhou_little_maid:maid_info":{IsYsmModel:0b,id:"touhou_little_maid:maid",model_id:"touhou_little_maid:hakurei_reimu_type_b_9cc0af67a94bdbb6dbae8056ab30c2bc"}}

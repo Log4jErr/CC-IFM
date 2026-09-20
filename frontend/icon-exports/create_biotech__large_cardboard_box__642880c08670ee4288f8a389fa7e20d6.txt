@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"cataclysm:symbiocto"},CapturedEntityDescId:"entity.cataclysm.symbiocto"}}

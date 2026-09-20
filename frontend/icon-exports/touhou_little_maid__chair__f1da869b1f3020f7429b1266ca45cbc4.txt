@@ -1,0 +1,1 @@
+{"touhou_little_maid:is_no_gravity":0b,"touhou_little_maid:model_id":"next_update_model:elite_slime","touhou_little_maid:mounted_height":-0.1875f,"touhou_little_maid:tameable_can_ride":0b}

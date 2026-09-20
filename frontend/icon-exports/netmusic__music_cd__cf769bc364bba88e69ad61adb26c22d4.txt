@@ -1,0 +1,1 @@
+{"netmusic:song_info":{artists:["Mansur Yeşildağ"],name:"Ceddin Deden",readOnly:1b,time_second:130,trans_name:"祖父，先祖",url:"https://music.163.com/song/media/outer/url?id=510265273.mp3"}}

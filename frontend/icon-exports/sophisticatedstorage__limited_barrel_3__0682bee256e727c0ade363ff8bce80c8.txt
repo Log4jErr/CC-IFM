@@ -1,0 +1,1 @@
+{"sophisticatedcore:accent_color":-15295332,"sophisticatedcore:main_color":-15295332}

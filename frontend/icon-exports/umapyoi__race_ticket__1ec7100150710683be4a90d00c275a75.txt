@@ -1,0 +1,1 @@
+{"umapyoi:race":"umapyoi:enif_stakes"}

@@ -1,0 +1,1 @@
+{"minecraft:rarity":"epic","umapyoi:data_location":{name:"umapyoi:satono_diamond_french"},"umapyoi:ranking":{ranking:"ssr"}}

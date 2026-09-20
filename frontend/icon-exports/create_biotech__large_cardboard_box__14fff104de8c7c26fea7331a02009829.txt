@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"cataclysm:netherite_monstrosity"},CapturedEntityDescId:"entity.cataclysm.netherite_monstrosity"}}

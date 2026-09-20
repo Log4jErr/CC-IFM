@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"irons_spellbooks:dead_king_corpse"},CapturedEntityDescId:"entity.irons_spellbooks.dead_king_corpse"}}

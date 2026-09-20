@@ -1,0 +1,1 @@
+{"minecraft:rarity":"epic","umapyoi:data_location":{name:"umapyoi:dumnheint"},"umapyoi:ranking":{ranking:"easter_egg"}}

@@ -1,0 +1,1 @@
+{"minecraft:damage":0,"minecraft:max_damage":24,"minecraft:rarity":"uncommon","umapyoi:data_location":{name:"umapyoi:adv_stamina_card"},"umapyoi:ranking":{ranking:"sr"}}

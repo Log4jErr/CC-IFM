@@ -1,0 +1,1 @@
+{"umapyoi:data_location":{name:"umapyoi:common_uma"},"umapyoi:factor_data":[{factor:"umapyoi:white_guts_factor",level:1}]}

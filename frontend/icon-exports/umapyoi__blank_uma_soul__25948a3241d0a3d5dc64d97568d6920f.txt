@@ -1,0 +1,1 @@
+{"minecraft:rarity":"uncommon","umapyoi:data_location":{name:"umapyoi:el_condor_pasa"},"umapyoi:ranking":{ranking:"sr"}}

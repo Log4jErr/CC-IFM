@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"minecraft:cave_spider"},CapturedEntityDescId:"entity.minecraft.cave_spider"}}

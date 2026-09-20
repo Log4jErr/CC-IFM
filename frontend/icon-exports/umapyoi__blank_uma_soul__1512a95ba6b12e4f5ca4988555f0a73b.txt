@@ -1,0 +1,1 @@
+{"minecraft:rarity":"epic","umapyoi:data_location":{name:"umapyoi:almond_eye"},"umapyoi:ranking":{ranking:"ssr"}}

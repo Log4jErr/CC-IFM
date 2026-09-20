@@ -1,0 +1,1 @@
+{"minecraft:potion_contents":{potion:"untitledduckmod:long_intimidation"}}

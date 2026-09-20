@@ -1,0 +1,1 @@
+{"netmusic:song_info":{artists:["Famishin","Angel Note"],name:"It's a HORI style!",time_second:269,url:"https://music.163.com/song/media/outer/url?id=473403148.mp3"}}

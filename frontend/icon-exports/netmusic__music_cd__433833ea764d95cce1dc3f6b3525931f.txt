@@ -1,0 +1,1 @@
+{"netmusic:song_info":{artists:["池頼広"],name:"神々Cガール",time_second:214,trans_name:"神是中学生",url:"https://music.163.com/song/media/outer/url?id=420664.mp3"}}

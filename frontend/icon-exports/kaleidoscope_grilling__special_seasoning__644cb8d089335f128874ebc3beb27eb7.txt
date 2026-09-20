@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{SeasoningIngredients:["kaleidoscope_grilling:green_chili_powder","kaleidoscope_grilling:sichuan_pepper","kaleidoscope_grilling:onion_powder"]}}

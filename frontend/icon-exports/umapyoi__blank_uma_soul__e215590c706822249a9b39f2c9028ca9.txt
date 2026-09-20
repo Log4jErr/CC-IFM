@@ -1,0 +1,1 @@
+{"minecraft:rarity":"epic","umapyoi:data_location":{name:"umapyoi:gold_city_autumn"},"umapyoi:ranking":{ranking:"ssr"}}

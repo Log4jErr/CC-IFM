@@ -1,0 +1,1 @@
+{"minecraft:entity_data":{id:"minecraft:painting",variant:"minecraft:skull_and_roses"}}

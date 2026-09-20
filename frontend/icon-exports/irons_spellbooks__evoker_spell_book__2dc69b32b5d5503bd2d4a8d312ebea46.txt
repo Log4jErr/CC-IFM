@@ -1,0 +1,1 @@
+{"irons_spellbooks:spell_container":{data:[{id:"irons_spellbooks:fang_strike",index:0,level:6,locked:1b},{id:"irons_spellbooks:fang_ward",index:1,level:4,locked:1b},{id:"irons_spellbooks:summon_vex",index:2,level:4,locked:1b}],maxSpells:10,mustEquip:1b,spellWheel:1b}}

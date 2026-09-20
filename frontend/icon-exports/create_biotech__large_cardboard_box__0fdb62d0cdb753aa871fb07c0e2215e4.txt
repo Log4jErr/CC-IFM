@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"irons_spellbooks:priest"},CapturedEntityDescId:"entity.irons_spellbooks.priest"}}

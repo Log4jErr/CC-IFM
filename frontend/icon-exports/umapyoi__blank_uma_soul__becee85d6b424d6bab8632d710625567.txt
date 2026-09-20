@@ -1,0 +1,1 @@
+{"minecraft:rarity":"epic","umapyoi:data_location":{name:"umapyoi:king_halo_cheer"},"umapyoi:ranking":{ranking:"ssr"}}

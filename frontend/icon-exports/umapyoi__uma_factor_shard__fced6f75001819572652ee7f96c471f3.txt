@@ -1,0 +1,1 @@
+{"umapyoi:factor_data":[{factor:"umapyoi:telent_factor",level:3}]}

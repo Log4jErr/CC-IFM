@@ -1,0 +1,1 @@
+{"minecraft:rarity":"uncommon","umapyoi:data_location":{name:"umapyoi:ks_miracle"},"umapyoi:ranking":{ranking:"sr"}}

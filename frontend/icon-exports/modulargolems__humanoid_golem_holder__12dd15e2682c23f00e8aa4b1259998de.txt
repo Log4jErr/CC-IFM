@@ -1,0 +1,1 @@
+{"modulargolems:golem_materials":{parts:[{material:"cataclysm:ancient_metal",part:"modulargolems:humanoid_golem_body"},{material:"cataclysm:ancient_metal",part:"modulargolems:humanoid_golem_arms"},{material:"cataclysm:ancient_metal",part:"modulargolems:humanoid_golem_legs"}]}}

@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"cataclysm:ignis"},CapturedEntityDescId:"entity.cataclysm.ignis"}}

@@ -1,0 +1,1 @@
+{"modulargolems:part_material":"cataclysm:cursium"}

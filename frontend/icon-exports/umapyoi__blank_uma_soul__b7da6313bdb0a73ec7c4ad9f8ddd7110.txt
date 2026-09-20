@@ -1,0 +1,1 @@
+{"minecraft:rarity":"uncommon","umapyoi:data_location":{name:"umapyoi:oguri_cap"},"umapyoi:ranking":{ranking:"sr"}}

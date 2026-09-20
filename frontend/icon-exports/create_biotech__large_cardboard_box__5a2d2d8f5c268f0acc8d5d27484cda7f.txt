@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"create_biotech:ding_dong_chicken"},CapturedEntityDescId:"entity.create_biotech.ding_dong_chicken"}}

@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"minecraft:wither_skeleton"},CapturedEntityDescId:"entity.minecraft.wither_skeleton"}}

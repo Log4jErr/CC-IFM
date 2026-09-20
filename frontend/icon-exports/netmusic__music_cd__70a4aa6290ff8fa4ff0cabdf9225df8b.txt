@@ -1,0 +1,1 @@
+{"netmusic:song_info":{artists:["池頼広"],name:"あの夏の坂道",time_second:116,trans_name:"那年夏天的坂道",url:"https://music.163.com/song/media/outer/url?id=420693.mp3"}}

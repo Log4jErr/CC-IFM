@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"minecraft:piglin_brute"},CapturedEntityDescId:"entity.minecraft.piglin_brute"}}

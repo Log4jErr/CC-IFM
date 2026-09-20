@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"minecraft:elder_guardian"},CapturedEntityDescId:"entity.minecraft.elder_guardian"}}

@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"goblintraders:vein_goblin_trader"},CapturedEntityDescId:"entity.goblintraders.vein_goblin_trader"}}

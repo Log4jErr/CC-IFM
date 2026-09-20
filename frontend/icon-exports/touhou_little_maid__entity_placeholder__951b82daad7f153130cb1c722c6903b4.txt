@@ -1,0 +1,1 @@
+{"touhou_little_maid:recipe_id":"spawn_lightning_bolt"}

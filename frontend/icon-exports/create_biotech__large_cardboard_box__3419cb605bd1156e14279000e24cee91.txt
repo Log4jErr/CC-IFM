@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"goblintraders:goblin_trader"},CapturedEntityDescId:"entity.goblintraders.goblin_trader"}}

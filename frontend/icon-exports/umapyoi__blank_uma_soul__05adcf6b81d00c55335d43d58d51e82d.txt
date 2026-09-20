@@ -1,0 +1,1 @@
+{"minecraft:rarity":"uncommon","umapyoi:data_location":{name:"umapyoi:seiun_sky"},"umapyoi:ranking":{ranking:"sr"}}

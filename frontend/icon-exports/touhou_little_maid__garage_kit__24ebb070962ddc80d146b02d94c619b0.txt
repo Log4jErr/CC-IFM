@@ -1,0 +1,1 @@
+{"touhou_little_maid:maid_info":{IsYsmModel:0b,id:"touhou_little_maid:maid",model_id:"touhou_little_maid:cirno_slim_af6bc1a4e6e95433d0d72fe108ec09b7"}}

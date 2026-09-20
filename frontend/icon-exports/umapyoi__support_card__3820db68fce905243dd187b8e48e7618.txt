@@ -1,0 +1,1 @@
+{"minecraft:damage":0,"minecraft:max_damage":2,"minecraft:rarity":"epic","umapyoi:data_location":{name:"umapyoi:ssr_three_goddesses"},"umapyoi:ranking":{ranking:"ssr"}}

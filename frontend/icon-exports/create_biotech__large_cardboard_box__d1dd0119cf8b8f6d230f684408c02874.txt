@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"cataclysm:elite_draugr"},CapturedEntityDescId:"entity.cataclysm.elite_draugr"}}

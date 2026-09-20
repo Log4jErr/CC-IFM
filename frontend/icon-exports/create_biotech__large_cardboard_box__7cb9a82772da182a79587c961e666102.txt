@@ -1,0 +1,1 @@
+{"minecraft:custom_data":{CapturedEntity:{id:"minecraft:snow_golem"},CapturedEntityDescId:"entity.minecraft.snow_golem"}}

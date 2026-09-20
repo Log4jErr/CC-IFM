@@ -1,0 +1,1 @@
+{"kaleidoscope_doll:doll_entity":{doll_block_state:{Name:"kaleidoscope_doll:doll_23",Properties:{facing:"south",waterlogged:"false"}}}}
