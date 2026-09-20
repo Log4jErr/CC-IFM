@@ -2399,8 +2399,23 @@ end
 -- 主控必须把它逐条结算（这里是两条：一条 done、一条 error）。
 do
     local fakeModem = { open = function() end, isOpen = function() return true end, close = function() end }
+    --- 日志桩：warn 单独记下来（applyQueryResult 在 worker 报错时会 warn）。主控的 log 是
+    --- Util.makeLogger 的产物：**既能直接调用**，又有 .warn / .error 字段 —— 这里照着做一个，
+    --- 否则那条分支在测试里会直接崩掉（Lua 里函数不能被索引，所以得用带 __call 的表）。
+    local logWarnings = {}
+    local logStub = setmetatable({}, {
+        __call = function() end,
+        __index = function(_, key)
+            if key == "warn" or key == "error" then
+                return function(fmt, ...)
+                    logWarnings[#logWarnings + 1] = string.format(fmt, ...)
+                end
+            end
+            return nil
+        end,
+    })
     local t = TransferModule.new({
-        log = function() end,
+        log = logStub,
         Modems = {
             find = function() return fakeModem, 'back' end,
             asModem = function() return fakeModem, 'back' end,
@@ -2470,6 +2485,33 @@ do
     check('a single query_result message is settled through the same method',
         t.queryCache['scan:chest_2'] ~= nil and t.queries[23] == nil,
         'cached=' .. tostring(t.queryCache['scan:chest_2'] ~= nil))
+
+    --- 用户第 4 项（worker 显示大量"任务超时，已丢弃"）：
+    --- worker 明确回报"那台外设不响应"（ok = false）时，主控必须**立刻**知道这条扫描结束了
+    --- （onQueryDropped）—— 否则那个容器的扫描任务会一直挂在 inflight，直到 QUERY_TIMEOUT(10s)
+    --- 才作废：扫描队列每秒空转、日志里只有超时，真正的原因（哪台外设）还看不到。
+    local droppedKey, droppedReason = nil, nil
+    t.onQueryDropped = function(key, reason)
+        droppedKey = key
+        droppedReason = reason
+    end
+    t.queries = { [24] = { id = 24, key = 'scan:chest_3', worker = 7, at = os.epoch('utc') } }
+    t.queryRunning['scan:chest_3'] = 24
+    t:onModemMessage('back', TransferModule.CHANNEL, 0, {
+        proto = 'ifm_transfer', op = 'results', from = 7, version = 'test', slots = 64,
+        results = {
+            { op = 'query_result', id = 24, ok = false, error = 'peripheral chest_3 is not answering' },
+        },
+    }, 0)
+    check('a failed query_result notifies the master right away (onQueryDropped)',
+        droppedKey == 'scan:chest_3' and tostring(droppedReason):find('not answering', 1, true) ~= nil and
+            t.queries[24] == nil and t.queryRunning['scan:chest_3'] == nil and
+            t.queryCache['scan:chest_3'] == nil,
+        'key=' .. tostring(droppedKey) .. ' reason=' .. tostring(droppedReason))
+    check('the failed query is logged with its container key',
+        #logWarnings > 0 and tostring(logWarnings[#logWarnings]):find('scan:chest_3', 1, true) ~= nil,
+        'warnings=' .. tostring(#logWarnings) .. ' last=' .. tostring(logWarnings[#logWarnings]))
+    t.onQueryDropped = nil
     t.onQueryResult = nil
 end
 

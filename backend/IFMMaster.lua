@@ -1569,10 +1569,68 @@ local function afterScan(name, now)
     queueMissingDetails()
 end
 
+--- ===== 用户第 4 项：一台不响应的容器外设不再拖垮扫描队列 =====
+--- 现场症状：worker 屏幕上"任务超时，已丢弃"一路涨，可所有存储外设看着都正常。
+--- 原因链：某台容器外设（区块没加载 / 外设刚拆 / 有线网线松了）对 list() 永不返回 ⇒
+---   worker 那边的任务挂 60 秒才被摘掉（stuck +1），主控这边 10 秒就判超时 ⇒
+---   扫描队列下一轮**立刻**又重派同一个容器 ⇒ 又挂 ⇒ stuck 一路涨、队列每秒空转。
+--- 现在：同一台容器连续失败 SCAN_BACKOFF_AFTER 次就停扫 SCAN_BACKOFF_MS，并**点名是哪台外设**；
+--- 期间扫描任务只是排回队列（不占 worker 槽位、不发 modem），到点自动重试；成功一次立刻恢复。
+local SCAN_BACKOFF_AFTER = 3
+local SCAN_BACKOFF_MS = 30000
+local scanFailStreak = {}      -- 容器名 -> { count, firstAt, lastReason }
+local scanBackoffUntil = {}    -- 容器名 -> 冷却截止（os.epoch("utc") + ms）
+local scanBackoffLogAt = {}    -- 容器名 -> 上次普通失败提示时间（避免刷屏）
+
+--- 记一次容器扫描失败（查询超时 / worker 报错 / worker 掉线）：
+--- 连续失败到阈值就进入冷却，并把原因写进日志 —— 排查时直接看这一行就知道是哪台外设。
+local function noteScanFailure(name, reason)
+    if type(name) ~= "string" or name == "" then
+        return
+    end
+    local now = os.epoch("utc")
+    local streak = scanFailStreak[name]
+    if not streak or now - (streak.firstAt or 0) > 60000 then
+        streak = { count = 0, firstAt = now }
+        scanFailStreak[name] = streak
+    end
+    streak.count = streak.count + 1
+    streak.lastReason = reason
+    if streak.count >= SCAN_BACKOFF_AFTER and (scanBackoffUntil[name] or 0) <= now then
+        scanBackoffUntil[name] = now + SCAN_BACKOFF_MS
+        log("Container scan for %s failed %d time(s) in a row (last: %s) - skipping that container for %ds " ..
+            "so it stops filling the queues; check that peripheral (chunk loaded? cable? was it removed?)",
+            tostring(name), streak.count, tostring(reason or "unknown"), math.floor(SCAN_BACKOFF_MS / 1000))
+    elseif now - (scanBackoffLogAt[name] or 0) >= 60000 then
+        scanBackoffLogAt[name] = now
+        log("Container scan for %s failed (%s) - it will be retried next round", tostring(name),
+            tostring(reason or "unknown"))
+    end
+end
+
+--- 这个容器成功了：清掉失败计数与冷却（冷却期间恢复的话也写一行）
+local function noteScanSuccess(name)
+    if type(name) ~= "string" or name == "" then
+        return
+    end
+    local was = scanBackoffUntil[name]
+    scanFailStreak[name] = nil
+    scanBackoffUntil[name] = nil
+    scanBackoffLogAt[name] = nil
+    if was and was > os.epoch("utc") then
+        log("Container scan for %s works again - its scans are resumed", tostring(name))
+    end
+end
+
 local function scanTaskRunner(task, now)
     local name = task.name
     if not peripherals:exists(name) then
         return "drop"                      -- 外设没了：撤掉任务（它回来时生成器会重新排一条）
+    end
+    --- 用户第 4 项：这台容器正在冷却（连续失败）—— 排回队列但不再重派（不发 modem、不占槽位）
+    local backoffUntil = scanBackoffUntil[name]
+    if backoffUntil and backoffUntil > now then
+        return true
     end
     local state, value = transfer:submitScan(name)
     if state == "done" and type(value) == "table" then
@@ -1829,8 +1887,9 @@ transfer.onQueryDropped = function(key, reason)
         return
     end
     finishScanInflight(name)
-    log("Container scan for %s was dropped (%s) - it will be scanned again next round",
-        tostring(name), tostring(reason or "unknown"))
+    --- 用户第 4 项：把失败记下来（连续失败到阈值就停扫一会儿），日志由 noteScanFailure 输出
+    --- （它自己按分钟节流，所以不会每秒刷屏；原因里会带上是哪台外设）。
+    noteScanFailure(name, reason)
 end
 
 --- worker 代扫回来了：写进容器快照，并结束对应的扫描队列任务（在飞 → 出队）
@@ -1839,6 +1898,8 @@ transfer.onQueryResult = function(_, key, message)
     if not name then
         return
     end
+    --- 用户第 4 项：这台容器答话了 —— 清掉失败计数与冷却（冷却中恢复时日志会写一行）
+    noteScanSuccess(name)
     --- 用户第 4 项（资源大面积消失）：worker 可能**看不到**这个容器（不在同一有线网络 / 区块没加载 /
     --- 外设刚被拆）—— 那种情况下它回报的是"扫到 0 个容器 + 空表"。以前主控照单全收，于是这个容器的
     --- 快照被清空（网页上大批资源凭空消失，往往只剩别的容器里还有的那几种）。

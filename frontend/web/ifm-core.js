@@ -316,6 +316,13 @@
             tipCrafting: '正在合成', tipCraftTarget: '剩余目标',
             nbtHash: 'NBT 哈希', nbtAny: '留空=无 NBT',
             tagScanning: '标签扫描中 {done}/{total}', tagScanByWorkers: 'worker 代查 {n}', tagsCached: '已缓存 {n} 种物品标签',
+            // ===== 用户第 1/2 项：登录页帮助按钮 + 标题行图标化 =====
+            help: '帮助', helpHint: '打开 GitHub 仓库（安装说明、更新与问题反馈）',
+            statusTags: '已缓存的物品标签种类',
+            transferWorkersHint: '从节点搬运的 IFMWorker 台数',
+            transferInFlight: '在途任务：{pending}',
+            dispatchSteps: '调度器累计推进的步数',
+            statusQueue: '{queue}：排队 {depth} · 在飞 {inflight}',
             relayHint: '连不上itty.socket公共中转时可自建中转，或者使用代理/VPN',
             versionLabel: '前端 v{client}',
             versionServer: '服务端 v{server}',
@@ -547,6 +554,13 @@
             craftable: 'Craftable', noValue: '—',
             nbtHash: 'NBT hash', nbtAny: 'empty = no NBT',
             tagScanning: 'Scanning tags {done}/{total}', tagScanByWorkers: '{n} read by workers', tagsCached: 'Cached tags for {n} item types',
+            // ===== Issue 1/2: login help button + icon-only status line =====
+            help: 'Help', helpHint: 'Open the GitHub repository (install guide, updates, issues)',
+            statusTags: 'Item tag types cached',
+            transferWorkersHint: 'IFMWorker nodes doing the moving',
+            transferInFlight: 'Tasks in flight: {pending}',
+            dispatchSteps: 'Scheduler steps taken so far',
+            statusQueue: '{queue}: {depth} queued · {inflight} in flight',
             relayHint: 'If the public relay is unreachable, self-host a broadcast relay and put its url above',
             versionLabel: 'frontend v{client}',
             versionServer: 'server v{server}',
@@ -990,7 +1004,7 @@
         setDisplay('loginOverlay', 'none');
         setDisplay('app', 'block');
         setConnectionStatus('online');
-        toast(t('connectedTo', { room: room }), 'success');
+        toast(t('connectedTo', { room: '****' }), 'success');
     }
 
     function fmtCount(value) {
@@ -1117,14 +1131,35 @@
         }
     }
 
-    // IFMWorker 搬运卸载状态（顶部显示）：有 worker 时显示数量与在途任务，否则显示“本机搬运”
+    // ===== 用户第 2 项：标题行只留「图标 + 数字」=====
+    // 以前这里是一长串中文明细（"已缓存 334 种物品标签 从节点搬运：7 台 · 在途 0 ..."），
+    // 挤在一行里既看不出重点，也没法一眼扫。现在每个数字前放一个图标，含义全部移到悬停提示里
+    // （图标与数字都带 title，鼠标停在谁上面都能看到它是什么）。
+    function statusStatHtml(glyph, value, hint) {
+        return '<i class="fa ' + glyph + ' status-icon"' +
+            (hint ? ' title="' + escapeHtml(hint) + '"' : '') + '></i>' +
+            '<span class="status-value">' + escapeHtml(value === null || value === undefined ? '' : String(value)) +
+            '</span>';
+    }
+
+    // IFMWorker 搬运卸载状态（顶部显示）：有 worker 时显示台数与在途任务，否则显示“本机搬运”
     function renderTransferInfo() {
         const node = el('transferInfo');
         if (!node) return;
         const info = status ? status.transfer : null;
         if (info && info.available) {
             const scan = info.scan || {};
-            node.textContent = t('transferWorkers', { n: info.workers, pending: info.pending || 0 });
+            const workers = info.workers || 0;
+            const pending = info.pending || 0;
+            node.innerHTML = statusStatHtml('fa-truck', workers, t('transferWorkersHint')) +
+                statusStatHtml('fa-hourglass-half', pending, t('transferInFlight', { pending: pending })) +
+                statusStatHtml('fa-magnifying-glass', scan.cached || 0, t('transferScanHint', {
+                    cached: scan.cached || 0,
+                    containers: scan.containers || 0,
+                    localOnly: scan.localOnly || 0,
+                    blind: scan.blind || 0,
+                    paused: scan.pauseLeft || 0
+                }));
             node.title = t('transferHint', {
                 channel: info.channel,
                 done: info.done || 0,
@@ -1141,9 +1176,9 @@
             node.style.color = ((scan.blind || 0) > 0 || (scan.paused || 0) > 0) ? 'var(--warn)' : '';
             return;
         }
-        node.textContent = info ? t('transferNone') : '';
+        node.innerHTML = info ? statusStatHtml('fa-desktop', t('transferNone'), t('transferHintNone')) : '';
         node.title = t('transferHintNone');
-        node.style.color = info ? '' : '';
+        node.style.color = '';
     }
 
     // 调度器信息（1.7.0）：模式 + 各队列深度/在途 + 每轮耗时。
@@ -1167,12 +1202,36 @@
         return dispatchI18n(key, dispatchI18n('dispatchModeUnknown', raw));
     }
 
+    // 各队列 / 各调度模式的图标（用户第 2 项：标题行只留图标 + 数字，含义在悬停提示里）。
+    function dispatchQueueGlyph(name) {
+        if (name === 'process') return 'fa-cogs';
+        if (name === 'storageScan') return 'fa-archive';
+        if (name === 'inputScan') return 'fa-sign-in';
+        if (name === 'interactionScan') return 'fa-cubes';
+        if (name === 'outputScan') return 'fa-sign-out';
+        if (name === 'inventoryIn') return 'fa-arrow-down';
+        if (name === 'inventoryOut') return 'fa-arrow-up';
+        if (name === 'compact') return 'fa-compress';
+        if (name === 'stackScan') return 'fa-layer-group';
+        if (name === 'detail') return 'fa-info-circle';
+        if (name === 'manual') return 'fa-hand-pointer';
+        return 'fa-list';
+    }
+
+    function dispatchModeGlyph(mode) {
+        if (mode === 'local') return 'fa-desktop';
+        if (mode === 'remote') return 'fa-server';
+        if (mode === 'mixed') return 'fa-random';
+        if (mode === 'paused') return 'fa-pause';
+        return 'fa-question';
+    }
+
     function renderDispatchInfo() {
         const node = el('dispatchInfo');
         if (!node) return;
         const info = status && status.dispatch;
         if (!info) {
-            node.textContent = '';
+            node.innerHTML = '';
             node.title = '';
             return;
         }
@@ -1182,7 +1241,13 @@
             const depth = queue.depth || 0;
             const inflight = queue.inflight || 0;
             if (depth > 0 || inflight > 0) {
-                short.push(dispatchQueueLabel(queue.name) + ' ' + depth + (inflight > 0 ? '+' + inflight : ''));
+                // 一个队列 = 一个图标 + 一个数字（该队列没干完的量：排队 + 在飞）
+                short.push(statusStatHtml(dispatchQueueGlyph(queue.name), depth + inflight,
+                    t('statusQueue', {
+                        queue: dispatchQueueLabel(queue.name),
+                        depth: depth,
+                        inflight: inflight
+                    })));
             }
             detail.push(dispatchQueueLabel(queue.name) + ': depth=' + depth + ' (active=' + (queue.active || 0) +
                 ' waiting=' + (queue.waiting || 0) + ') inflight=' + inflight +
@@ -1191,8 +1256,10 @@
                 ' promoted=' + (queue.promoted || 0) +
                 ' needs=' + (queue.needs || 'none') + ' policy=' + (queue.policy || 'retry'));
         });
-        node.textContent = t('dispatchMode', { mode: dispatchModeLabel(info.mode), steps: info.steps || 0 }) +
-            (short.length > 0 ? ' · ' + short.join(' ') : '');
+        node.innerHTML = statusStatHtml(dispatchModeGlyph(info.mode), '',
+                t('dispatchMode', { mode: dispatchModeLabel(info.mode), steps: fmtCount(info.steps || 0) })) +
+            statusStatHtml('fa-forward-step', fmtCount(info.steps || 0), t('dispatchSteps')) +
+            short.join('');
         node.title = t('dispatchHint', {
             mode: dispatchModeLabel(info.mode), steps: info.steps || 0,
             last: Math.round((info.lastMs || 0) * 10) / 10,

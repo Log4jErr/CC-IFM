@@ -55,6 +55,17 @@
         node.textContent = pendingCount > 0 ? t('pendingRequests', { n: pendingCount }) : '';
     }
 
+    // 用户第 3 项：房间号 / 中继地址在标题行里一律显示成 ****（截图、录屏、直播时不泄露），
+    // 鼠标悬停才显示真实值（title 里放原文）。登录页的输入框保持明文 —— 那个是要编辑的。
+    function maskText(id, value) {
+        const node = el(id);
+        if (!node) return;
+        const text = (value === null || value === undefined) ? '' : String(value);
+        node.textContent = text ? '****' : '';
+        node.title = text;
+        node.classList.toggle('masked', text !== '');
+    }
+
     function sendRequest(action, data) {
         return new Promise(function (resolve, reject) {
             if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -323,8 +334,8 @@
         setCookie('ifm_relay', relayBase, 365);
         setConnectionStatus('connecting');
         setText('loginError', '');
-        setText('roomLabel', '#' + room);
-        setText('relayLabel', relayBase);
+        maskText('roomLabel', '#' + room);
+        maskText('relayLabel', relayBase);
         let socket;
         try {
             socket = new WebSocket(relayBase + encodeURIComponent(room));
@@ -462,19 +473,24 @@
         refreshTooltip();
     }
 
-    // 顶部状态：标签缓存 / 存储整理进度（整理进度有独立的进度条，见 renderCompactProgress）
+    // 顶部状态（用户第 2 项）：只显示「图标 + 数字」，含义在悬停提示里（以前是一长串中文明细）
     function renderStatus() {
         const node = el('tagInfo');
         if (node) {
             const scan = status ? status.tagScan : null;
             if (scan && scan.queued > 0) {
-                node.textContent = t('tagScanning', { done: scan.scanned, total: scan.queued }) +
-                    // 其中有多少是 worker 代查回来的（主控没做阻塞的 getItemDetail）
-                    (scan.fromWorkers ? ' · ' + t('tagScanByWorkers', { n: scan.fromWorkers }) : '');
+                // 标签扫描进行中：转圈图标 + 进度数字（提示里写全“标签扫描中 {done}/{total}”）
+                node.innerHTML = statusStatHtml('fa-spinner fa-spin',
+                    fmtCount(scan.scanned) + '/' + fmtCount(scan.queued),
+                    t('tagScanning', { done: scan.scanned, total: scan.queued }) +
+                    (scan.fromWorkers ? ' · ' + t('tagScanByWorkers', { n: scan.fromWorkers }) : ''));
+                node.title = t('tagScanning', { done: scan.scanned, total: scan.queued });
             } else if (status && status.tags) {
-                node.textContent = t('tagsCached', { n: status.tags });
+                node.innerHTML = statusStatHtml('fa-tags', fmtCount(status.tags), t('statusTags'));
+                node.title = t('tagsCached', { n: status.tags });
             } else {
-                node.textContent = '';
+                node.innerHTML = '';
+                node.title = '';
             }
         }
         renderCapacity();

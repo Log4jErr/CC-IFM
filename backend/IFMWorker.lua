@@ -548,6 +548,55 @@ local lastStateAt = 0
 local lastQuery = nil          -- 最近一次查询的摘要（连同状态一起上报给主控）
 local stuckTotal = 0           -- 因为超时被摘掉的卡住任务数（>0 说明有容器/外设长时间不响应）
 
+--- ===== 挂住的外设（用户第 4 项）=====
+--- 现场：worker 屏幕上"任务超时，已丢弃"一路涨，可所有存储外设看起来都很正常。
+--- 原因：CC:T 的外设调用是**阻塞**的 —— 某台外设（区块没加载 / 外设刚拆 / 有线网线断了）
+--- 不响应时，那次调用永远不返回，任务就挂在等待里直到 TASK_TIMEOUT(60s) 才被摘掉。
+--- 摘掉之后主控并不知道是谁挂住了：它会立刻重派同样的活（还是那台外设）→ 又挂 60 秒……
+--- 于是 stuck 计数一路涨、扫描队列每秒空转，看起来"永远好不了"。
+--- 现在被摘掉的任务涉及的**外设名**进怀疑名单：STUCK_PERIPHERAL_COOLDOWN 秒内碰到它的任务
+--- 立刻失败并**写明是哪台外设**（不再白占 60 秒槽位）——主控日志里就能直接看到它。
+local STUCK_PERIPHERAL_COOLDOWN = 30
+local stuckPeripherals = {}      -- 外设名 -> 冷却截止（os.epoch("utc") + ms）
+local stuckPeripheralWarned = {} -- 外设名 -> 是否已经提示过（避免刷屏）
+
+--- 这条消息会碰哪些容器外设（job 的 from/to、query 的 container）：
+--- 外设挂住时就是它让任务卡在等待里，所以任务与消息都要记下它。
+local function peripheralNamesOf(message)
+    local out = {}
+    if type(message) ~= "table" then
+        return out
+    end
+    local function add(name)
+        if type(name) == "string" and name ~= "" then
+            out[#out + 1] = name
+        end
+    end
+    if message.op == "query" then
+        add(pickContainer(message))
+    else
+        add(message.from)
+        add(message.to)
+    end
+    return out
+end
+
+--- 这条消息碰到"刚挂住过"的外设吗？有就返回那台外设名（调用方按各自的失败形状回报）
+local function suspendedPeripheralOf(message)
+    local now = os.epoch("utc")
+    for _, name in ipairs(peripheralNamesOf(message)) do
+        local untilAt = stuckPeripherals[name]
+        if untilAt then
+            if untilAt <= now then
+                stuckPeripherals[name] = nil
+            else
+                return name
+            end
+        end
+    end
+    return nil
+end
+
 --- ===== 并行任务表 =====
 --- tasks[id] = { id, kind, text, co, startedAt, onDone }
 --- taskOrder = 按启动顺序排的任务号（保证屏幕上显示的顺序稳定）
@@ -643,9 +692,31 @@ local function dropStuckTasks(now)
         local task = tasks[taskOrder[index]]
         if task and now - (task.startedAt or now) > TASK_TIMEOUT * 1000 then
             stuckTotal = stuckTotal + 1
+            --- 用户第 4 项：把这条任务碰到的外设记进怀疑名单 —— 主控下一轮就会看到明确的失败原因
+            --- （"peripheral X is not answering"），而不是又一次 60 秒的白等；日志里点名外设，
+            --- 在 worker 屏幕上就能直接看出来是谁不响应。
+            local names = task.peripherals or {}
+            for _, name in ipairs(names) do
+                stuckPeripherals[name] = now + STUCK_PERIPHERAL_COOLDOWN * 1000
+                stuckPeripheralWarned[name] = nil
+            end
+            local blamed = #names > 0 and table.concat(names, ", ") or "unknown peripheral"
             workerLog("task #" .. tostring(task.id) .. " (" .. tostring(task.text) ..
                 ") has been waiting for more than " .. tostring(TASK_TIMEOUT) ..
-                "s - dropping it so the slot is free again (that container/peripheral is not answering)")
+                "s - dropping it so the slot is free again; " .. tostring(blamed) ..
+                " did not answer - tasks touching it fail fast for " ..
+                tostring(STUCK_PERIPHERAL_COOLDOWN) .. "s")
+            --- 立刻按这条任务本来的形状回报失败：主控不必再白等它自己的 20s/10s 超时；
+            --- 日志里也因此直接出现是哪台外设，而不是一条没有上下文的“job timeout”。
+            local why = "abandoned: " .. tostring(blamed) .. " did not answer within " ..
+                tostring(TASK_TIMEOUT) .. "s"
+            if task.op == "query" then
+                queueResult({ op = "query_result", id = task.id, ok = false, error = why })
+            elseif task.op == "detail" then
+                queueResult({ op = "detail_result", id = task.id, ok = false, error = why })
+            elseif task.op == "job" then
+                queueResult({ op = "error", id = task.id, moved = 0, error = why })
+            end
             tasks[task.id] = nil
             table.remove(taskOrder, index)
         end
@@ -751,7 +822,10 @@ local function startTask(message, kind, text, body, onDone)
     if id == nil or tasks[id] then
         return false
     end
-    local task = { id = id, kind = kind, text = text, startedAt = os.epoch("utc"), onDone = onDone }
+    local task = { id = id, kind = kind, text = text, startedAt = os.epoch("utc"), onDone = onDone,
+        --- 用户第 4 项：记下这条任务碰的外设 —— 它要是挂住了（60s 没跑完被摘掉），
+        --- 这些名字会进怀疑名单，让后续任务立刻失败并写清原因（见 dropStuckTasks）
+        peripherals = peripheralNamesOf(message), op = message.op }
     task.co = coroutine.create(function()
         local ok, result = pcall(body)
         task.ok = ok
@@ -905,6 +979,20 @@ local function handleMessage(message, fromEnvelope)
                 error = "already executed earlier (result expired)" })
             return
         end
+        --- 用户第 4 项：from / to 里有一台刚挂住过的外设（上次的调用 60s 没返回）——
+        --- 立刻按失败回报并写明是谁，别再让这条任务白占 60 秒槽位（主控日志会显示外设名）。
+        local stuckMove = suspendedPeripheralOf(message)
+        if stuckMove then
+            local why = "peripheral " .. tostring(stuckMove) .. " is not answering (it did not answer for " ..
+                tostring(TASK_TIMEOUT) .. "s; that peripheral is skipped for " ..
+                tostring(STUCK_PERIPHERAL_COOLDOWN) .. "s)"
+            if not stuckPeripheralWarned[stuckMove] then
+                stuckPeripheralWarned[stuckMove] = os.epoch("utc")
+                workerLog("refusing moves touching " .. tostring(stuckMove) .. ": " .. why)
+            end
+            queueResult({ op = "error", id = message.id, moved = 0, error = why })
+            return
+        end
         --- 任务表满了（64 条在跑）才回 busy：主控会把这条活交给别的 worker 或自己本机做
         if rejectFull(message) then
             return
@@ -980,7 +1068,21 @@ local function handleMessage(message, fromEnvelope)
         if resendTask(message) then
             return
         end
-        --- 任务表满了才回 busy（1.8.0：worker 一次能并行 64 条）
+        --- 用户第 4 项：这个容器刚挂住过（上次的 list() 调用 60s 没返回）——立刻回报失败并写明
+        --- 是哪台外设（主控日志里直接可见），不再让扫描白等 60 秒（见文件顶部的怀疑名单）。
+        local stuckQuery = suspendedPeripheralOf(message)
+        if stuckQuery then
+            local why = "peripheral " .. tostring(stuckQuery) .. " is not answering (it did not answer for " ..
+                tostring(TASK_TIMEOUT) .. "s; that peripheral is skipped for " ..
+                tostring(STUCK_PERIPHERAL_COOLDOWN) .. "s)"
+            if not stuckPeripheralWarned[stuckQuery] then
+                stuckPeripheralWarned[stuckQuery] = os.epoch("utc")
+                workerLog("refusing scans of " .. tostring(stuckQuery) .. ": " .. why)
+            end
+            queueResult({ op = "query_result", id = message.id, ok = false, error = why })
+            return
+        end
+        --- 任务表满了（1.8.0：worker 一次能并行 64 条）才回 busy：主控会把这条活交给别人 / 自己本机做
         if rejectFull(message) then
             return
         end

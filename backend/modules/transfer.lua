@@ -1125,7 +1125,14 @@ function Transfer:applyQueryResult(message, worker)
     self.queryRunning[record.key] = nil
     if message.ok == false then
         self.queryStats.failed = self.queryStats.failed + 1
-        self.log.warn("IFMWorker #%s query failed: %s", tostring(worker.id), tostring(message.error))
+        self.log.warn("IFMWorker #%s query failed (%s): %s", tostring(worker.id),
+            tostring(record.key), tostring(message.error))
+        --- 用户第 4 项：worker 明确报错（例如"那台外设不响应"）时也要通知主控 ——
+        --- 否则那条容器的扫描任务会一直挂在 inflight，等到 QUERY_TIMEOUT(10s) 才作废：
+        --- 表现就是扫描队列每秒空转、日志里全是超时（真正的原因还看不到）。
+        if self.onQueryDropped then
+            pcall(self.onQueryDropped, record.key, "worker reported: " .. tostring(message.error))
+        end
         return true
     end
     message.key = record.key
@@ -1594,10 +1601,10 @@ function Transfer:tick(now)
                 else
                     hint = " (no ack: the request may not have reached that worker - check its channel/network)"
                 end
-                self.log("IFMWorker #%s%s did not answer query #%s within %dms (%d attempt(s) incl. resends) - " ..
+                self.log("IFMWorker #%s%s did not answer query #%s for %s within %dms (%d attempt(s) incl. resends) - " ..
                     "dropped so it can be used again%s",
-                    tostring(query.worker), self:workerLabel(worker), tostring(query.id or 0), QUERY_TIMEOUT,
-                    query.attempts or 1, hint)
+                    tostring(query.worker), self:workerLabel(worker), tostring(query.id or 0), tostring(query.key),
+                    QUERY_TIMEOUT, query.attempts or 1, hint)
                 if isScan then
                     self.log("IFMWorker scan: that container is read by the master this round and retried later " ..
                         "(one query per container now, so a slow container no longer blocks the others)")
@@ -1666,9 +1673,11 @@ function Transfer:tick(now)
                 worker.timeouts = (worker.timeouts or 0) + 1
             end
             -- 日志把“是谁、等了多久、哪次搬运”都写清楚：这样不用翻网页就知道该去哪台机器上看
-            self.log("IFMWorker #%s%s did not answer job #%s within %dms (%s) - dropped, the engine will retry; " ..
-                "check that worker's screen (wired modem required) and its cable",
-                tostring(job.worker), self:workerLabel(worker), tostring(job.id or 0), JOB_TIMEOUT, tostring(job.key))
+            local move = job.job or {}
+            self.log("IFMWorker #%s%s did not answer job #%s (%s -> %s) within %dms (%s) - dropped, the engine " ..
+                "will retry; check that worker's screen (a container that never answers keeps it stuck)",
+                tostring(job.worker), self:workerLabel(worker), tostring(job.id or 0),
+                tostring(move.from), tostring(move.to), JOB_TIMEOUT, tostring(job.key))
         elseif job.state ~= "pending" and now - (job.at or 0) > JOB_TIMEOUT then
             --- 已经出结果但没人来取（引擎那边放弃了这次搬运）：直接清掉，别让表一直涨
             self.jobs[job.key] = nil
