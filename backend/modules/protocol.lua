@@ -7,7 +7,7 @@
 --               { action = "full_sync_end", categories = {...} }   （全量发完了；网页据此一次性替换本地数据）
 --   删除项带 _deleted = true；空闲时定期回 heartbeat。
 -- 传输使用 itty.ws 中转：wss://itty.ws/c/<房间号>
--- 连接是**异步**的：http.websocketAsync 立刻返回，websocket_success / websocket_failure 事件
+-- 连接是异步的：http.websocketAsync 立刻返回，websocket_success / websocket_failure 事件
 -- 在 Protocol:onEvent 里处理（同步的 http.websocket 会阻塞主循环，已弃用）。
 
 local Protocol = {}
@@ -46,7 +46,7 @@ local KEY_FIELDS = {
 local SCALAR_CATEGORIES = { status = true }
 
 --- 推送策略（1.6.12）：
----   * 服务端**不设 WebSocket 收发的速率硬限制**（用户第 7 项要求）——
+---   * 服务端不设 WebSocket 收发的速率硬限制（用户第 7 项要求）——
 ---     推送由“状态变更计数”（cache.revision）驱动：有变化就推，同一 tick 内多次请求只推一次；
 ---   * 没有变化时仍有 updateInterval 兜底刷新；推送失败时用同一个间隔退避重试。
 --- 想恢复旧行为（最快 N 毫秒一次 / 按推送耗时放大间隔）时，传 minPushInterval 即可。
@@ -55,7 +55,7 @@ local DEFAULT_MIN_PUSH_GAP_MS = 0
 --- 异步连接的超时（毫秒）：http.websocketAsync 立刻返回，结果靠 websocket_success /
 --- websocket_failure 事件送达。万一两个事件都没来（中继静默丢包），超过这个时间就
 --- 允许再发一次连接请求 —— 不然“一直在连”的状态会被卡死。
-local CONNECT_TIMEOUT_MS = 10000
+local CONNECT_TIMEOUT_MS = 35000
 
 local function keyOf(category, item)
     local fields = KEY_FIELDS[category]
@@ -113,14 +113,14 @@ function Protocol.new(opts)
     self.onConnect = opts.onConnect
     self.updateInterval = opts.updateInterval or 2
     --- 浏览器请求之后那次推送的最小间隔（毫秒）。
-    --- 1.6.12：**默认 0 = 不设硬限制** —— 有数据变化就立刻推（用户第 7 项要求：
+    --- 1.6.12：默认 0 = 不设硬限制 —— 有数据变化就立刻推（用户第 7 项要求：
     --- 服务端不应当对 WebSocket 收发数据包做速率硬限制）。
     --- 仍然存在的两件事：① 一次推送会全量收集（读容器）——为了不把主循环压垮，
-    --- 推送**按“状态变更计数”驱动**：只有自上次推送后有变化（cache.revision 变了）才会再推，
+    --- 推送按“状态变更计数”驱动：只有自上次推送后有变化（cache.revision 变了）才会再推，
     --- 同一 tick 里多次请求只会合并成一次推送；② 推送失败时退避到下一个间隔再试。
     --- 需要立刻全量的场合（浏览器刚接入 / 点了刷新 / full_request）仍然用 pushUpdates(true)。
     self.minPushInterval = opts.minPushInterval or DEFAULT_MIN_PUSH_GAP_MS
-    --- 两次增量推送之间的**实际**下限：只由 minPushInterval 决定（默认 0）
+    --- 两次增量推送之间的实际下限：只由 minPushInterval 决定（默认 0）
     self.pushGap = math.max(self.minPushInterval, 0)
     --- 状态变更计数提供者（一般是 cache.revision）：变了就推
     self.revisionProvider = opts.revisionProvider
@@ -137,9 +137,36 @@ function Protocol.new(opts)
     self.maxLogChunk = opts.maxLogChunk or 40
     self.ws = nil
     self.connected = false
-    --- 是否有一次**异步**连接请求在飞（http.websocketAsync 已发出、还没等到 websocket_success/failure）
+    --- 是否有一次异步连接请求在飞（http.websocketAsync 已发出、还没等到 websocket_success/failure）
     self.connecting = false
     self.connectRequestedAt = 0
+    --- 我们自己关掉的 socket 数：CC:T 的关闭事件是异步、且只带 url（不带句柄），
+    --- 所以重连时"关旧连接 → 开新连接"之后，旧连接的关闭事件会迟到到来。
+    --- 如果不认识它，就会把刚建立的新连接一起判死 → 每 reconnectInterval 秒重连一次的死循环
+    --- （用户报的"每隔几秒 WebSocket closed, will reconnect"）。这个计数就是用来认领它们的。
+    --- 除了"自己关掉的 socket"，放弃握手的请求（超时后重发）与"多出来的句柄"
+    --- 也会产生迟到的结果事件，同样记在这里。
+    self.closeAcks = 0
+    --- 还在等结果（websocket_success / websocket_failure / websocket_closed）的连接请求数。
+    --- 关键：同一条连接不要重复发请求 —— 否则中继里会出现同一台计算机的多条连接，
+    --- 网页会看到"加入 → 莫名离开"，中继也可能因为房间连接数超限而把人踢掉
+    --- （日志里的 `Could not connect` 就是这么来的）。
+    self.pendingAcks = 0
+    --- 连接建立 / 关闭的时间与原因（诊断用：能看出"活了几秒就被关"还是"中继主动关"）
+    self.connectedAt = 0
+    self.closedAt = 0
+    self.lastCloseReason = nil
+    self.lastRxAt = 0
+    --- 长时间（秒）收不到任何入站消息时的兜底重连：中继静默断开（没有关闭事件）才用得上，
+    --- 所以放得很长，避免正常运行时反复重连。
+    self.idleReconnectInterval = opts.idleReconnectInterval or 300
+    self.lastIdleReconnect = 0
+    --- 应用层保活（秒）：中继/反向代理对空闲 WebSocket 有超时（实测约 30~40 秒），
+    --- 没有浏览器在房间里时主控什么都不发 → 中继会以 "Could not connect" 把连接踢掉，
+    --- 表现为"没人看网页时服务端就每 35 秒重连一次，一打开网页就稳定了"。
+    --- 所以这里在自己长时间（默认 20 秒）没有收发任何消息时，主动发一条极小的 keepalive。
+    self.keepaliveInterval = opts.keepaliveInterval or 20
+    self.lastSendAt = 0
     self.clientActive = false
     self.needFullSync = true
     self.lastHeartbeat = 0
@@ -162,6 +189,9 @@ function Protocol.new(opts)
         pushes = 0, pushSkipped = 0, fullSyncs = 0, changedItems = 0,
         --- 异步连接：请求数 / 失败数 / 超时（没有结果事件）数 —— 中继不通时这几个数会持续增长
         connectRequests = 0, connectFailures = 0, connectTimeouts = 0,
+        --- 连接生命周期计数（诊断用）：closes=中继关我们 / ownCloses=我们自己关（迟到事件）
+        --- / staleCloses=重复或无效的关闭事件 / reconnects=主动重连次数
+        closes = 0, ownCloses = 0, staleCloses = 0, reconnects = 0,
         byAction = {},
         since = os.epoch("utc"),
     }
@@ -211,7 +241,7 @@ function Protocol:flushLogs()
     self.logPending = false
 end
 
---- 建立 WebSocket 连接（**异步**）
+--- 建立 WebSocket 连接（异步）
 --- 以前这里用 http.websocket（同步阻塞）：中继不可达时每次重连都要等 CC:T 的 http 超时，
 --- 期间主循环完全不 yield —— 性能调试里那条 `Slow protocol update: 860ms`（甚至几十秒）就是这么来的。
 --- 现在改成 http.websocketAsync：立刻返回，连接结果由 websocket_success /
@@ -232,6 +262,7 @@ function Protocol:connect()
     end
     self.connecting = true
     self.connectRequestedAt = os.epoch("utc")
+    self.pendingAcks = (self.pendingAcks or 0) + 1
     self.stats.connectRequests = self.stats.connectRequests + 1
     return true
 end
@@ -239,6 +270,7 @@ end
 --- websocket_success 事件：连接建立了，接管句柄
 function Protocol:onSocketOpened(handle)
     self.connecting = false
+    self.pendingAcks = math.max(0, (self.pendingAcks or 0) - 1)
     local kind = type(handle)
     if kind ~= "table" and kind ~= "userdata" then
         -- 事件里没有句柄（正常不会发生）：当作失败，下个周期重试
@@ -248,14 +280,20 @@ function Protocol:onSocketOpened(handle)
     end
     if self.ws then
         -- 已经有一个可用连接（例如连接超时后重发，随后迟到的成功事件）：把多出来的这个关掉，
-        -- 保留正在用的那一个，避免句柄泄漏 / 消息重复。
+        -- 保留正在用的那一个，避免句柄泄漏 / 消息重复。它的关闭事件会迟到 → 记进 closeAcks，
+        -- 让 onEvent 认领掉，绝不能因此把在用的连接判死。
+        self.closeAcks = (self.closeAcks or 0) + 1
+        self.stats.extraHandles = (self.stats.extraHandles or 0) + 1
         pcall(function()
             handle.close()
         end)
+        self.log("Extra websocket handle closed (a live connection already exists)")
         return false
     end
     self.ws = handle
     self.connected = true
+    self.connectedAt = os.epoch("utc")
+    self.lastRxAt = self.connectedAt
     self.needFullSync = true
     self.snapshot = {}
     self.dropLogged = false
@@ -288,7 +326,7 @@ function Protocol:send(message)
         self.log("JSON encode failed: %s", tostring(json))
         return false
     end
-    -- 注意：1.5.0 起中继**永远**由主控自己连接（IFMWorker 不再代连），所以这里没有“转发给 worker”的分支
+    -- 注意：1.5.0 起中继永远由主控自己连接（IFMWorker 不再代连），所以这里没有“转发给 worker”的分支
     local socket = self.ws
     local sent, err = pcall(function()
         -- 点号调用：send(message [, binary])，binary 必须是布尔值，不能传句柄自身
@@ -307,6 +345,8 @@ end
 --- 发送统计（本机 socket 与 worker 转发两条路径共用）
 function Protocol:noteSent(message, bytes)
     self.pushCount = self.pushCount + 1
+    --- 最后一次发出消息的时间：应用层保活用它判断"我已经很久没说话了"
+    self.lastSendAt = os.epoch("utc")
     local stats = self.stats
     bytes = tonumber(bytes) or 0
     stats.sentMessages = stats.sentMessages + 1
@@ -335,6 +375,9 @@ function Protocol:closeSocket()
     end
     local socket = self.ws
     self.ws = nil
+    --- 记一笔"是我们自己关的"：它的 websocket_closed 事件稍后才会到（只带 url，认不出句柄），
+    --- 见 Protocol:onEvent —— 迟到的那次必须被认领，否则会把新连接一起判死。
+    self.closeAcks = (self.closeAcks or 0) + 1
     pcall(function()
         socket.close()
     end)
@@ -491,29 +534,59 @@ function Protocol:update(now)
     if self.clientActive and now - self.lastHeartbeat > self.clientTimeout * 1000 then
         self.clientActive = false
         self.needFullSync = true
-        -- 长时间收不到浏览器消息：中继可能已经静默断开（浏览器那边不会触发 onclose），
-        -- 直接重连一次中继（新连接会让频道内其它客户端收到 join 事件，网页随即全量同步）
-        self.log("Client timeout, reconnecting relay")
-        self.lastReconnect = now
-        self:connect()
+        --- 长时间收不到浏览器消息（后台标签页的定时器会被节流、网页自己也有看门狗会重建连接）。
+        --- 1.7.0 起不再因此重连中继：以前那种"关掉好连接再开一条"的做法，
+        --- 会让我们自己的关闭事件迟到、把新连接一起判死，形成每几秒重连一次的死循环
+        --- （用户在服务端看到的就是刷屏的 WebSocket closed）。真正断线时 send 会失败，
+        --- 那时走下面的正常重连分支。
+        self.log("Client timeout (%ds without browser message); keeping the relay socket, will resync", self.clientTimeout)
         return
     end
     if not self.connected then
-        --- 异步连接请求还没结果：先等（websocket_success / websocket_failure 事件会改状态）
-        if self.connecting then
+        --- 异步连接请求还没结果：先等（websocket_success / websocket_failure / websocket_closed 事件会改状态）
+        if (self.pendingAcks or 0) > 0 then
             if now - (self.connectRequestedAt or 0) < CONNECT_TIMEOUT_MS then
+                --- 还有一条请求在飞：绝不再发一条。否则中继里会出现同一台计算机的多条连接，
+                --- 网页会看到"自己加入 → 立刻又离开"，中继也可能因为房间连接数超限而把连接踢掉
+                --- （日志里的 `Could not connect` 就是这么来的）。
                 return
             end
-            -- 超时：两个事件都没来（中继静默丢包）。允许重发；迟到的成功事件由 onSocketOpened 忽略。
+            -- 超时：结果事件一直没来（中继静默丢包）。放弃这条请求并允许重发；
+            -- 它迟到的成功/失败/关闭事件由 closeAcks 认领，绝不会影响下一条连接。
+            self.pendingAcks = math.max(0, self.pendingAcks - 1)
+            self.closeAcks = (self.closeAcks or 0) + 1
             self.connecting = false
             self.stats.connectTimeouts = self.stats.connectTimeouts + 1
+            self.stats.abandoned = (self.stats.abandoned or 0) + 1
             self.log("WebSocket connect timed out after %ds, retrying", math.floor(CONNECT_TIMEOUT_MS / 1000))
         end
         if now - self.lastReconnect >= self.reconnectInterval * 1000 then
             self.lastReconnect = now
+            self.stats.reconnects = (self.stats.reconnects or 0) + 1
             self:connect()
         end
         return
+    end
+    --- 兜底：连接看起来还在，但很久没收到任何入站消息了（中继静默断开时不会有关闭事件）。
+    --- 间隔很长（默认 300s）且只在确实连着时才生效，避免正常运行时反复重连。
+    local lastInbound = math.max(self.lastRxAt or 0, self.connectedAt or 0)
+    if self.idleReconnectInterval and self.idleReconnectInterval > 0
+        and now - lastInbound > self.idleReconnectInterval * 1000
+        and now - (self.lastIdleReconnect or 0) > self.idleReconnectInterval * 1000 then
+        self.lastIdleReconnect = now
+        self.lastRxAt = now
+        self.stats.reconnects = (self.stats.reconnects or 0) + 1
+        self.log("No relay traffic for %ds, refreshing the connection", self.idleReconnectInterval)
+        self:connect()
+        return
+    end
+    --- 应用层保活（见 keepaliveInterval 的说明）：自己长时间没收发任何消息就发一条极小的消息，
+    --- 免得中继因为"空闲"把连接踢掉（没人在网页上时就是这样）。
+    local lastTraffic = math.max(self.lastSendAt or 0, self.lastRxAt or 0, self.connectedAt or 0)
+    if self.keepaliveInterval and self.keepaliveInterval > 0
+        and now - lastTraffic >= self.keepaliveInterval * 1000 then
+        self.stats.keepalives = (self.stats.keepalives or 0) + 1
+        self:send({ type = "keepalive", at = now })
     end
     if self.clientActive then
         -- 推送策略（1.6.12，用户第 7 项：不做速率硬限制）：
@@ -642,7 +715,7 @@ function Protocol:handleMessage(raw)
     if self.clientActive and payload.action ~= "heartbeat" then
         -- 推送出错绝不能把异常抛到主循环（主循环结束 = 服务端退出 = 网页所有请求超时）
         --
-        --- 1.6.12：请求处理完之后**有变化就推**（用户第 7 项：不做速率硬限制）。
+        --- 1.6.12：请求处理完之后有变化就推（用户第 7 项：不做速率硬限制）。
         ---   * 判断依据是 cache.revision：同一 tick 里连着来几个请求，也只有第一个会真的推
         ---     （推完 revision 就同步了），因此不会把主循环刷爆；
         ---   * 心跳只表示“浏览器还活着”，不为它做全量收集（保持原样）；
@@ -658,29 +731,71 @@ function Protocol:handleMessage(raw)
 end
 
 --- 处理 CC:T 事件（返回 true 表示该事件已被协议层消费）
---- 注意：连接是**异步**的，所以 websocket_success 必须在这里处理（否则句柄拿不到）。
-function Protocol:onEvent(event, param1, param2)
+--- 注意：连接是异步的，所以 websocket_success 必须在这里处理（否则句柄拿不到）。
+function Protocol:onEvent(event, param1, param2, param3)
     if event == "websocket_success" and param1 == self.url then
         self:onSocketOpened(param2)
         return true
     end
     if event == "websocket_message" and param1 == self.url then
+        self.lastRxAt = os.epoch("utc")
         self:handleMessage(param2)
         return true
     end
     if event == "websocket_closed" and param1 == self.url then
+        local stats = self.stats
+        stats.closes = stats.closes + 1
+        self.pendingAcks = math.max(0, (self.pendingAcks or 0) - 1)
+        --- 关闭原因（CC:T 会给出原因/说明，中继主动关与本地关掉能区分开）
+        local reason = tostring(param2)
+        if param3 ~= nil and tostring(param3) ~= "" then
+            reason = reason .. " / " .. tostring(param3)
+        end
+        self.lastCloseReason = reason
+        self.closedAt = os.epoch("utc")
+        --- ①② 属于"不重要"的关闭事件：断的不是当前在用的这条连接
+        ---   ① closeAcks > 0：我们自己关掉的旧连接 / 放弃握手的请求 / 多出来的句柄 —— 认领并忽略它。
+        ---      关键点：绝不能因为它的迟到而把刚建立的新连接判死（那就是"每几秒重连一次"的根因）。
+        ---   ② self.ws 还活着，但我们没有任何在飞的请求：说明这条关闭事件属于更早的连接
+        ---      （中继侧的老连接超时清理），当前连接不受影响。
+        if (self.closeAcks or 0) > 0 then
+            self.closeAcks = self.closeAcks - 1
+            stats.ownCloses = stats.ownCloses + 1
+            self.log("Old socket closed as requested (ignored; %s; age %dms)",
+                reason, self.connectedAt > 0 and (self.closedAt - self.connectedAt) or 0)
+            return true
+        end
+        if not self.ws and not self.connected then
+            --- 已经没有活连接了（重复的关闭事件）：只记数，不改状态
+            stats.staleCloses = stats.staleCloses + 1
+            return true
+        end
         self.connecting = false
         self.connected = false
         self.ws = nil          -- 句柄已失效：丢掉，免得之后 send 再报一次错
         self.clientActive = false
-        self.log("WebSocket closed, will reconnect")
+        self.log("WebSocket closed by relay (%s) after %ds, will reconnect",
+            reason, self.connectedAt > 0 and math.floor((self.closedAt - self.connectedAt) / 1000) or 0)
         return true
     end
     if event == "websocket_failure" and param1 == self.url then
+        self.pendingAcks = math.max(0, (self.pendingAcks or 0) - 1)
+        self.stats.connectFailures = self.stats.connectFailures + 1
+        --- 认领属于旧请求的失败事件：当前连接（self.ws）绝不能被它清掉
+        if (self.closeAcks or 0) > 0 then
+            self.closeAcks = self.closeAcks - 1
+            self.stats.staleCloses = (self.stats.staleCloses or 0) + 1
+            self.log("Stale connect failure ignored: %s", tostring(param2))
+            return true
+        end
+        if self.ws and self.connected then
+            self.stats.staleCloses = (self.stats.staleCloses or 0) + 1
+            self.log("Connect failure for an old attempt ignored (a live connection exists): %s", tostring(param2))
+            return true
+        end
         self.connecting = false
         self.connected = false
         self.ws = nil
-        self.stats.connectFailures = self.stats.connectFailures + 1
         self.log("WebSocket connect failed: %s", tostring(param2))
         return true
     end
@@ -696,13 +811,22 @@ function Protocol:status()
         connecting = self.connecting or false,
         clientActive = self.clientActive,
         updateInterval = self.updateInterval,
+        --- 连接活了多久 / 上一次收到入站消息过了多久 / 上一次断开的原因（诊断闪断用）
+        connectedSeconds = (self.connected and (self.connectedAt or 0) > 0)
+            and math.floor((os.epoch("utc") - self.connectedAt) / 1000) or 0,
+        idleSeconds = ((self.lastRxAt or 0) > 0) and math.floor((os.epoch("utc") - self.lastRxAt) / 1000) or -1,
+        closes = (self.stats and self.stats.closes) or 0,
+        lastCloseReason = self.lastCloseReason,
+        --- 在飞请求数 / 等我们认领的迟到事件数（诊断"为什么一直重连"用）
+        pendingAcks = self.pendingAcks or 0,
+        expectedAcks = self.closeAcks or 0,
     }
 end
 
 --- 收发统计摘要（诊断模式 perf 使用）：消息数 / 字节数 + 按字节数排序的 action 明细。
 --- 用来回答“运行缓慢到底是哪个动作、哪个包太大”。
 --- 注意：方法名不能叫 `stats`：实例上还有一个数据字段 `self.stats`（原始计数表），
---- 同名字段会把方法**遮蔽**掉（`obj.stats` 拿到的是表，`obj:stats()` 会报 attempt to call a table value），
+--- 同名字段会把方法遮蔽掉（`obj.stats` 拿到的是表，`obj:stats()` 会报 attempt to call a table value），
 --- 所以这里叫 `statsSummary`（见 modules/diagnose.lua 的调用与 build.py 的“方法遮蔽检查”）。
 function Protocol:statsSummary()
     local stats = self.stats
@@ -742,6 +866,23 @@ function Protocol:statsSummary()
         connectRequests = stats.connectRequests,
         connectFailures = stats.connectFailures,
         connectTimeouts = stats.connectTimeouts,
+        --- 连接生命周期：closes=中继关我们 / ownCloses=我们自己关（迟到事件被认领）
+        --- / staleCloses=重复关闭事件 / reconnects=主动重连次数
+        closes = stats.closes or 0,
+        ownCloses = stats.ownCloses or 0,
+        staleCloses = stats.staleCloses or 0,
+        reconnects = stats.reconnects or 0,
+        --- 连接请求纪律（1.7.0 修复）：在飞请求数 / 我们自己认领掉的迟到事件数 / 放弃的请求 / 多余句柄
+        pendingAcks = self.pendingAcks or 0,
+        expectedAcks = self.closeAcks or 0,
+        abandoned = stats.abandoned or 0,
+        extraHandles = stats.extraHandles or 0,
+        --- 应用层保活次数（空闲时防止中继把连接踢掉）
+        keepalives = stats.keepalives or 0,
+        lastCloseReason = self.lastCloseReason,
+        connectedSeconds = (self.connected and self.connectedAt or 0) > 0
+            and math.floor((os.epoch("utc") - self.connectedAt) / 1000) or 0,
+        idleSeconds = ((self.lastRxAt or 0) > 0) and math.floor((os.epoch("utc") - self.lastRxAt) / 1000) or -1,
         pushes = stats.pushes,
         pushSkipped = stats.pushSkipped,
         fullSyncs = stats.fullSyncs,

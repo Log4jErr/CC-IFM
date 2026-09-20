@@ -5,11 +5,11 @@
 --   query  查询：主控要“容器里有什么”“某物品在哪些容器里各有多少”时，本机扫描本机能看到的
 --                外设并把结果回报主控（展示与决策都由主控做）。
 --
--- 明确**不做**（一律留在主控本机，避免 worker 与主控状态不一致，也避免 worker 出问题影响生产）：
+-- 明确不做（一律留在主控本机，避免 worker 与主控状态不一致，也避免 worker 出问题影响生产）：
 --   * 不跑流程（engine）：流程状态机、计时、下单/取消全部由主控负责；
 --   * 不做存储整理（compact）：整理计划由主控计算、主控执行；
 --   * 不连 WebSocket：网页中继永远由主控自己连接（worker 掉线不会让网页失联）。
---   本机需要与主控**同一份 ifm/ 目录**：modem 发现、外设枚举、频道/协议常量都从那里取，
+--   本机需要与主控同一份 ifm/ 目录：modem 发现、外设枚举、频道/协议常量都从那里取，
 --   不再自带一份（两份实现漂了最难查 —— worker 跑在别的计算机上）。build.py 的单文件产物
 --   解压后会同时写出 IFMMaster.lua / IFMWorker.lua 与 ifm/*.lua，所以正常部署下它一定在。
 --   （推荐有线网络：wired modem + 网络线 —— 有线网络里的计算机共享外设；无线 modem 只能通讯）。
@@ -119,7 +119,7 @@ if workerName == nil or workerName == "" then
     workerName = "worker-#" .. tostring(computerId)
 end
 
-local version = "1.6.19"
+local version = "1.7.0"
 
 --- 本机日志（屏幕上看得到，方便直接复制给主控看）
 local function workerLog(text)
@@ -216,16 +216,16 @@ end
 -- 主控要查询时发 { op = "query", id, container = 容器外设名,
 --                    names = { 物品名/流体名 -> true }（可选，只要这些）,
 --                    limit = 单次最多回报多少个槽位 }
--- **一次只查一个容器**：主控要“查询所有容器”时由它自己拆成多条查询、轮流派给各台 worker ——
+-- 一次只查一个容器：主控要“查询所有容器”时由它自己拆成多条查询、轮流派给各台 worker ——
 -- 这样某个慢容器只会拖住它自己那一条，不会连带整整一批（也不会把 worker 的心跳卡住）。
 -- 回报里的 scannedContainers 只会包含这个容器（没扫到就是空表 → 主控本机读）。
--- 本机扫描**本机能看到**的 inventory / fluid_storage，把每个槽位/储罐原样回报，并附上按名称合计的数量。
+-- 本机扫描本机能看到的 inventory / fluid_storage，把每个槽位/储罐原样回报，并附上按名称合计的数量。
 
 --- 外设枚举用与主控同一个模块（modules/peripherals.lua）：多类型外设也认得
 --- （CC:T 的 peripheral.getType 可能返回多个类型，自己比较第一个会漏掉）。
 local peripherals = Peripherals.new({ log = function() end })
 
---- 一次查询只查**一个容器**（“查询所有容器”由主控拆成多条查询并行派活，见 modules/transfer.lua）：
+--- 一次查询只查一个容器（“查询所有容器”由主控拆成多条查询并行派活，见 modules/transfer.lua）：
 ---   spec.container   容器外设名（主控新版本用这个字段）
 ---   spec.containers = { 容器外设名 }（兼容旧主控：只取第一个）
 --- 注意：调用方（runQuery）必须先 peripherals:scan() 刷一次注册表。
@@ -341,7 +341,7 @@ local function queryFluids(spec, side)
     return tanks, totals, scanned, dropped
 end
 
---- 执行一次查询：**一个容器**（物品 + 流体都看，因为这个容器可能同时提供两种外设）
+--- 执行一次查询：一个容器（物品 + 流体都看，因为这个容器可能同时提供两种外设）
 local function runQuery(spec)
     local startedAt = os.epoch("utc")
     local container = pickContainer(spec)
@@ -382,7 +382,7 @@ end
 -- ===================== detail：物品详情（getItemDetail）=====================
 -- 主控要问「某个物品的 maxCount / tags」时发：
 --   { op = "detail", id, samples = { { container = 外设名, slot = 槽位, name = 物品名, nbt = ... }, ... } }
--- getItemDetail 与 list() 一样是**阻塞**的外设调用（有线网络上 ≈1 个服务器刻/次），
+-- getItemDetail 与 list() 一样是阻塞的外设调用（有线网络上 ≈1 个服务器刻/次），
 -- 而主控要为几百种物品各问一次（整理计划要 maxCount、标签扫描要 tags）—— 主控自己做
 -- 就是几百个服务器刻的卡顿。打包交给 worker 后，主控只等 modem 消息。
 -- 只在「这个槽位现在还是那种物品」时才回报详情：排队期间它可能已经被搬走 / 换成别的东西。
@@ -481,7 +481,7 @@ local function reportState()
     lastStateAt = os.epoch("utc")
 end
 
---- 这条握手消息是不是**另一台 worker** 发来的（而不是主控）？
+--- 这条握手消息是不是另一台 worker 发来的（而不是主控）？
 --- worker 的 hello / pong 一定带 caps（能力表）与 name；主控的 hello 两者都没有。
 local function isWorkerHandshake(message)
     return type(message.caps) == "table" or type(message.name) == "string"
@@ -491,7 +491,7 @@ end
 ---   1) 明确发给本机（target == 本机号）：job / query / welcome；
 ---   2) 带 master = true（1.5.3 起主控的 hello / pong / welcome 都带）；
 ---   3) 老版本主控的 hello / pong 握手（没有 caps / name 这两个 worker 字段）。
---- 其余一律不是 —— **别的 worker 每秒上报的 state / query_result 都没有 target**，
+--- 其余一律不是 —— 别的 worker 每秒上报的 state / query_result 都没有 target，
 --- 以前它们同样会走到“记下发信人为主控”那一行，屏幕上的 master 行就在真主控与别的 worker
 --- 之间来回跳，这就是那个 bug 的真正原因。
 local function isMasterMessage(message, op)
@@ -508,10 +508,10 @@ local function isMasterMessage(message, op)
 end
 
 -- ===================== 重发与排队（1.6.2） =====================
--- 主控与 worker 之间是无线 modem：消息偶尔会丢（距离/干扰）。主控对一条查询/搬运会**重发同一个 id**，
+-- 主控与 worker 之间是无线 modem：消息偶尔会丢（距离/干扰）。主控对一条查询/搬运会重发同一个 id，
 -- 所以这里要做两件事：
---   1) **幂等**：同一个 id 已经做过 → 把上次的结果再回一遍（绝不重复搬运、也不重复扫描）；
---   2) **排队**：手上正忙时不回 busy（主控那边会白等到超时），先把消息存起来，忙完立刻做。
+--   1) 幂等：同一个 id 已经做过 → 把上次的结果再回一遍（绝不重复搬运、也不重复扫描）；
+--   2) 排队：手上正忙时不回 busy（主控那边会白等到超时），先把消息存起来，忙完立刻做。
 local TASK_CACHE_MAX = 16
 local DEFER_MAX = 8
 local DEFER_MAX_AGE = 8000      -- 排队超过这么久就丢掉（主控那边早已超时作废，做了也白做）
@@ -591,7 +591,7 @@ local function handleMessage(message)
         return                          -- 别的 worker 的广播（state / query_result / done …）：与本机无关
     end
     -- 能走到这里说明这条消息是主控发来的
-    -- job / query 里的 from / to 是**容器外设名**，不是发信人：发信人看 sender（1.5.4 起主控会带上）
+    -- job / query 里的 from / to 是容器外设名，不是发信人：发信人看 sender（1.5.4 起主控会带上）
     local senderId = message.from
     if op == "job" or op == "query" then
         senderId = tonumber(message.sender)
@@ -614,7 +614,7 @@ local function handleMessage(message)
         return
     end
     if op == "welcome" then
-        -- 主控报到（房间号 / 版本）。worker 不需要房间号，但**必须**核对版本：
+        -- 主控报到（房间号 / 版本）。worker 不需要房间号，但必须核对版本：
         -- 不一致时在屏幕上常显警告（只打一行日志很容易被忽略，之前的排查就吃过这个亏）。
         if type(message.version) == "string" then
             masterVersion = message.version
@@ -631,7 +631,7 @@ local function handleMessage(message)
         return
     end
     --- ===== 版本闸门 =====
-    --- 主控与 worker 的版本必须完全一致，否则**拒绝执行任何作业**。
+    --- 主控与 worker 的版本必须完全一致，否则拒绝执行任何作业。
     --- 只在主控版本已知时判断（hello/pong/welcome 不受影响，否则两边连互相认识都做不到）。
     if masterVersion and masterVersion ~= version then
         local why = "version mismatch: master " .. tostring(masterVersion) .. " vs worker " .. tostring(version)

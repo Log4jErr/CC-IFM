@@ -1,5 +1,12 @@
 {
+  "name": "ifm-backend-tools",
+  "private": true,
+  "description": "IFM 后端/前端自测用到的 Node 依赖：luaparse = 构建时 Lua 语法检查；fengari = 在 Node 里跑真 Lua 虚拟机（模块自测）；jsdom = 用浏览器同款解析器检查 index.html（前端冒烟测试）。这些只用于开发期检查，不参与 CC:T 运行。",
   "dependencies": {
     "luaparse": "^0.3.1"
+  },
+  "devDependencies": {
+    "fengari": "^0.1.5",
+    "jsdom": "^29.1.1"
   }
 }

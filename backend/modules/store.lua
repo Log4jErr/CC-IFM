@@ -7,17 +7,20 @@ Store.__index = Store
 
 Store.KINDS = { "containers", "signals", "filters", "machineTypes", "machines", "processes", "settings" }
 
---- 全局设置（1.6.11）：目前只有一条记录 "scan"（容器扫描间隔），
---- 由网页「设置」面板通过 set_settings 请求写入；缺省值见 Store.SCAN_DEFAULTS。
-Store.SETTINGS_NAME = "scan"
---- 缺省扫描间隔（1.6.15 调整）：
----   storageScanMs = 8000  存储容器：**同一个容器从上次被扫描到下次被扫描的最小间隔**（毫秒）——
----                         不足这个间隔就不再读它（主控因此少读外设、省性能）；搬运/整理把某个
----                         容器动了（Containers:invalidate）之后会强制重读一次，保证看到最新内容。
----   inputScanMs   = 1000  输入容器：排空扫描的节奏（毫秒）——每隔这么久看一次输入容器，
----                         把里面的物品/流体搬进存储容器。
-Store.SCAN_DEFAULTS = { storageScanMs = 8000, inputScanMs = 1000 }
-Store.SCAN_LIMITS = { min = 250, max = 600000 }
+--- 全局设置（1.7.0）：
+---   "schedule" —— 各任务队列的调度时间片（正整数，见 Store.SCHEDULE_*）。
+--- 1.7.0 起不再有"毫秒级扫描间隔"（settings.scan 已删除：扫描由 storageScan / inputScan 队列驱动）。
+
+--- 调度时间片设置（1.7.0）：每条队列每次轮到时最多执行几步（正整数）。
+--- 「设置」面板改完立即生效，并写入 config.json -> settings.schedule。
+Store.SCHEDULE_NAME = "schedule"
+Store.SCHEDULE_DEFAULTS = {
+    process = 1, storageScan = 1, inputScan = 1,
+    inventoryIn = 1, inventoryOut = 1, compact = 1, detail = 1, manual = 1,
+}
+Store.SCHEDULE_QUEUES = { "process", "storageScan", "inputScan", "inventoryIn", "inventoryOut",
+    "compact", "detail", "manual" }
+Store.SCHEDULE_LIMITS = { min = 1, max = 50 }
 
 local VALID_ROLES = { storage = true, interaction = true, output = true, input = true }
 --- 容器定义的种类：item = 物品容器（inventory 外设），fluid = 流体容器（fluid_storage 外设）。
@@ -77,7 +80,7 @@ local function normalizeStringList(list)
 end
 
 --- 容器定义在数据表里的键：kind:name。
---- 物品容器与流体容器**允许同名**（例如同一个工作盆：物品“工作盆” + 流体“工作盆”），
+--- 物品容器与流体容器允许同名（例如同一个工作盆：物品“工作盆” + 流体“工作盆”），
 --- 所以容器定义以“种类:名称”为键，其它定义仍然以名称为键。
 function Store.containerKey(containerKind, name)
     return (containerKind == "fluid" and "fluid:" or "item:") .. tostring(name or "")
@@ -106,21 +109,24 @@ function Store.emptyData()
     }
 end
 
---- 容器扫描间隔设置（毫秒）：缺省 + 逐字段回退，保证任何时候都拿得到可用值
-function Store:scanSettings()
-    local saved = self:get("settings", Store.SETTINGS_NAME) or {}
-    local defaults = Store.SCAN_DEFAULTS
-    local function pick(value, fallback)
-        local number = tonumber(value)
-        if not number then
-            return fallback
+
+--- 调度时间片设置：缺省 + 逐字段回退（正整数），保证任何时候都拿得到可用值
+function Store:scheduleSettings()
+    local saved = self:get("settings", Store.SCHEDULE_NAME) or {}
+    local savedSlices = type(saved.slices) == "table" and saved.slices or {}
+    local limits = Store.SCHEDULE_LIMITS
+    local slices = {}
+    for _, name in ipairs(Store.SCHEDULE_QUEUES) do
+        local value = tonumber(savedSlices[name])
+        if not value then
+            value = Store.SCHEDULE_DEFAULTS[name] or limits.min
         end
-        local limits = Store.SCAN_LIMITS
-        return math.max(limits.min, math.min(limits.max, math.floor(number)))
+        slices[name] = math.max(limits.min, math.min(limits.max, math.floor(value)))
     end
     return {
-        storageScanMs = pick(saved.storageScanMs, defaults.storageScanMs),
-        inputScanMs = pick(saved.inputScanMs, defaults.inputScanMs),
+        slices = slices,
+        limits = limits,
+        queues = Store.SCHEDULE_QUEUES,
     }
 end
 
@@ -346,7 +352,7 @@ function Store:references(kind, name, containerKind)
     return refs
 end
 
---- 容器定义名：**只有输出容器需要用户起名字**（机器按名字引用它、点「发送」也要选它）；
+--- 容器定义名：只有输出容器需要用户起名字（机器按名字引用它、点「发送」也要选它）；
 --- 存储容器与交互容器都用外设名作定义名 —— 一个外设 + 一种容器只对应一个定义，用户不必（也不该）起名。
 function Store:containerNameFor(obj, name)
     local plain = Store.containerPlainName(self.Util.trim(name or ""))
@@ -360,7 +366,7 @@ function Store:containerNameFor(obj, name)
     return plain
 end
 
---- 信号定义名：**红石信号不再需要命名** —— 定义名恒等于中继器的外设名（一个中继器一个定义）。
+--- 信号定义名：红石信号不再需要命名 —— 定义名恒等于中继器的外设名（一个中继器一个定义）。
 --- 兼容旧配置：机器里写的旧“信号定义名”仍然能解析（见 Recipe:signalPeripheralOf）。
 function Store:signalNameFor(obj, name)
     local derived = self.Util.trim((obj or {}).peripheral or "")
@@ -405,7 +411,7 @@ function Store:dropContainerByPeripheral(containerKind, peripheral, keepName)
 end
 
 --- 新增/修改定义。
---- opts.previous：编辑前的旧键（容器是 "种类:名称"，其它定义是名称），用于**重命名**：
+--- opts.previous：编辑前的旧键（容器是 "种类:名称"，其它定义是名称），用于重命名：
 --- 旧定义在校验前先摘掉 —— 否则“同一外设每种容器只能用一个名字”的检查会把“编辑自己”当成冲突，
 --- 于是改名永远存不进去；校验失败时原样还原（等于没动过），通过后不再写回旧键（改名完成）。
 function Store:set(kind, name, obj, opts)
@@ -413,7 +419,7 @@ function Store:set(kind, name, obj, opts)
         return false, "\\u672A\\u77E5\\u7684\\u914D\\u7F6E\\u7C7B\\u578B " .. tostring(kind)
     end
     obj = obj or {}
-    --- 编辑（可能是改名）：**先把旧定义摘下来** —— 校验与“同外设让位”期间它不该再算占用，
+    --- 编辑（可能是改名）：先把旧定义摘下来 —— 校验与“同外设让位”期间它不该再算占用，
     --- 失败时再原样放回（等于没动过）。注意必须早于 dropContainerByPeripheral：
     --- 否则那一步会先把旧定义删掉，这里就再也拿不回备份、失败后也还原不出来。
     local previousKey = type(opts) == "table" and opts.previous or nil
@@ -508,7 +514,7 @@ function Store:delete(kind, name, containerKind, opts)
     return true
 end
 
---- 一个机器用到的**外设名集合**（输入/输出容器定义的外设 + 信号解析出的中继器）。
+--- 一个机器用到的外设名集合（输入/输出容器定义的外设 + 信号解析出的中继器）。
 --- 现在只用于诊断/展示：1.6.9 起同一个外设允许被多台机器引用（用户明确要求），
 --- 所以不再用它做“一个外设只属于一个机器”的校验。
 function Store:machinePeripheralNames(machine)
@@ -569,7 +575,7 @@ function Store:normalizeElement(el, allowPlaceholder)
             item = el.item or "",
         }
     elseif kind == "waitSignal" or kind == "emitSignal" or kind == "emitPulse" then
-        -- 红石元素只引用**机器定义**里的信号序号（机器 signals 列表的序号，从 1 开始）：默认 1，不再有全局信号序号
+        -- 红石元素只引用机器定义里的信号序号（机器 signals 列表的序号，从 1 开始）：默认 1，不再有全局信号序号
         return {
             kind = kind,
             machineSignalIndex = Util.int(el.machineSignalIndex, 1),
@@ -585,7 +591,7 @@ function Store:normalizeElement(el, allowPlaceholder)
         }
     elseif kind == "virtual" then
         -- 虚操作（抽象模板元素）：不对应任何真实资源，输入/输出都能放；
-        -- 含虚操作的流程**不能合成**，只作为网页“流程设置复制”的来源。
+        -- 含虚操作的流程不能合成，只作为网页“流程设置复制”的来源。
         return {
             kind = kind,
             name = el.name or "",
@@ -794,7 +800,7 @@ function Store:validateElement(el, allowPlaceholder, index, label)
     return false, label .. "\\u5143\\u7D20 " .. index .. " \\u7684\\u7C7B\\u578B\\u672A\\u77E5\\uFF1A" .. tostring(kind)
 end
 
---- 流程里是否含有“虚操作”元素（kind = "virtual"）：含虚操作的流程是**抽象模板** —— 
+--- 流程里是否含有“虚操作”元素（kind = "virtual"）：含虚操作的流程是抽象模板 —— 
 --- 不能执行 / 不能被选作上游 / 不能下单合成，只能被网页的“流程设置复制”拷贝到别的流程。
 --- 引擎（modules/recipe.lua）与主控（IFMMaster.lua）都用它做判断。
 function Store.processHasVirtual(process)
@@ -878,14 +884,14 @@ function Store:validate(kind, name, obj)
             end
         end
         for _, signalEntry in ipairs(obj.signals or {}) do
-            --- 红石信号**不再需要命名**：这一项既可以是旧的“信号定义名”，也可以直接是
-            --- 红石中继器的**外设名**（把外设拖到机器的信号卡片上产生的就是后者）。
+            --- 红石信号不再需要命名：这一项既可以是旧的“信号定义名”，也可以直接是
+            --- 红石中继器的外设名（把外设拖到机器的信号卡片上产生的就是后者）。
             --- 外设是否存在由引擎检查（Recipe:machineProblem 会给出可读原因）。
             if not isName(signalEntry) then
                 return false, "\\u4FE1\\u53F7\\u540D\\u4E0D\\u80FD\\u4E3A\\u7A7A"
             end
         end
-        --- 1.6.9：允许同一个外设（交互容器 / 红石中继器）被**多台机器**引用 ——
+        --- 1.6.9：允许同一个外设（交互容器 / 红石中继器）被多台机器引用 ——
         --- 用户明确要求“交互容器可以属于多个机器”“一个红石中继器可以给多台机器用”。
         --- 注意（使用提示）：两台机器共用同一个输入/输出容器时会同时往里搬 / 同时读它的信号，
         --- 这是配置者自己的选择；IFM 不再替它拦下来。
@@ -922,7 +928,10 @@ function Store:validate(kind, name, obj)
         end
         return true
     elseif kind == "settings" then
-        -- 全局设置：目前只有“容器扫描间隔”（毫秒，250 ~ 600000）
+        -- 全局设置：
+        -- "schedule" —— 各队列的调度时间片（正整数，1 ~ 50）
+        --   "scan"     —— 旧的容器扫描间隔（毫秒，250 ~ 600000；1.7.0 起被调度时间片取代，仅作兼容保留）
+        --   "schedule" —— 各队列的调度时间片（正整数，1 ~ 50）
         local limits = Store.SCAN_LIMITS
         for _, field in ipairs({ "storageScanMs", "inputScanMs" }) do
             if obj[field] ~= nil then
@@ -932,6 +941,25 @@ function Store:validate(kind, name, obj)
                 end
                 if value < limits.min or value > limits.max then
                     return false, field .. " out of range (" .. limits.min .. " ~ " .. limits.max .. " ms)"
+                end
+            end
+        end
+        if obj.slices ~= nil then
+            if type(obj.slices) ~= "table" then
+                return false, "slices must be a table"
+            end
+            local sliceLimits = Store.SCHEDULE_LIMITS
+            for name, value in pairs(obj.slices) do
+                if Store.SCHEDULE_DEFAULTS[name] == nil then
+                    return false, "unknown queue " .. tostring(name)
+                end
+                local number = tonumber(value)
+                if not number or number ~= math.floor(number) then
+                    return false, "slice for " .. tostring(name) .. " must be a positive integer"
+                end
+                if number < sliceLimits.min or number > sliceLimits.max then
+                    return false, "slice for " .. tostring(name) .. " out of range (" ..
+                        sliceLimits.min .. " ~ " .. sliceLimits.max .. ")"
                 end
             end
         end

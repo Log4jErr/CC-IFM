@@ -16,7 +16,7 @@ local args = { ... }
 --- 版本号：前端 web/ifm-core.js 里的 IFM_CLIENT_VERSION 必须与此保持一致。
 --- 网页连上后会比对两边的版本号，不一致时弹出警告并主动停止连接，
 --- 避免“新前端 + 旧后端”（或反过来）产生难以定位的怪问题。
-local IFM_VERSION = "1.6.19"
+local IFM_VERSION = "1.7.0"
 
 local DEFAULT_RELAY = "wss://itty.ws/c/"
 
@@ -108,7 +108,7 @@ if (not room or room == "") and #unknown == 1 and unknown[1]:sub(1, 1) ~= "-" th
     print("[IFM] note: positional room argument is deprecated, use --room <room>")
 end
 
---- 定位脚本目录：**代码**在 <脚本目录>/modules/，**数据**在 <脚本目录>/data/（1.6.17 起）
+--- 定位脚本目录：代码在 <脚本目录>/modules/，数据在 <脚本目录>/data/（1.6.17 起）
 --- 以前数据文件和代码混在一起（ifm/ 里），升级时会自动把老数据搬到 data/（只搬一次）
 local scriptPath = shell and shell.getRunningProgram and shell.getRunningProgram() or "IFMMaster.lua"
 local baseDir = fs.getDir(scriptPath)
@@ -154,6 +154,8 @@ local Recipe = loadModule("recipe")
 local Diagnose = loadModule("diagnose")
 local Protocol = loadModule("protocol")
 local Transfer = loadModule("transfer")
+--- 任务调度器（1.7.0）：每个来源一个队列，队列间轮转，每个队列有自己的时间片
+local Dispatch = loadModule("dispatch")
 
 if not fs.exists(dataDir) then
     fs.makeDir(dataDir)
@@ -260,19 +262,6 @@ else
     log("No existing runtime state (%s), starting fresh", tostring(cacheErr))
 end
 
---- 容器扫描间隔设置（1.6.11）：存储容器（list 缓存时长）与输入容器（排空扫描节奏）。
---- 网页「设置」面板改完会立刻生效，重启后从 config.json 里的 settings.scan 恢复。
-local function applyScanSettings()
-    local settings = store:scanSettings()
-    containers:applyScanSettings(settings.storageScanMs)
-    engine:applyScanSettings(settings.inputScanMs)
-    return settings
-end
---- 1.6.15：缺省 存储 8000ms（同一容器两次扫描的最小间隔）/ 输入 1000ms
-local scanSettings = applyScanSettings()
-log("Container scan settings: storage=%dms (min interval between two scans of the same " ..
-    "container) input=%dms (input container drain interval) (config.json -> settings.scan)",
-    scanSettings.storageScanMs, scanSettings.inputScanMs)
 
 --- 房间号：保存在 config.json 顶层的 room 字段里（不再使用 room.txt）
 -- 规则：--room 指定 -> 用它；--random-room -> 随机一个；都没有 -> 用配置里的；配置里没有 -> 随机并写入配置
@@ -362,7 +351,7 @@ local function buildProducerIndex()
 end
 
 --- 物品标签（网页悬停信息与 #标签 搜索用）：只读服务端缓存，缓存里没有就返回 nil。
---- 标签由 processTagQueue 按需补进缓存：先把缺的物品排进队列，再交给 worker 打包代查
+--- 标签由 detail 队列按需补进缓存：扫描时看到"还没有详情"的物品就排一条任务（一步一次 getItemDetail）
 --- getItemDetail（没有可用 worker 时才本机读，且每 tick 最多一个）—— 每个物品名只查一次。
 local function itemTags(name)
     local cached = cache:tagsOf(name)
@@ -538,79 +527,20 @@ local function collectSnapshot()
 end
 
 --- 标签扫描：只在需要时才问 getItemDetail（每个物品名只问一次，结果持久化到 cache.json）。
---- **getItemDetail 是阻塞的外设调用**（有线网络上 ≈1 个服务器刻/次），而且主控要问的是
+--- getItemDetail 是阻塞的外设调用（有线网络上 ≈1 个服务器刻/次），而且主控要问的是
 --- 「几百种物品」—— 所以这里一律先走物品详情字典（Containers 的 detailCache），
---- 字典里没有的交给 worker 打包代查（见 Transfer:detailRequest），主控自己**不做**阻塞调用；
+--- 字典里没有的交给 worker 打包代查（见 Transfer:detailRequest），主控自己不做阻塞调用；
 --- 只有在没有可用 worker 时才本机读，并且每个 tick 最多读 MAX_TAG_SCANS_PER_TICK 个。
-local tagScan = { queued = 0, scanned = 0, fromWorkers = 0, deferred = 0 }
-local tagQueue = {}
-local tagIndex = 1
---- 兜底路径（没有可用 worker）每个 tick 最多本机读几个：一次 getItemDetail ≈1 个服务器刻，
---- 一次读 8 个会把主循环拖住 ~0.4s，所以这里只做 1 个（标签是展示用的低优先级数据）。
-local MAX_TAG_SCANS_PER_TICK = 1
---- 一次请 worker 代查多少个物品（一批 = 一个 modem 请求，worker 一口气做完）。
---- 一批 8 个 ≈ 8 个服务器刻（≈0.4s）—— 够快，又不会把 worker 占太久（它还要搬东西）。
-local TAG_DETAIL_BATCH = 8
---- 一个 tick 最多派几批给 worker（4 × 8 = 32 个物品）：派太多会连 modem 和 worker 一起占满。
-local MAX_TAG_DETAIL_REQUESTS = 4
---- 客户端连着时自动补扫的间隔：标签缓存里缺哪个物品就补哪个（每个物品只会补一次）。
---- 补扫要先扫一遍所有容器（`queueTagScan`），所以间隔别太短（默认 60 秒）。
-local TAG_AUTO_INTERVAL = 60000
-local lastTagAutoScan = 0
+--- ===== 物品详情（maxCount / tags）：由调度器的 detail 队列 补齐（1.7.0）=====
+--- 生成：storageScan / inputScan 扫到"还没有详情"的物品时排一条任务；
+--- 执行：队列一步只做一次 getItemDetail（一次调用约 1 个游戏刻）；
+--- 失败：直接丢弃（物品可能已经不在了；下一次扫描会重新生成）；
+--- 结果：进物品详情字典（maxCount 供整理/放入策略用）+ 写标签缓存（供 #标签 搜索）。
+local detailScan = { queued = 0, scanned = 0, fromWorkers = 0 }
 
---- 收集「标签缓存里还没有」的每种物品的一个样本，排队扫描其标签。
---- 已经在缓存里的物品**绝不会**再问 getItemDetail（同一物品一个会话只查一次）。
---- 顺手做两件事（都是这次扫描本来就要读的数据）：
----   * 记录「当前存储里出现的物品名」→ 用来清理标签缓存（只保留现有物品，见下面的 pruneTags）；
----   * 只对现有物品排队扫描。
-local function queueTagScan()
-    tagQueue = {}
-    tagIndex = 1
-    local seen = {}
-    local present = {}
-    for _, stack in ipairs(containers:collectStacks(nil)) do
-        local name = stack.name
-        if type(name) == "string" and name ~= "" then
-            present[name] = true
-            if not seen[name] then
-                seen[name] = true
-                if not cache:hasTags(name) then
-                    tagQueue[#tagQueue + 1] = {
-                        peripheral = stack.peripheral,
-                        slot = stack.slot,
-                        name = name,
-                        --- NBT 也是物品身份的一部分（物品详情字典的键 = 物品名 + NBT）
-                        nbt = stack.nbt,
-                    }
-                end
-            end
-        end
-    end
-    --- 标签缓存只保留「当前存储里还有的」物品：NBT 变体无限多，临时物品的标签会把 cache.json 写满
-    local dropped = cache:pruneTags(present)
-    if dropped > 0 then
-        log("Tag cache pruned: %d item type(s) no longer in storage (%d kept, %d present)",
-            dropped, Util.count(cache:tags()), Util.count(present))
-    end
-    tagScan = { queued = #tagQueue, scanned = 0, fromWorkers = 0, deferred = 0 }
-    return #tagQueue
-end
-
---- 客户端连着时自动把缺失的标签排进队列（用户不点「扫描标签」也能在网页上看到标签与 #标签 搜索）
-local function autoQueueTagScan()
-    if tagScan.queued > 0 or not protocol or not protocol.clientActive then
-        return 0
-    end
-    local now = os.epoch("utc")
-    if now - (lastTagAutoScan or 0) < TAG_AUTO_INTERVAL then
-        return 0
-    end
-    -- 上一次推送很慢 = 主循环正被容器扫描拖着走：这一刻先不补扫标签（标签只是展示用的低优先级数据）
-    if protocol.lastPushCost and protocol.lastPushCost > 400 then
-        return 0
-    end
-    lastTagAutoScan = now
-    return queueTagScan()
+--- detail 队列任务的键：物品名 + NBT（与物品详情字典同键）
+local function detailQueueKey(name, nbt)
+    return tostring(name) .. "\1" .. tostring(nbt or "")
 end
 
 --- 把一份 itemDetail 的 tags 写进标签缓存（只有确认物品名一致时调用）
@@ -629,29 +559,8 @@ local function storeTags(itemName, detail)
     cache:setTags(itemName, tags)
 end
 
---- 把「物品详情字典里已经有答案」的排队物品写进标签缓存（worker 代查回来的都走这条）。
---- 返回这次消费掉几个条目。**只有**遇到字典里还没有的物品才停（保持队列顺序）。
-local function flushTagQueue()
-    local written = 0
-    while tagIndex <= #tagQueue do
-        local entry = tagQueue[tagIndex]
-        local detail, known = containers:cachedItemDetail(entry.name, entry.nbt)
-        if not known then
-            break
-        end
-        tagIndex = tagIndex + 1
-        written = written + 1
-        --- detail 为 nil = 问过但外设给不出（负缓存）：跳过，但不再重复排队
-        if detail then
-            storeTags(entry.name, detail)
-        end
-        tagScan.scanned = (tagScan.scanned or 0) + 1
-    end
-    return written
-end
-
---- 吸收 worker 代查回来的物品详情（每个 tick 一次）：填进物品详情字典，然后立刻写标签缓存。
---- 这一步**零阻塞**：主控只读 modem 消息，getItemDetail 是 worker 在旁边做的。
+--- 吸收 worker 代查回来的物品详情（每个调度轮次一次）：填字典 + 立刻写标签缓存。
+--- 零阻塞：getItemDetail 是 worker 在旁边做的，主控只读 modem 消息。
 local function absorbWorkerDetails()
     if not transfer or not transfer.takeDetailResults then
         return 0
@@ -662,10 +571,83 @@ local function absorbWorkerDetails()
     end
     local taken = containers:absorbItemDetails(entries)
     if taken > 0 then
-        tagScan.fromWorkers = (tagScan.fromWorkers or 0) + taken
+        detailScan.fromWorkers = (detailScan.fromWorkers or 0) + taken
     end
-    flushTagQueue()
+    for _, entry in ipairs(entries) do
+        if type(entry) == "table" and type(entry.detail) == "table" and entry.name then
+            storeTags(entry.name, entry.detail)
+            detailScan.scanned = (detailScan.scanned or 0) + 1
+        end
+    end
     return taken
+end
+
+--- 把"扫描时看到过、但还没有详情"的物品排进 detail 队列（生成器每个轮次调用）
+local function queueMissingDetails()
+    local seen = containers:takeScanSeen()
+    local queued = 0
+    for _, entry in ipairs(seen or {}) do
+        local _, known = containers:cachedItemDetail(entry.name, entry.nbt)
+        if not known and entry.container then
+            if dispatch and dispatch:enqueue("detail", {
+                key = detailQueueKey(entry.name, entry.nbt),
+                sample = { container = entry.container, slot = entry.slot,
+                    name = entry.name, nbt = entry.nbt },
+            }) then
+                queued = queued + 1
+            end
+        end
+    end
+    detailScan.queued = queued
+    return queued
+end
+
+--- 标签缓存清理（低频，按轮次而不是毫秒间隔）：只保留"当前还存在"的物品的标签。
+--- NBT 变体无限多，临时流转的物品标签会把 cache.json 写满。
+local TAG_PRUNE_EVERY_TICKS = 200
+local tagPruneTick = 0
+local function pruneTagCache()
+    tagPruneTick = (tagPruneTick or 0) + 1
+    if tagPruneTick < TAG_PRUNE_EVERY_TICKS then
+        return 0
+    end
+    tagPruneTick = 0
+    local present = {}
+    for _, def in ipairs(store:list("containers")) do
+        for _, stack in ipairs(containers:stacks(def.name)) do
+            if type(stack.name) == "string" and stack.name ~= "" then
+                present[stack.name] = true
+            end
+        end
+    end
+    local dropped = cache:pruneTags(present)
+    if dropped > 0 then
+        log("Tag cache pruned: %d item type(s) no longer in storage", dropped)
+    end
+    return dropped
+end
+
+--- 网页「扫描标签」按钮：把"存储里可见、但还没有详情"的物品全部排进 detail 队列
+local function queueTagScan()
+    local queued = 0
+    for _, def in ipairs(store:list("containers")) do
+        for _, stack in ipairs(containers:stacks(def.name)) do
+            if type(stack.name) == "string" and stack.name ~= "" then
+                local _, known = containers:cachedItemDetail(stack.name, stack.nbt)
+                if not known and dispatch then
+                    if dispatch:enqueue("detail", {
+                        key = detailQueueKey(stack.name, stack.nbt),
+                        sample = { container = def.peripheral, slot = stack.slot,
+                            name = stack.name, nbt = stack.nbt },
+                    }) then
+                        queued = queued + 1
+                    end
+                end
+            end
+        end
+    end
+    detailScan.queued = queued
+    return queued
 end
 
 --- 每个 tick 处理一小段队列，绝不阻塞主循环：
@@ -673,58 +655,6 @@ end
 ---   ② 字典里已经有答案的条目立刻写标签缓存；
 ---   ③ 剩下的请 worker 打包代查（一批 TAG_DETAIL_BATCH 个）；
 ---   ④ 没有可用 worker 时才本机读（每 tick 最多 MAX_TAG_SCANS_PER_TICK 个，阻塞但极少）。
-local function processTagQueue()
-    absorbWorkerDetails()
-    local processed = flushTagQueue()
-    local requests = 0
-    while tagIndex <= #tagQueue and requests < MAX_TAG_DETAIL_REQUESTS and processed < MAX_TAG_SCANS_PER_TICK do
-        local batch, index = {}, tagIndex
-        while index <= #tagQueue and #batch < TAG_DETAIL_BATCH do
-            local entry = tagQueue[index]
-            local _, known = containers:cachedItemDetail(entry.name, entry.nbt)
-            if known then
-                break                        -- 这条已经有答案（含“问过拿不到”的负缓存）：交给 flush 处理
-            end
-            batch[#batch + 1] = {
-                container = entry.peripheral,
-                slot = entry.slot,
-                name = entry.name,
-                nbt = entry.nbt,
-            }
-            index = index + 1
-        end
-        if #batch == 0 then
-            break
-        end
-        requests = requests + 1
-        local state = containers:requestItemDetails(batch)
-        if state == "pending" then
-            --- 已经派给 worker：结果回来后由 absorbWorkerDetails 填字典并写标签（下个 tick）
-            tagScan.deferred = (tagScan.deferred or 0) + #batch
-            return processed
-        end
-        --- 没有可用 worker（或都在忙）：本机读一个，读到的详情进字典，再由 flush 统一写标签
-        local entry = tagQueue[tagIndex]
-        containers:detail(entry.peripheral, entry.slot, { name = entry.name, nbt = entry.nbt })
-        local written = flushTagQueue()
-        if written == 0 then
-            --- 槽位里已经不是那个物品了（被搬走 / 换掉）也不该卡住队列：跳过这一条
-            tagIndex = tagIndex + 1
-            tagScan.scanned = (tagScan.scanned or 0) + 1
-            written = 1
-        end
-        processed = processed + written
-        break
-    end
-    if tagScan.queued > 0 and tagIndex > #tagQueue then
-        log("Tag scan finished: %d item type(s) cached in cache.json (%d of them read by workers)",
-            tagScan.scanned, tagScan.fromWorkers or 0)
-        tagScan = { queued = 0, scanned = 0, fromWorkers = 0, deferred = 0 }
-        tagQueue = {}
-        tagIndex = 1
-    end
-    return processed
-end
 
 --- 连接状态 + 标签扫描进度
 function buildStatus()
@@ -735,14 +665,11 @@ function buildStatus()
     for _ in pairs(cache:tags()) do
         current.tags = current.tags + 1
     end
-    if tagScan.queued > 0 then
-        current.tagScan = {
-            queued = tagScan.queued,
-            scanned = tagScan.scanned,
-            pending = math.max(0, tagScan.queued - tagScan.scanned),
-            --- 有多少个是 worker 代查回来的（网页上能看出“主控没在做阻塞调用”）
-            fromWorkers = tagScan.fromWorkers or 0,
-            deferred = tagScan.deferred or 0,
+    if dispatch then
+        current.detail = {
+            depth = dispatch:depth("detail"),
+            scanned = detailScan.scanned or 0,
+            fromWorkers = detailScan.fromWorkers or 0,
         }
     end
     --- 存储容量（网页资源浏览的进度条）：已存物品/可存物品、已占用槽位/总槽位
@@ -760,8 +687,13 @@ function buildStatus()
     if transfer then
         current.transfer = transfer:status()
     end
-    --- 容器扫描间隔设置（网页「设置」面板显示 + 编辑）
-    current.scanSettings = store:scanSettings()
+--- （1.7.0：settings.scan 已删除 —— 扫描由 storageScan / inputScan 队列驱动）
+    --- 调度时间片设置（网页「设置」面板）：每条队列每次轮到自己时最多几步
+    current.schedule = store:scheduleSettings()
+    --- 调度器运行状态（各队列深度 / 服务数 / 模式 / 每轮耗时）
+    if dispatch then
+        current.dispatch = dispatch:status()
+    end
     return current
 end
 
@@ -845,7 +777,7 @@ local function handleSendItems(payload)
 end
 
 --- 网页发来的容器管理请求 → 找到容器定义。
---- 先按“名称 + 种类”找；找不到再**只按名称**在物品/流体两种容器里找一遍 ——
+--- 先按“名称 + 种类”找；找不到再只按名称在物品/流体两种容器里找一遍 ——
 --- 网页那侧的种类可能来自历史数据或它自己的猜测，不该因此报“容器定义不存在”。
 --- 返回 def, 实际种类（找不到返回 nil）。
 local function findContainerByPayload(payload)
@@ -896,11 +828,121 @@ local function containerView(payload)
     return out
 end
 
---- 交互容器管理：手动搬运。
----   dir = "out"：把这个容器里的资源搬到**存储容器**（role = storage）
----   dir = "in" ：把**存储容器**里的资源搬进这个容器
---- 注意：这里临时摘掉 IFMWorker 调度器，由本机直接搬 —— 手动操作要立刻看到结果，
---- 不适合“发任务给 worker、下个 tick 再确认”的异步路径（搬完立刻把调度器装回去）。
+--- 交互容器管理：手动搬运（1.7.0 起进入「手动操作队列」）。
+---   dir = "out"：把这个容器里的资源搬到存储容器（role = storage）
+---   dir = "in" ：把存储容器里的资源搬进这个容器
+--- 队列规则（与其它队列一致）：
+---   * 有 worker 就交给 worker（不再"临时摘掉调度器由本机搬"）；
+---   * 每次调度只做一步（一次 pushItem/pushFluid 调用）；
+---   * 这一步搬不动 / 失败 → 丢弃任务（失败时丢弃）；
+---   * 这一步搬到了但还没搬够 → 回队尾，下一轮接着搬。
+local manualSeq = 0
+local function runManualTask(task, now)
+    local def = store:findContainer(task.container, task.kind)
+    if not def then
+        log("Manual move dropped: container %s is gone", tostring(task.container))
+        return false
+    end
+    local kind = task.kind
+    local resource = task.resource
+    local entries = task.entries
+    if not entries or now - (task.listedAt or 0) >= 1000 then
+        -- 源容器当前内容（缓存/快照；不额外触发扫描）
+        entries = {}
+        if task.dir == "out" then
+            if kind == "item" then
+                for _, stack in ipairs(containers:stacks(def.name)) do
+                    if stack.name == resource then
+                        entries[#entries + 1] = { ref = stack.slot, amount = tonumber(stack.count) or 0 }
+                    end
+                end
+            else
+                for _, tank in ipairs(containers:tanks(def.name)) do
+                    if tank.name == resource then
+                        entries[#entries + 1] = { ref = tank.tank, amount = tonumber(tank.amount) or 0 }
+                    end
+                end
+            end
+            task.targets = task.targets or containers:byRole("storage", kind, "out")
+        else
+            task.targets = task.targets or containers:byRole("storage", kind, "in")
+            for _, source in ipairs(task.targets) do
+                if kind == "item" then
+                    for _, stack in ipairs(containers:stacks(source)) do
+                        if stack.name == resource then
+                            entries[#entries + 1] = { ref = stack.slot, amount = tonumber(stack.count) or 0,
+                                source = source }
+                        end
+                    end
+                else
+                    for _, tank in ipairs(containers:tanks(source)) do
+                        if tank.name == resource then
+                            entries[#entries + 1] = { ref = tank.tank, amount = tonumber(tank.amount) or 0,
+                                source = source }
+                        end
+                    end
+                end
+            end
+        end
+        task.entries = entries
+        task.listedAt = now
+        task.index = 1
+    end
+    local remaining = math.max(0, tonumber(task.remaining) or 0)
+    if remaining <= 0 then
+        log("Manual container %s %s %s: %s x%s done", tostring(def.name), tostring(task.dir),
+            tostring(kind), tostring(resource), tostring(task.moved or 0))
+        return false
+    end
+    local targets = task.targets or {}
+    if #targets == 0 then
+        log("Manual container %s %s: no storage container available, task dropped", tostring(def.name),
+            tostring(task.dir))
+        return false
+    end
+    -- 一次调用 = 一步：挑当前源条目 -> 依次试目标
+    local index = task.index or 1
+    while index <= #entries do
+        local entry = entries[index]
+        if not entry then
+            break
+        end
+        local from = entry.source or def.name
+        for _, target in ipairs(targets) do
+            local to = (task.dir == "out") and target or def.name
+            local got, reason
+            if kind == "item" then
+                got, reason = containers:pushItem(from, entry.ref, math.min(remaining, entry.amount), to)
+            else
+                got, reason = containers:pushFluid(from, math.min(remaining, entry.amount), resource, to)
+            end
+            if reason == "pending" then
+                task.index = index
+                return true                     -- 已交给 worker：回队尾等它回报（不重复发）
+            end
+            got = tonumber(got) or 0
+            if got > 0 then
+                task.moved = (task.moved or 0) + got
+                task.remaining = remaining - got
+                task.index = index
+                if task.remaining <= 0 then
+                    log("Manual container %s %s %s: %s x%s done", tostring(def.name), tostring(task.dir),
+                        tostring(kind), tostring(resource), tostring(task.moved))
+                    return false
+                end
+                return true                     -- 还差一些：回队尾继续（下一轮重新看源容器）
+            end
+            if reason then
+                task.reason = reason
+            end
+        end
+        index = index + 1
+    end
+    log("Manual container %s %s %s: %s - task dropped (%s)", tostring(def.name), tostring(task.dir),
+        tostring(kind), tostring(resource), tostring(task.reason or "nothing left to move"))
+    return false
+end
+
 local function containerMove(payload, dir)
     local def, kind = findContainerByPayload(payload)
     if not def then
@@ -914,86 +956,28 @@ local function containerMove(payload, dir)
         return { error = "\\u8BF7\\u5148\\u9009\\u62E9\\u7269\\u54C1/\\u6D41\\u4F53" }
     end
     local count = math.max(1, tonumber(payload.count) or 1)
-    --- 某容器里符合该资源的条目（物品给槽位、流体给罐号）
-    local listEntries = function(containerName)
-        local out = {}
-        if kind == "item" then
-            for _, stack in ipairs(containers:stacks(containerName)) do
-                if stack.name == resource then
-                    out[#out + 1] = { ref = stack.slot, amount = tonumber(stack.count) or 0 }
-                end
-            end
-        else
-            for _, tank in ipairs(containers:tanks(containerName)) do
-                if tank.name == resource then
-                    out[#out + 1] = { ref = tank.tank, amount = tonumber(tank.amount) or 0 }
-                end
-            end
-        end
-        return out
-    end
-    local move = function(fromContainer, ref, want, toContainer)
-        if kind == "item" then
-            return containers:pushItem(fromContainer, ref, want, toContainer)
-        end
-        return containers:pushFluid(fromContainer, want, resource, toContainer)
-    end
     --- 搬运顺序按存储优先级：out（搬进存储）高优先级在前；in（从存储搬出）低优先级在前
     local targets = containers:byRole("storage", kind, dir == "out" and "out" or "in")
     if #targets == 0 then
         return { error = "\\u6CA1\\u6709 storage \\u89D2\\u8272\\u7684\\u5B58\\u50A8\\u5BB9\\u5668" }
     end
-    local provider = containers.transfer
-    containers:setTransferProvider(nil)
-    local moved, reason = 0, nil
-    local ok, err = pcall(function()
-        if dir == "out" then
-            for _, entry in ipairs(listEntries(def.name)) do
-                if moved >= count then
-                    break
-                end
-                for _, target in ipairs(targets) do
-                    if moved >= count then
-                        break
-                    end
-                    local got, sub = move(def.name, entry.ref, count - moved, target)
-                    got = tonumber(got) or 0
-                    if got > 0 then
-                        moved = moved + got
-                        containers:invalidate()
-                    elseif sub then
-                        reason = reason or sub
-                    end
-                end
-            end
-        else
-            for _, source in ipairs(targets) do
-                if moved >= count then
-                    break
-                end
-                for _, entry in ipairs(listEntries(source)) do
-                    if moved >= count then
-                        break
-                    end
-                    local got, sub = move(source, entry.ref, count - moved, def.name)
-                    got = tonumber(got) or 0
-                    if got > 0 then
-                        moved = moved + got
-                        containers:invalidate()
-                    elseif sub then
-                        reason = reason or sub
-                    end
-                end
-            end
-        end
-    end)
-    containers:setTransferProvider(provider)
-    if not ok then
-        return { error = tostring(err) }
+    manualSeq = manualSeq + 1
+    local task = {
+        key = "manual:" .. tostring(manualSeq),
+        dir = dir,
+        container = def.name,
+        kind = kind,
+        resource = resource,
+        remaining = count,
+        moved = 0,
+        targets = targets,
+    }
+    if not dispatch or not dispatch:enqueue("manual", task) then
+        return { error = "\\u8C03\\u5EA6\\u5668\\u4E0D\\u53EF\\u7528" }
     end
-    log("Manual container %s %s %s: %s x%s -> %s", tostring(def.name), tostring(dir),
-        tostring(kind), tostring(resource), tostring(count), tostring(moved))
-    return { success = true, moved = moved, reason = reason }
+    log("Manual container %s %s %s x%s queued (manual queue)", tostring(def.name), tostring(dir),
+        tostring(resource), tostring(count))
+    return { success = true, queued = true, moved = 0 }
 end
 
 --- WebSocket 请求路由
@@ -1034,29 +1018,36 @@ local function handleRequest(payload)
         return { success = true }
     elseif action == "compact_storage" then
         -- 存储整理：把同一种物品（同名同 NBT）散落在多个槽位/多个容器上的堆按数量升序合并。
-        -- 计划本身也**分批算**（每个 tick 最多问几次外设），所以这里立刻返回：
+        -- 计划本身也分批算（每个 tick 最多问几次外设），所以这里立刻返回：
         -- 网页显示“正在计算搬运计划…”，算完后引擎再按每 tick 少量搬运执行（进度在网页上看得到）。
         local state = engine:startCompact(payload.role)
         log("Storage compact requested (%s): the plan is computed in small slices so the master stays responsive",
             tostring(state))
         return { success = true, planning = true, state = state }
-    elseif action == "set_scan_settings" then
-        --- 容器扫描间隔（毫秒）：存储容器 / 输入容器各一个。校验走 Store:set，
-        --- 保存后立刻应用并回传生效值（网页直接显示回传值，避免“看着存了其实没生效”）。
-        local data = {
-            storageScanMs = payload.storageScanMs,
-            inputScanMs = payload.inputScanMs,
-        }
-        local ok, err = store:set("settings", Store.SETTINGS_NAME, data, { force = true })
+    elseif action == "set_schedule_settings" then
+        --- 调度时间片（1.7.0）：每条队列每次轮到时最多执行几步（正整数，1 ~ 50）。
+        --- 校验走 Store:set；保存后立刻应用并回传生效值（网页直接显示回传值）。
+        local slices = type(payload.slices) == "table" and payload.slices or nil
+        if not slices then
+            return { error = "slices must be a table of { queue = positive integer }" }
+        end
+        local data = { slices = slices }
+        local ok, err = store:set("settings", Store.SCHEDULE_NAME, data, { force = true })
         if not ok then
-            log("Save settings failed: %s", tostring(err))
+            log("Save schedule settings failed: %s", tostring(err))
             return { error = err }
         end
-        local applied = applyScanSettings()
+        local applied = store:scheduleSettings()
+        if dispatch then
+            dispatch:applySlices(applied.slices)
+        end
         store:flush()
-        log("Container scan settings updated: storage=%dms input=%dms",
-            applied.storageScanMs, applied.inputScanMs)
-        return { success = true, scanSettings = applied }
+        local parts = {}
+        for _, queue in ipairs(applied.queues) do
+            parts[#parts + 1] = queue .. "=" .. tostring(applied.slices[queue])
+        end
+        log("Schedule slices updated: %s", table.concat(parts, " "))
+        return { success = true, schedule = applied }
     elseif action == "container_view" then
         -- 交互容器管理：查看该容器当前的内容物
         return containerView(payload)
@@ -1191,7 +1182,7 @@ local function handleRequest(payload)
         log("send_items -> container=%s queued=%d failed=%d", tostring(payload.container), queued, failed)
         return result
     elseif action == "worker_query" then
-        -- 让 IFMWorker 代扫**一个容器**（一条查询只查一个容器，见 modules/transfer.lua 的 startScanBatch）
+        -- 让 IFMWorker 代扫一个容器（一条查询只查一个容器，见 modules/transfer.lua 的 startScanBatch）
         -- payload: { container = 容器外设名, names = {物品名...}, key = "自定义缓存键" }
         if not (transfer and transfer.requestQuery) then
             return { error = "transfer module unavailable" }
@@ -1228,7 +1219,7 @@ local function handleRequest(payload)
         end
         return { success = true, state = state, key = key, info = "query sent to IFMWorker; see status.transfer.lastQuery" }
     elseif action == "delete_delivery" then
-        --- 发货 id 用 deliveryId 字段传：请求里顶层的 id 是**请求关联号**（响应要靠它配对），
+        --- 发货 id 用 deliveryId 字段传：请求里顶层的 id 是请求关联号（响应要靠它配对），
         --- 早先前端把发货 id 也写成 id，把关联号覆盖掉 → 响应回来了网页却等不到（1.6.7 修）。
         --- 这里仍然接受旧的 id 字段（老前端/缓存的页面），保证兼容。
         local deliveryId = tonumber(payload.deliveryId or payload.id)
@@ -1246,12 +1237,11 @@ protocol = Protocol.new({
     log = log,
     collect = collectSnapshot,
     onRequest = handleRequest,
-    -- 定时推送间隔（秒）：**没有变化时**的兜底刷新频率（有变化会立刻推，见下）。
+    -- 定时推送间隔（秒）：没有变化时的兜底刷新频率（有变化会立刻推，见下）。
     -- 注意：一次推送要全量收集（每个容器一次外设调用，有线网络上 ≈1 个服务器刻/次），
     -- 12 个容器就 ~0.6s，所以兜底频率别设太小。
     updateInterval = 2,
-    -- 增量推送的硬下限（毫秒）：1.6.12 起**默认 0 = 不设硬限制**（用户要求：服务端不应当
-    -- 对 WebSocket 收发数据包做速率硬限制）。推送改由“状态变更计数”驱动：
+    -- 增量推送的硬下限（毫秒）：1.6.12 起默认 0 = 不设硬限制（服务端不应当对 WebSocket 收发数据包做速率硬限制）。推送改由“状态变更计数”驱动：
     -- cache.revision 变了就立刻推，同一 tick 内多个请求合并成一次。
     -- 想恢复旧的“最快 N 毫秒一次”节流时，把这里设成毫秒数即可（例如 2000）。
     minPushInterval = 0,
@@ -1270,8 +1260,8 @@ protocol = Protocol.new({
 --- 有 worker 在线时，搬运全部由它们执行，本机只发送参数、等回报；查询（requestQuery）同理。
 transfer = Transfer.new({ log = log, Peripherals = peripherals, Modems = Modems })
 containers:setTransferProvider(transfer)
---- 容器扫描卸载：worker 代读主控的容器（主控自己读一遍 19 个容器 ≈950ms，是“主控缓慢”的最大来源）
-containers:setScanProvider(transfer)
+--- 容器扫描：1.7.0 起由 storageScan / inputScan 队列驱动（Transfer:submitScan → worker 代读，
+--- 没有 worker 时本机 scanNow）；容器模块自己不再持有任何"扫描间隔 / 预算"。
 --- 物品详情卸载：getItemDetail 同样是阻塞调用（≈1 个服务器刻/次），整理要 maxCount、
 --- 标签扫描要 tags，几百种物品全压在主控身上会明显卡顿 —— 打包交给 worker 代查。
 containers:setDetailProvider(transfer)
@@ -1279,6 +1269,160 @@ containers:setDetailProvider(transfer)
 transfer:setContext({
     version = IFM_VERSION,
 })
+
+--- ===== 任务调度器（1.7.0）=====
+--- 每个来源一个队列，队列之间轮转（round-robin），每个队列各有时间片（网页「设置」可改）。
+--- 队列的推进规则：
+---   * 有 worker 且都忙 → 本次调度不推进队列（写盘 / 心跳 / 超时 / 推送照做）；
+---   * 没有 worker → 主控本机执行，且每次调度只推进一步；
+---   * 任务失败/未完成：流程队列回队尾（retry），其它队列直接丢弃（drop，由生成器下次重建）。
+--- 目前（P1）只有流程队列接了执行体；容器扫描 / 入库 / 出库 / 整理 / 物品详情 / 交互容器
+--- 这几条队列在 P2 接入（现在先把队列与生成器骨架搭好，行为与以前一致）。
+dispatch = Dispatch.new({ log = log, store = store, cache = cache, transfer = transfer })
+--- 搬运任务的执行者：containers 把任务入队，队列轮到它时调用 executeMove（见 modules/containers.lua）
+containers:setDispatcher(dispatch)
+local scheduleSettings = store:scheduleSettings()
+dispatch:applySlices(scheduleSettings.slices)
+
+-- 队列定义：needs = 任务需要什么能力（none / query / move）。
+-- 各队列的 run 自己决定"这一步是继续（true，回队尾）/ 结束（false）/ 丢弃（"drop"）"：
+--   * 流程队列：没结束就 true（均匀推进所有进程）；
+--   * 手动操作：搬够了 false，还没搬够 true，搬不动 / 失败 "drop"（失败即丢弃）。
+dispatch:addQueue("process", {
+    needs = "none", policy = "retry",
+    run = function(task, now)
+        return engine:stepProcessOnce(task.name, now)
+    end,
+})
+-- 容器扫描队列（storageScan / inputScan）：一步 = 扫一个容器。
+--   * 有 worker：交给 worker 代读（Transfer:submitScan），结果由 transfer.onQueryResult 写进快照；
+--   * 没有 worker：本机 scanNow（阻塞约 1 刻/容器；无 worker 时每次调度只推进一步，不会挤爆）；
+--   * 扫描失败 / 外设没了：丢弃（"drop"），下次由生成器重新排。
+local function scanTaskRunner(task, now)
+    local name = task.name
+    if not peripherals:exists(name) then
+        return "drop"
+    end
+    if transfer:workerCount() == 0 then
+        containers:scanNow(name)
+        return false
+    end
+    local state, value = transfer:submitScan(name)
+    if state == "done" and type(value) == "table" then
+        -- 新鲜结果已经在缓存里：写一次快照（用结果自己的时间戳，避免把"已结算的乐观变更"误丢）
+        containers:applyScan(name, value.items, value.tanks, tonumber(value.at) or now)
+        return false
+    end
+    if state == "pending" then
+        return "inflight"                       -- worker 在扫：结果由 onQueryResult 收
+    end
+    return true                                 -- 没有空闲的查询 worker：回队尾，下次再试
+end
+dispatch:addQueue("storageScan", { needs = "query", policy = "retry", run = scanTaskRunner })
+dispatch:addQueue("inputScan", { needs = "query", policy = "retry", run = scanTaskRunner })
+-- 搬运队列（inventoryIn / inventoryOut / compact）：一步 = 执行一条搬运任务。
+--   * 有 worker：交给 worker（Containers:runItemMove 里的 Transfer 请求，对任务键幂等）；
+--   * 没有 worker：主控本机执行（pushItems / pullItems）；
+--   * 搬不动 / 失败：丢弃（入库、出库、整理的搬运失败即丢弃，由生成器下次重建）；
+--   * 已经交给 worker 还在飞：返回 "inflight"（等回报，回报后由 executeMove 再走一次结算）。
+local function moveTaskRunner(task)
+    return containers:executeMove(task)
+end
+dispatch:addQueue("inventoryIn", { needs = "move", policy = "retry", run = moveTaskRunner })
+dispatch:addQueue("inventoryOut", { needs = "move", policy = "retry", run = moveTaskRunner })
+dispatch:addQueue("compact", { needs = "move", policy = "retry", run = moveTaskRunner })
+-- 物品详情队列：一步 = 一次 getItemDetail（一次调用约 1 个游戏刻）。
+--   * 有 worker：交给它代查（结果由 transfer.onDetailResult 结束任务，字典由 absorb 流程写入）；
+--   * 没有 worker：主控本机读一次（阻塞约 1 刻）；
+--   * 拿不到 / 失败：丢弃（物品可能已经不在了；下一次扫描会重新生成）；
+--   * 字典里已经有答案（含"问过拿不到"的负缓存）：丢弃。
+dispatch:addQueue("detail", {
+    needs = "query", policy = "retry",
+    run = function(task)
+        local sample = task.sample
+        if not sample or not sample.container or not sample.name then
+            return "drop"
+        end
+        local _, known = containers:cachedItemDetail(sample.name, sample.nbt)
+        if known then
+            return false
+        end
+        if not peripherals:exists(sample.container) then
+            return "drop"
+        end
+        if transfer:workerCount() > 0 then
+            local state = containers:requestItemDetails({ sample })
+            if state == "pending" then
+                return "inflight"
+            end
+            return true                         -- 没有空闲的查询 worker：回队尾
+        end
+        local detail = containers:detail(sample.container, sample.slot,
+            { name = sample.name, nbt = sample.nbt })
+        if type(detail) == "table" then
+            storeTags(sample.name, detail)
+            detailScan.scanned = (detailScan.scanned or 0) + 1
+        end
+        return false
+    end,
+})
+dispatch:addQueue("manual", {
+    needs = "move", policy = "retry",
+    run = function(task, now)
+        return runManualTask(task, now)
+    end,
+})
+
+-- 维护：心跳 / worker 超时 / 任务重发（不属于"调度器推进"，worker 全忙也照做）
+dispatch:setMaintain(function(now)
+    transfer:tick(now)
+end)
+
+--- worker 代扫回来了：写进容器快照，并结束对应的扫描队列任务（在飞 → 出队）
+transfer.onQueryResult = function(_, key, message)
+    local name = tostring(key or ""):match("^scan:(.+)$")
+    if not name then
+        return
+    end
+    containers:applyScan(name, message.items, message.tanks, tonumber(message.at) or os.epoch("utc"))
+    dispatch:finishInflight("storageScan", name)
+    dispatch:finishInflight("inputScan", name)
+end
+
+--- worker 代查的物品详情回来了：结束 detail 队列里对应的在飞任务
+--- （字典与标签由 absorbWorkerDetails 在生成器里统一写入）
+transfer.onDetailResult = function(_, message)
+    for _, entry in ipairs(type(message.details) == "table" and message.details or {}) do
+        if type(entry) == "table" and entry.name then
+            dispatch:finishInflight("detail", detailQueueKey(entry.name, entry.nbt))
+        end
+    end
+end
+
+-- 生成器：把新任务补进队列（纯内存）
+dispatch:addGenerator(function(now)
+    engine:maintain(now)
+    --- 容器扫描：按轮次判断新鲜度（不是毫秒间隔）——没扫过、或超过 maxAgeTicks 轮没扫过就排进队列
+    containers:advanceTick()
+    local maxAgeTicks = 20                      -- 20 轮 ≈ 1 秒（50ms/轮）
+    for _, def in ipairs(store:list("containers")) do
+        local peripheralName = def.peripheral
+        if type(peripheralName) == "string" and peripheralName ~= "" and
+            peripherals:exists(peripheralName) and containers:needsScan(peripheralName, maxAgeTicks) then
+            local queueName = (def.role == "input") and "inputScan" or "storageScan"
+            dispatch:enqueue(queueName, { key = peripheralName, name = peripheralName })
+        end
+    end
+    engine:enqueueActiveProcesses(dispatch)
+    engine:processDeliveries(now)
+    engine:stepCompact(now)
+    engine:finishTick()
+    --- 物品详情（detail 队列）：吸收 worker 代查回来的结果 → 排"扫描时看到但还没详情"的物品 →
+    --- 低频清理标签缓存（按轮次，不是毫秒间隔）
+    absorbWorkerDetails()
+    queueMissingDetails()
+    pruneTagCache()
+end)
 
 --- 日志同时打印到本地终端并推给网页（浏览器控制台打印）：
 --- 这样即使没打开浏览器控制台，也能在 CC 终端看到引擎/流程/发送任务的具体原因。
@@ -1324,17 +1468,37 @@ else
     log("Initial relay connection request failed, retrying every %d seconds", protocol.reconnectInterval)
 end
 
-local TICK = 0.1
-local tickToken = os.startTimer(TICK)
+--- 调度节拍（1.7.0）：50ms = 1 个游戏刻（CC:T 能准确计时的最小时间片）。
+--- 上一轮调度完成后才开始下一轮计时：一轮偶尔超过 50ms（例如没有 worker、本机读容器
+--- 每次约 1 刻）时不会积压 timer 事件，也就不会出现"timer 事件永远消化不完"的情况。
+local TICK = 0.05
+local tickToken = nil
+local armedAt = 0
+local function armTick()
+    tickToken = os.startTimer(TICK)
+    armedAt = os.epoch("utc")
+end
+armTick()
 local lastStatusPrint = os.epoch("utc")
 local startedAt = os.epoch("utc")
 
---- 每 30 秒的状态摘要（**同时**打印到终端与浏览器控制台）：
+--- 每 30 秒的状态摘要（同时打印到终端与浏览器控制台）：
 --- 连接状态、每条发送任务的进度与原因、每个进程的状态/阶段/机器/原因
 local function statusLine()
+    local protocolStatus = protocol.status and select(2, pcall(protocol.status, protocol)) or nil
+    local link = ""
+    if type(protocolStatus) == "table" then
+        --- 中继连接的健康度：活了多久 / 多久没收到任何入站消息 / 累计断开次数与最后一次的原因
+        --- （闪断排查用；closes 持续增长而 connectedFor 很小 = 连接一直被关掉）
+        link = string.format(" / link: up=%ds idle=%ds closes=%d%s",
+            protocolStatus.connectedSeconds or 0,
+            protocolStatus.idleSeconds or 0,
+            protocolStatus.closes or 0,
+            protocolStatus.lastCloseReason and (" (" .. tostring(protocolStatus.lastCloseReason) .. ")") or "")
+    end
     local connection = protocol.connected and "relay:up" or "relay:down"
     local client = protocol.clientActive and "browser:on" or "browser:off"
-    log("%s / %s / room %s / defs: containers=%d signals=%d filters=%d machines=%d processes=%d / uptime %ds",
+    log("%s / %s / room %s / defs: containers=%d signals=%d filters=%d machines=%d processes=%d / uptime %ds%s",
         connection,
         client,
         room,
@@ -1343,7 +1507,8 @@ local function statusLine()
         #store:list("filters"),
         #store:list("machines"),
         #store:list("processes"),
-        math.floor((os.epoch("utc") - startedAt) / 1000))
+        math.floor((os.epoch("utc") - startedAt) / 1000),
+        link)
     for _, delivery in ipairs(cache:deliveries()) do
         log("delivery #%s %s x%s -> %s%s",
             tostring(delivery.id or 0),
@@ -1363,10 +1528,6 @@ local function statusLine()
             tostring(record.lastError))
     end
 end
-
---- 备用驱动：某些情况下主 tick 定时器会丢失（收不到 timer 事件），
---- 这时只要还有任何事件（网页心跳等）或备用定时器，引擎依然会被推进
-local backupToken = os.startTimer(TICK + 0.05)
 
 --- 事件计数（诊断报告里能看到：timers=0 说明这台机器收不到定时器事件）
 local debugCounters = { events = 0, timers = 0, websockets = 0, ticks = 0 }
@@ -1419,9 +1580,17 @@ local function timed(label, fn, ...)
     return ok, err
 end
 
---- 慢 tick 明细：引擎 tick 里推进了几个流程 / 真正读了几次容器（缓存命中不算）与容器扫描的实测成本
-slowDetails["engine tick"] = function()
-    return engine:tickStatsText()
+--- 慢调度明细：这一轮推了哪些队列（每条队列的深度/服务数）以及容器扫描的实测成本
+slowDetails["dispatch"] = function()
+    local dispatchStatus = dispatch:status()
+    local parts = {}
+    for _, queue in ipairs(dispatchStatus.queues) do
+        parts[#parts + 1] = string.format("%s=%d", queue.name, queue.depth)
+    end
+    return string.format("%s | mode=%s steps=%d lastMs=%.1f maxMs=%.1f | %s",
+        engine:tickStatsText(), tostring(dispatchStatus.mode), tonumber(dispatchStatus.steps) or 0,
+        tonumber(dispatchStatus.lastMs) or 0, tonumber(dispatchStatus.maxMs) or 0,
+        table.concat(parts, " "))
 end
 
 --- 慢推送明细：一次推送要全量收集（含资源统计与容量），这里给出容器扫描的自适应缓存时长
@@ -1444,6 +1613,10 @@ diagnose.perfStats = perfStats
 diagnose.debugCounters = debugCounters
 diagnose.protocol = protocol
 diagnose.transfer = transfer
+--- 调度器（1.7.0）：诊断报告里的队列深度 / 服务数 / 每轮耗时都从这里取
+diagnose.dispatch = dispatch
+--- 引擎（recipe）：诊断里的守卫计数（用户第 1 项：未定义行为必须报错并计数）从这里取
+diagnose.engine = engine
 
 --- 外设热插拔：可能成片触发（有线网络抖动 / 成片区块加载时事件会刷屏）。
 --- 因此这里只标记“待扫描”，真正的重扫放到 runDue 里按“最多每秒一次”执行：
@@ -1462,34 +1635,18 @@ local function refreshPeripheralsIfNeeded(now)
     containers:invalidate()
 end
 
---- 推进引擎与各模块：不论由哪种事件触发，只要距上次推进 >= TICK 就跑一次
-local lastEngineRun = 0
-local function runDue(now)
-    if now - lastEngineRun < TICK * 1000 then
-        return
-    end
-    lastEngineRun = now
+--- 一次主控调度执行（只在 timer 事件里跑；见下面的 mainLoop）。
+--- 主角是调度器（队列轮转 + 时间片）：有 worker 且都忙时它只停"队列推进"，
+--- 写盘 / 心跳 / 超时 / 重发 / 推送这些不属于调度器的部分照做。
+local function masterTick(now)
     debugCounters.ticks = debugCounters.ticks + 1
     refreshPeripheralsIfNeeded(now)
-    -- 引擎 tick 也要计时：以前这里是裸 pcall，perf 报告里**看不到**它的耗时，
-    -- 而排查“主循环为什么变慢（engineRuns 远小于 timers）”时这一段往往正是最大的一块。
-    --- 1.5.0：流程与中继都由主控本机执行（IFMWorker 只做搬运/查询），
-    --- 所以这里不再有“让出流程”与“切换中继传输层”的动作。
-    local okEngine, engineErr = timed("engine tick", engine.tick, engine, now)
-    if not okEngine then
-        -- 记进引擎（诊断报告里能看到）；错误行由 timed() 统一打印/推送
-        engine.lastTickError = tostring(engineErr)
-    else
-        engine.lastTickError = nil
-    end
+    --- 延时任务（modules/scheduler.lua）：与任务队列无关的小定时器
     timed("scheduler", scheduler.tick, scheduler, now)
-    timed("tag queue", processTagQueue)
-    timed("tag auto scan", autoQueueTagScan)
-    timed("store tick", store.tick, store, now)
-    timed("cache tick", cache.tick, cache, now)
+    --- 网页推送：状态有变化才真的推（revision 驱动）
     timed("protocol update", protocol.update, protocol, now)
-    --- IFMWorker 调度：定时广播 hello、清理掉线的 worker 与超时任务
-    timed("transfer tick", transfer.tick, transfer, now)
+    --- 任务调度器：写盘 → 维护 → 生成器 → 队列轮转（见 modules/dispatch.lua）
+    timed("dispatch", dispatch.tick, dispatch, now)
     if now - lastStatusPrint > 30000 then
         lastStatusPrint = now
         timed("status line", statusLine)
@@ -1500,31 +1657,33 @@ local function mainLoop()
     while true do
         local event, param1, param2, param3, param4, param5 = os.pullEvent()
         debugCounters.events = debugCounters.events + 1
-        if event == "timer" and (param1 == tickToken or param1 == backupToken) then
-            if param1 == tickToken then
-                tickToken = os.startTimer(TICK)
-            else
-                backupToken = os.startTimer(TICK + 0.05)
-            end
+        if event == "timer" and param1 == tickToken then
+            tickToken = nil
             debugCounters.timers = debugCounters.timers + 1
-            runDue(Util.now())
+            masterTick(Util.now())
+            -- 需求：一轮调度完成后才开始下一轮计时 —— timer 事件永远不会积压
+            armTick()
         elseif event == "peripheral" or event == "peripheral_detach" then
             -- 不在这里立刻重扫：成片的外设事件会把事件循环占满（见 refreshPeripheralsIfNeeded）
             peripheralScanPending = true
-            runDue(Util.now())
         elseif event == "websocket_success" or event == "websocket_message" or event == "websocket_closed"
             or event == "websocket_failure" then
             debugCounters.websockets = debugCounters.websockets + 1
             -- 协议层（含收到请求后的推送）出错绝不能让主循环结束：
             -- 主循环一旦结束，服务端就退出，网页上所有请求都会变成“超时”。
-            timed("protocol event", protocol.onEvent, protocol, event, param1, param2)
-            runDue(Util.now())
+            -- 网页请求在两次调度之间就会被处理完（调度器只认 timer 事件）。
+            -- param3 是 CC:T 在 websocket_closed 里附带的关闭说明（诊断用）。
+            timed("protocol event", protocol.onEvent, protocol, event, param1, param2, param3)
         elseif event == "modem_message" then
             -- IFMWorker 调度：worker 的 hello / pong / 任务结果都从这里进来
             timed("transfer message", transfer.onModemMessage, transfer, param1, param2, param3, param4, param5)
-            runDue(Util.now())
-        else
-            runDue(Util.now())
+        end
+        -- 丢 timer 的恢复（事件驱动、不引入第二个 timer）：已经排队的 timer 早该触发却一直没来
+        -- → 重开一个（旧 token 的事件会被忽略，因为 tickToken 已经换了）
+        local now = Util.now()
+        if tickToken and now - armedAt > 2 * TICK * 1000 then
+            tickToken = nil
+            armTick()
         end
     end
 end

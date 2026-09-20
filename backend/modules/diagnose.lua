@@ -1,6 +1,6 @@
 -- IFM :: modules/diagnose.lua
 -- 只读诊断：把“为什么材料/产物/发送任务不动”逐条算出来。
--- 结果作为日志行推给浏览器控制台（同时本地 print），**不写任何文件**（CC:T 磁盘很小）。
+-- 结果作为日志行推给浏览器控制台（同时本地 print），不写任何文件（CC:T 磁盘很小）。
 --
 -- 三种模式（由 IFMMaster.lua 的 diagnose action 调用）：
 --   report : 全面体检（外设 / 容器定义 / 机器 / 进程 / 发送任务 / 结论）
@@ -22,7 +22,7 @@ function Diagnose.new(opts)
     --- perf（各组件耗时）/ protocol（收发统计）通常由 IFMMaster.lua 在创建后回填，
     --- 这里允许构造时直接传入；两者都缺失时 perf 诊断会给出“不可用”的提示。
     -- 性能计时（IFMMaster.lua 的 timed 收集）。
-    -- 注意：字段名**不能**叫 self.perf —— `perf` 是本模块的方法名（`Diagnose:perf()`），
+    -- 注意：字段名不能叫 self.perf —— `perf` 是本模块的方法名（`Diagnose:perf()`），
     -- 赋成表会把方法覆盖掉，诊断 perf 模式就会报 “attempt to call method 'perf' (a table value)”。
     self.perfStats = opts.perfStats
     self.protocol = opts.protocol
@@ -410,6 +410,21 @@ function Diagnose:perf()
                 summary.pushes or 0, summary.pushSkipped or 0, summary.fullSyncs or 0,
                 summary.changedItems or 0, summary.dropped or 0, summary.failed or 0,
                 summary.encodeFailed or 0))
+            --- 连接生命周期（闪断排查）：多久断一次、是谁断的、断在连上后第几秒
+            say(string.format("protocol link: connectRequests=%d failures=%d timeouts=%d reconnects=%d",
+                summary.connectRequests or 0, summary.connectFailures or 0,
+                summary.connectTimeouts or 0, summary.reconnects or 0))
+            say(string.format("protocol link: pending=%d expected=%d abandoned=%d extras=%d",
+                summary.pendingAcks or 0, summary.expectedAcks or 0,
+                summary.abandoned or 0, summary.extraHandles or 0))
+            say(string.format("protocol link: closes=%d (relay=%d, own=%d, stale=%d) connectedFor=%ds idle=%ds",
+                summary.closes or 0,
+                math.max(0, (summary.closes or 0) - (summary.ownCloses or 0) - (summary.staleCloses or 0)),
+                summary.ownCloses or 0, summary.staleCloses or 0,
+                summary.connectedSeconds or 0, summary.idleSeconds or 0))
+            if summary.lastCloseReason then
+                say("protocol link: last close reason: " .. tostring(summary.lastCloseReason))
+            end
             say("protocol: traffic by action (bytes desc, top 12):")
             local actions = summary.actions or {}
             if #actions == 0 then
@@ -428,28 +443,71 @@ function Diagnose:perf()
         say("protocol: not available")
     end
 
-    --- 2.5) IFMWorker 搬运卸载（有 worker 时 IFM 自己不再搬东西）
+    --- 2.5) 任务调度器（1.7.0）：每条队列的深度 / 服务数 / 丢弃数 + 本轮耗时。
+    --- 这里是"为什么慢 / 为什么 worker 空着"的第一现场：
+    ---   * mode=local   没有 worker → 主控本机执行，每次调度只推进一步；
+    ---   * mode=remote  有 worker 且有空闲 → 队列轮转（派给 worker）；
+    ---   * mode=paused  有 worker 但都忙 → 本次调度不推进队列（这期间 worker 会一直有活）。
+    --- 看深度：某条队列深度一直是 0 而 steps 很小，说明瓶颈不在这条队列；
+    --- 深度一直涨而 steps 不涨 → 队列被能力门控挡住（没有具备该能力的空闲 worker）。
+    if self.dispatch and self.dispatch.status then
+        local okDispatch, dispatchStatus = pcall(self.dispatch.status, self.dispatch)
+        if okDispatch and type(dispatchStatus) == "table" then
+            say(string.format("scheduler: mode=%s runs=%d steps=%d (local=%d remote=%d) paused=%d inflight=%d writes=%d",
+                tostring(dispatchStatus.mode), dispatchStatus.runs or 0, dispatchStatus.steps or 0,
+                dispatchStatus.localSteps or 0, dispatchStatus.remoteSteps or 0,
+                dispatchStatus.paused or 0, dispatchStatus.inflight or 0, dispatchStatus.writes or 0))
+            if self.Store and self.Store.scheduleSettings then
+                local okSched, sched = pcall(self.Store.scheduleSettings, self.Store)
+                if okSched and type(sched) == "table" then
+                    local parts = {}
+                    for _, queue in ipairs(sched.queues or {}) do
+                        parts[#parts + 1] = queue .. "=" .. tostring((sched.slices or {})[queue] or 1)
+                    end
+                    say("scheduler slices: " .. table.concat(parts, " "))
+                end
+            end
+            say(string.format("scheduler: per-run last=%.1fms avg=%.1fms max=%.1fms cursor=%s uptime=%ds",
+                tonumber(dispatchStatus.lastMs) or 0, tonumber(dispatchStatus.avgMs) or 0,
+                tonumber(dispatchStatus.maxMs) or 0, tostring(dispatchStatus.cursor),
+                dispatchStatus.uptimeSeconds or 0))
+            say(string.format("scheduler guards: duplicateQueues=%d missingRunner=%d idleProcessInQueue=%d",
+                dispatchStatus.duplicateQueues or 0, dispatchStatus.missingRunner or 0,
+                (self.engine and self.engine.guardCounters and self.engine.guardCounters.idleProcessInQueue) or 0))
+            say("scheduler queues (name weight-cum-stats depth inflight served done dropped retried needs):")
+            for _, queue in ipairs(dispatchStatus.queues or {}) do
+                say(string.format("  %-13s slice=%-3s depth=%-5s inflight=%-3s served=%-7s done=%-7s dropped=%-5s retried=%-5s needs=%s",
+                    tostring(queue.name), tostring(queue.slice), tostring(queue.depth),
+                    tostring(queue.inflight), tostring(queue.served), tostring(queue.done),
+                    tostring(queue.dropped), tostring(queue.retried), tostring(queue.needs)))
+            end
+        else
+            say("scheduler: status unavailable (" .. tostring(dispatchStatus) .. ")")
+        end
+    else
+        say("scheduler: not available")
+    end
+
+    --- 2.6) IFMWorker 搬运卸载（有 worker 时 IFM 自己不再搬东西）
     if self.transfer and self.transfer.status then
         local okTransfer, transferStats = pcall(self.transfer.status, self.transfer)
         if okTransfer and type(transferStats) == "table" then
-            say(string.format("IFMWorker: workers=%d busy=%d pending=%d channel=%s",
-                transferStats.workers or 0, transferStats.busy or 0, transferStats.pending or 0,
-                tostring(transferStats.channel or "-")))
+            say(string.format("IFMWorker: workers=%d busy=%d idle=%d pending=%d channel=%s",
+                transferStats.workers or 0, transferStats.busy or 0, transferStats.idle or 0,
+                transferStats.pending or 0, tostring(transferStats.channel or "-")))
             say(string.format("IFMWorker: submitted=%d done=%d failed=%d timedOut=%d localMoves=%d",
                 transferStats.submitted or 0, transferStats.done or 0, transferStats.failed or 0,
                 transferStats.timedOut or 0, transferStats.localMoves or 0))
-            --- 容器扫描卸载：worker 代读容器干了多少活（主控省下的时间就在这里）
-            --- paused/blind 是“代扫没用”的两个信号：blind>0 = worker 回答了却看不到这些容器
-            --- （它不在同一有线网络上，见 README 6.2）；paused>0 = 连续失败后暂时不派活了
-            local scan = transferStats.scan
-            if type(scan) == "table" then
-                say(string.format("IFMWorker scan: cached=%d batches=%d subQueries=%d containersRead=%d hits=%d pending=%d localOnly=%d failed=%d ttl=%dms",
-                    scan.cached or 0, scan.batches or 0, scan.subQueries or 0, scan.containers or 0,
-                    scan.hits or 0, scan.pending or 0, scan.localOnly or 0, scan.failed or 0, scan.ttl or 0))
-                say(string.format("IFMWorker scan: blind=%d paused=%d (left=%ds) queued=%d sliceMax=%d ttlMax=%dms",
-                    scan.blind or 0, scan.paused or 0, scan.pauseLeft or 0, scan.queued or 0,
-                    scan.sliceMax or 0, scan.ttlMax or 0))
-            end
+            --- 1.7.0：代扫机制已删除（容器扫描走 storageScan / inputScan 队列），
+            --- 这里只报告 worker 侧的在飞任务数（快照统计见下面的 container snapshot 段）
+            say(string.format("IFMWorker: idle=%d/%d movers=%d queriers=%d",
+                transferStats.idle or 0, transferStats.workers or 0,
+                transferStats.idleMovers or 0, transferStats.idleQueriers or 0))
+            say(string.format("IFMWorker: usable=%d unknownVersion=%d versionMismatch=%d inFlight=%d (master=%s)",
+                transferStats.usable or 0, transferStats.versionUnknown or 0,
+                transferStats.versionMismatch or 0, transferStats.inFlightWorkers or 0,
+                tostring((self.protocol and self.protocol.version) or "?")))
+            --- 容器扫描的代扫统计（1.7.0 P1 仍是旧实现；P2 会并入 storageScan/inputScan 队列）
         else
             say("IFMWorker: status unavailable (" .. tostring(transferStats) .. ")")
         end
@@ -464,10 +522,18 @@ function Diagnose:perf()
         if self.Containers.scanSummary then
             local okSummary, scan = pcall(self.Containers.scanSummary, self.Containers)
             if okSummary and type(scan) == "table" then
-                say(string.format("container scan cache: containers=%s readCost=%sms passCost=%sms ttl=%sms (base=%sms x%s) reads=%s total=%sms defer=%s budget=%sms",
-                    tostring(scan.containers), tostring(scan.readCost), tostring(scan.passCost),
-                    tostring(scan.ttl), tostring(scan.baseTtl), tostring(scan.multiplier),
-                    tostring(scan.reads), tostring(scan.readMs), tostring(scan.defer or 0), tostring(scan.budget or 0)))
+                say(string.format("container snapshot: containers=%s scanned=%s readCost=%sms passCost=%sms reads=%s readMs=%sms staleMax=%s staleAvg=%s (ticks)",
+                    tostring(scan.containers), tostring(scan.scanned), tostring(scan.readCost),
+                    tostring(scan.passCost), tostring(scan.reads), tostring(scan.readMs),
+                    tostring(scan.staleTicks or 0), tostring(scan.staleAvgTicks or 0)))
+                if self.Containers.snapshotSummary then
+                    local okSnap, snap = pcall(self.Containers.snapshotSummary, self.Containers)
+                    if okSnap and type(snap) == "table" then
+                        say(string.format("container snapshot detail: reservations=%d settled=%d swept=%d inFlight=%d results=%d",
+                            snap.pending or 0, snap.settled or 0, snap.swept or 0, snap.inflight or 0,
+                            snap.results or 0))
+                    end
+                end
             end
         end
         local okScans, scans = pcall(self.Containers.scanStatsSummary, self.Containers, 12)

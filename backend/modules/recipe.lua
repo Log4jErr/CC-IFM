@@ -110,8 +110,10 @@ function Recipe.new(opts)
     self.Containers = opts.Containers
     self.Filter = opts.Filter
     self.log = opts.log or function() end
-    self.maxOpsPerTick = opts.maxOpsPerTick or 12
-    self.retryInterval = opts.retryInterval or 1
+    --- 一步的预算（1.7.0）：流程队列一次只推进"一步" —— 一次材料输入/产物抽出调用算一步，
+    --- 无论它是否搬满（搬不完就让位，回队列尾）。这样机器还在合成时，进程不会一直卡在
+    --- "等产物抽取"上。
+    self.stepBudget = 1
     --- 存储整理（网页手动触发）：每个 tick 最多执行多少次搬运，避免一次整理卡住主循环
     self.compactOpsPerTick = opts.compactOpsPerTick or 3
     --- 引擎存活信息（诊断用）：tick 次数、最后一次 tick 时间、最后一次 tick 异常
@@ -147,7 +149,7 @@ end
 
 --- 机器的信号项 → 中继器外设名（1.6.9）：
 ---   * 旧配置写的是“信号定义名” → 查定义拿它的外设；
----   * 现在信号不需要命名，机器里直接写**外设名** → 就把它当成外设名（返回它自己）。
+---   * 现在信号不需要命名，机器里直接写外设名 → 就把它当成外设名（返回它自己）。
 --- 返回：中继器外设名, 用于显示/日志的名字（解析不到时返回 nil）
 function Recipe:signalPeripheralOf(entry)
     if type(entry) ~= "string" or entry == "" then
@@ -264,7 +266,7 @@ function Recipe:machineUsage()
     return out
 end
 
---- 解析元素涉及的中继器外设（只认**机器**定义的信号序号：机器 signals 列表的序号，从 1 开始）
+--- 解析元素涉及的中继器外设（只认机器定义的信号序号：机器 signals 列表的序号，从 1 开始）
 function Recipe:resolveSignals(machine, element)
     local result = {}
     local sides = element.sides or {}
@@ -454,10 +456,10 @@ function Recipe:outputContainers(machine, resourceKind)
 end
 
 --- ===== 在飞搬运的记忆（1.6.7：修「要 64 个却搬了 127 个」）=====
---- worker 搬运是**异步**的：主控发出 task 后要等它回报。回报之前调用方必须继续等**同一条请求**，
+--- worker 搬运是异步的：主控发出 task 后要等它回报。回报之前调用方必须继续等同一条请求，
 --- 绝不能按“这一 tick 重新扫到的槽位”再发一条 —— 那会把同一批货搬两遍。
 --- 用户实测的现象：要 64 个，worker 先把某个槽位里的 63 个搬走；下一 tick 缓存刷新后，
---- 那个槽位空了，于是主控又从**另一个**槽位发了 64 个出去 → 一共 127 个。
+--- 那个槽位空了，于是主控又从另一个槽位发了 64 个出去 → 一共 127 个。
 --- 这里按 token（调用方给的稳定标记：流程名 + 元素 key / 发货任务 id）记住那条请求，
 --- 回报回来再记账，之后才允许重新扫源找下一批。
 local PENDING_MOVE_TTL = 45000      -- 超过这么久还没回报的记忆一律丢掉（worker 早就超时了）
@@ -517,10 +519,10 @@ function Recipe:resumePendingMove(token)
     end
     local moved, err
     if record.kind == "fluid" then
-        moved, err = self.Containers:pushFluid(record.container, record.want, record.fluid, record.target)
+        moved, err = self.Containers:pushFluid(record.container, record.want, record.fluid, record.target, queueName)
     else
         moved, err = self.Containers:pushItem(record.container, record.slot, record.want, record.target,
-            record.toSlot, record.mode)
+            record.toSlot, record.mode, queueName)
     end
     if err == "pending" then
         return nil, "pending"
@@ -537,6 +539,8 @@ end
 ---                 "fragment" = 先拿最少的那堆，发货/输出容器求少碎片）
 ---   insertMode    往目标容器放入时的策略（见 pushItem 的 mode 参数）
 function Recipe:transferIn(spec, itemTargets, fluidTargets, toSlot, amount, token, opts)
+    --- 1.7.0：这次搬运进哪条队列（默认"库存输入" = 送料进机器；发货用 opts.queue = "inventoryOut"）
+    local queueName = (type(opts) == "table" and opts.queue) or "inventoryIn"
     if amount <= 0 then
         return 0, nil
     end
@@ -730,7 +734,7 @@ function Recipe:transferOut(spec, machine, amount, token)
         return 0, nil
     end
     -- 物品只送物品存储容器、流体只送流体存储容器（同名物品/流体定义也能正确区分）；
-    -- 顺序按存储优先级从大到小：**高优先级容器优先存入**（同优先级按定义名排序，见 Containers:byRole）
+    -- 顺序按存储优先级从大到小：高优先级容器优先存入（同优先级按定义名排序，见 Containers:byRole）
     local itemTargets = self.Containers:byRole("storage", "item", "out")
     local fluidTargets = self.Containers:byRole("storage", "fluid", "out")
     if #itemTargets == 0 and #fluidTargets == 0 then
@@ -771,8 +775,8 @@ function Recipe:transferOut(spec, machine, amount, token)
                             local want = math.min(amount - moved, stack.count)
                             if want > 0 then
                                 local got, err = self.Containers:pushItem(source, stack.slot, want, target, nil,
-                                    --- 机器产物进存储容器要**快**：优先放进能一次放下、余量最小的槽位（1.6.11）
-                                    self.Containers.INSERT_SPEED)
+                                    --- 机器产物进存储容器要快：优先放进能一次放下、余量最小的槽位（1.6.11）
+                                    self.Containers.INSERT_SPEED, "inventoryOut")
                                 if err == "pending" then
                                     self:rememberPendingMove(token, {
                                         kind = "item",
@@ -815,7 +819,7 @@ function Recipe:transferOut(spec, machine, amount, token)
                             if moved >= amount then
                                 break
                             end
-                            local got, err = self.Containers:pushFluid(source, amount - moved, tank.name, target)
+                            local got, err = self.Containers:pushFluid(source, amount - moved, tank.name, target, "inventoryOut")
                             if err == "pending" then
                                 self:rememberPendingMove(token, {
                                     kind = "fluid",
@@ -1125,10 +1129,9 @@ function Recipe:ensureMaterials(processName, process, record, chain, depth)
 end
 
 --- 批次执行过程中发现材料不足（按优先级请求上游，或标记缺失）
+--- 1.7.0：去掉了"每秒才检查一次"的硬间隔 —— 流程队列每轮都会把进程放回队尾，
+--- 轮转本身就是节流；上游请求是幂等的（requestUpstream 只加增量）。
 function Recipe:handleShortage(process, record, now)
-    if now - (record.checkedAt or 0) < self.retryInterval * 1000 then
-        return false
-    end
     record.checkedAt = now
     local ready, element, shortBy, index = self:batchMaterialsReady(process, record)
     if ready then
@@ -1169,7 +1172,8 @@ end
 --- 输入阶段：按输入列表顺序依次输入，每个元素必须完全输入后才进入下一个
 function Recipe:stepInput(process, record, machine, now)
     local inputs = process.inputs or {}
-    local budget = self.maxOpsPerTick
+    -- 一步 = 至多一次搬运调用（见 Recipe.new 的 stepBudget）
+    local budget = self.stepBudget or 1
     record.progress = record.progress or {}
     -- 红石脉冲是跨 tick 的多步动作：先把它推进完，再继续后面的元素
     if record.pulse and not self:advancePulse(record, now) then
@@ -1247,13 +1251,13 @@ function Recipe:stepInput(process, record, machine, now)
                         element.slot,
                         short,
                         "in:" .. tostring(process.name) .. "\1" .. tostring(key),
-                        --- 给机器送料要**快**：从存储容器优先抽数量最多的那几堆（1.6.11）
+                        --- 给机器送料要快：从存储容器优先抽数量最多的那几堆（1.6.11）
                         { storageOrder = self.Containers.ORDER_SPEED }
                     )
                 end
                 if reason == "pending" then
                     -- 材料搬运已交给 IFMWorker：本 tick 不推进（下个 tick 用同一个任务继续等）。
-                    -- 但**已经回报的那部分要立刻记账** —— 否则下个 tick 会按“还没搬过”重新要一遍，
+                    -- 但已经回报的那部分要立刻记账 —— 否则下个 tick 会按“还没搬过”重新要一遍，
                     -- 把同一批材料送两遍（用户实测：要 64 个结果搬了 127 个）。
                     moved = tonumber(moved) or 0
                     if moved > 0 then
@@ -1326,7 +1330,8 @@ end
 --- 输出阶段：按输出列表顺序依次抽取，抽到“最多数目”或满足“最少数目”即进入下一个
 function Recipe:stepOutput(process, record, machine, now)
     local outputs = process.outputs or {}
-    local budget = self.maxOpsPerTick
+    -- 一步 = 至多一次搬运调用（见 Recipe.new 的 stepBudget）
+    local budget = self.stepBudget or 1
     record.outProgress = record.outProgress or {}
     -- 红石脉冲是跨 tick 的多步动作：先把它推进完，再继续后面的元素
     if record.pulse and not self:advancePulse(record, now) then
@@ -1556,7 +1561,7 @@ function Recipe:stepProcess(process, now)
     end
 
     --- 引用的外设 / 定义缺失（例如换外设时把旧定义删了）：冻结这个流程，等外设回来再继续。
-    --- 冻结期间**不动** batch / index / progress，所以外设一恢复就接着原来的进度跑。
+    --- 冻结期间不动 batch / index / progress，所以外设一恢复就接着原来的进度跑。
     local freeze = self:peripheralProblem(process, record)
     if freeze then
         if record.state ~= "missing" or record.lastError ~= freeze then
@@ -1623,9 +1628,7 @@ function Recipe:stepProcess(process, now)
             end
             record.wait = nil
         elseif wait.kind == "machine" then
-            if now - (record.checkedAt or 0) < 500 then
-                return
-            end
+            -- 1.7.0：去掉 500ms 硬间隔 —— 进程队列轮转本身就是节流
             record.checkedAt = now
             record.wait = nil
         elseif wait.kind == "signal" then
@@ -1638,9 +1641,7 @@ function Recipe:stepProcess(process, now)
                 record.wait = nil
             end
         else
-            if now - (record.checkedAt or 0) < self.retryInterval * 1000 then
-                return
-            end
+            -- 1.7.0：去掉"每秒重试"的硬间隔（同一进程每轮调度都会被推进一步）
             record.checkedAt = now
             if self:batchMaterialsReady(process, record) or self:machineHasPending(process, record) then
                 record.wait = nil
@@ -1777,14 +1778,15 @@ function Recipe:processDeliveries(now)
                     --- token 按发货任务 id：同一条发货在 worker 回报之前只会有一条在飞请求
                     --- （以前每次重扫源都会新发一条 → 64 个变成 63 + 64 = 127 个）
                     "delivery:" .. tostring(delivery.id or delivery.name),
-                    --- 发货到**输出容器**要少碎片：从存储容器优先抽数量最少的那几堆（1.6.11）
-                    { storageOrder = self.Containers.ORDER_FRAGMENT }
+                    --- 发货到输出容器要少碎片：从存储容器优先抽数量最少的那几堆（1.6.11）
+                    --- 队列：发货是"库存输出"（1.7.0）
+                    { storageOrder = self.Containers.ORDER_FRAGMENT, queue = "inventoryOut" }
                 )
                 if reason == "pending" then
                     -- 发送搬运已交给 IFMWorker：本 tick 不改状态（下个 tick 继续等同一个任务），
                     -- 也不写 lastError —— 这不是失败，只是“等 worker 干完”。delivery 会由下面的
                     -- “remaining > 0 就留在队列里”逻辑原样保留。
-                    -- 但**已经回报的那部分必须立刻扣减**：否则下个 tick 会按原来的 remaining
+                    -- 但已经回报的那部分必须立刻扣减：否则下个 tick 会按原来的 remaining
                     -- 再发一遍（用户实测：要 64 个，结果搬了 63 + 64 = 127 个）。
                     local booked = tonumber(moved) or 0
                     if booked > 0 then
@@ -1823,9 +1825,9 @@ function Recipe:processDeliveries(now)
 end
 
 --- ===== 存储整理（网页手动触发）=====
---- 目的：把同一种物品（同名 **且** 同 NBT，否则不可堆叠）散落在多个槽位、可以跨越多个容器上的堆，
+--- 目的：把同一种物品（同名 且 同 NBT，否则不可堆叠）散落在多个槽位、可以跨越多个容器上的堆，
 --- 按「槽位内数量从小到大」的顺序合并到一起：数量最多的那堆当目标，最少的先往里装。
---- **计划是分批算的**（每个 tick 最多问几次外设，见 Containers:compactPlanPass）：
+--- 计划是分批算的（每个 tick 最多问几次外设，见 Containers:compactPlanPass）：
 --- 以前一口气算完会把主循环卡住十几秒 —— 期间引擎不推进、网页收不到推送，浏览器会
 --- “15 秒没收到服务端数据”然后重连（点「整理」必然出现的那条消息就是这么来的）。
 --- 现在 startCompact 立刻返回（state = "planning"），由 stepCompact 每 tick 推进一小步，
@@ -1854,14 +1856,11 @@ end
 
 --- 推进「整理计划」的计算：每次调用只跑一遍分批计算（预算内），算完就转入执行阶段
 function Recipe:advanceCompactPlan(job, now)
-    --- 整理计划只用**当前已扫到的容器结果**：计算期间打开“只读缓存模式”——
-    --- 不再触发 worker 代扫 / 本机扫描，物品种类也只读缓存（用户第 12 项要求）。
-    --- 计算一结束就关掉（引擎随后的搬运/判断照旧会刷新缓存）。
-    self.Containers:setCacheOnly(true)
+    --- 整理计划只用当前已扫到的容器结果：计算期间打开“只读缓存模式”——
+    --- 1.7.0：容器读取本来就是"快照模式"（只有扫描队列会读外设），不需要再切只读缓存模式
     --- 用 pcall 包住：算计划中途抛错（非 PLAN_YIELD）时也必须把只读缓存模式关掉，
     --- 否则引擎后面做搬运判断时也会“只看旧缓存”，那样会漏搬/错判。
     local okPlan, plan, done = pcall(self.Containers.compactPlanPass, self.Containers, job.planner)
-    self.Containers:setCacheOnly(false)
     if not okPlan then
         error(plan, 0)
     end
@@ -1873,7 +1872,7 @@ function Recipe:advanceCompactPlan(job, now)
             local planner = job.planner or {}
             local stage = tostring(planner.stage or "scan")
             if stage == "detail" then
-                --- 正在等 worker 把物品详情（maxCount）送回来 —— 主控自己**没有**做阻塞的 getItemDetail
+                --- 正在等 worker 把物品详情（maxCount）送回来 —— 主控自己没有做阻塞的 getItemDetail
                 stage = "waiting for worker item details"
             end
             self.log("Storage compact planning: %s (%d/%d containers, %d/%d kinds probed, %d call(s))",
@@ -1977,7 +1976,8 @@ function Recipe:stepCompact(now)
             job.skipped = (job.skipped or 0) + 1
         else
             local moved, reason = self.Containers:pushItem(
-                move.fromContainer, move.fromSlot, move.amount, move.toContainer, move.toSlot)
+                move.fromContainer, move.fromSlot, move.amount, move.toContainer, move.toSlot,
+                nil, "compact")
             if reason == "pending" then
                 -- 已交给 IFMWorker：这次先不算进度，下个 tick 用同一个任务键继续等
                 job.index = job.index - 1
@@ -2012,7 +2012,7 @@ function Recipe:stepCompact(now)
 end
 
 --- 空闲判定：没有排队批次、没有上游请求、也没有等待中的步骤 ⇒ 这个流程完全没事可做。
---- 系统里大多数流程大多数时间都是空闲的（用户要求：空闲流程不列出、也不处理），
+--- 系统里大多数流程大多数时间都是空闲的（空闲流程不列出、也不处理），
 --- 所以 tick 与 runtime() 都要先把它们筛掉，避免每 tick 白跑一遍、每帧白推一遍。
 function Recipe:idleRecord(record)
     if not record then
@@ -2038,60 +2038,138 @@ function Recipe:idleRecord(record)
     return true
 end
 
---- 每 tick 推进全部流程与待发送队列
-function Recipe:tick(now)
+--- 队列外的每轮维护（1.7.0）：外设包装自愈、在飞搬运记忆清理、输入容器卸货。
+--- 这些不属于"调度器推进"，worker 全忙时也照做。
+function Recipe:maintain(now)
     now = now or os.epoch("utc")
     self.tickCount = (self.tickCount or 0) + 1
     self.lastTickAt = now
-    -- 注意：这里**不要**每 tick 清 Containers 的扫描缓存（旧版这里调 self.Containers:invalidate()）。
-    -- 容器 list() 在有线网络 / 复杂方块上可能几十毫秒，而一个 tick 里推送、引擎、标签扫描会反复读同一批容器；
-    -- 每 tick 清缓存会让它们各自重扫一遍（实测 15 个容器 ≈1.4s/tick，网页所有请求都变慢）。
-    -- 搬运成功的调用方（transferIn / transferOut / 整理 / 手动搬运）都会显式 invalidate()，
-    -- 外设变化时 IFMMaster.lua 也会清一次，所以缓存不会让引擎看到过期的槽位内容。
     -- 每 10 秒丢弃一次外设包装缓存：外设被替换 / 区块重载后旧包装对象会失效，
-    -- 这样不用重启服务端也能自愈（否则 pushItems / list 可能一直静默失败：物品不搬运、产物抽不出来）
+    -- 这样不用重启服务端也能自愈（否则 pushItems / list 可能一直静默失败）。
     if now - (self.wrapResetAt or 0) >= 10000 then
         self.wrapResetAt = now
         self.Peripherals:invalidate()
     end
     --- 在飞搬运的记忆（见在飞搬运的记忆一节）：清掉过期的（worker 早已超时的那些）
     self:sweepPendingMoves(now)
-    --- 输入容器：定期扫一遍，把里面的东西搬进存储容器（用户第 13 项要求）
+    --- 输入容器：扫一遍并把里面的东西搬进存储容器（用户第 13 项要求）
     self:drainInputContainers(now)
-    -- 本 tick 的细分计数：真正读了几次外设（缓存命中不算）与总耗时 —— 慢 tick 的明细里会打出来
-    local readsAtStart = self.Containers.readCount or 0
-    local readMsAtStart = self.Containers.readMsTotal or 0
-    local stats = { steps = 0, active = 0, processes = 0, reads = 0, readMs = 0 }
-    self.tickStats = stats
+    -- 本轮的细分计数（慢步骤明细用）：真正读了几次外设（缓存命中不算）
+    self.tickStats = {
+        steps = 0, active = 0, processes = #self.Store:list("processes"), reads = 0, readMs = 0,
+        readsAtStart = self.Containers.readCount or 0,
+        readMsAtStart = self.Containers.readMsTotal or 0,
+    }
+end
+
+--- 本轮结束：把容器读取计数收尾（主控在一次调度执行完成后调用）
+function Recipe:finishTick()
+    local stats = self.tickStats
+    if not stats then
+        return
+    end
+    stats.reads = (self.Containers.readCount or 0) - (stats.readsAtStart or 0)
+    stats.readMs = (self.Containers.readMsTotal or 0) - (stats.readMsAtStart or 0)
+end
+
+--- 流程队列的一条任务 = 一个进程推进一步。
+--- 这个流程现在"有事可做"吗（批次 / 用户下单 / 下游需求任一 > 0）。
+--- 空闲流程不要进流程队列 —— 生成器与流程队列的 run 都用这一个判断，
+--- 免得"没事可做"的流程每轮白占一个时间片。
+function Recipe:hasPendingWork(record)
+    if type(record) ~= "table" then
+        return false
+    end
+    return (tonumber(record.batch) or 0) > 0 or (tonumber(record.userCount) or 0) > 0 or
+        (tonumber(record.downstreamCount) or 0) > 0
+end
+
+--- 一步的定义：一次材料输入 / 产物抽出调用算一步，无论它是否搬满了
+--- 需要的数量 —— 调用完就让位（回队列尾），否则机器还在合成时这个进程会一直卡着等产物抽取。
+--- 返回 true = 还没结束（调度器把它放回队尾）；false = 没事可做了（出队）。
+function Recipe:stepProcessOnce(name, now)
+    local process = self.Store:get("processes", name)
+    if not process then
+        return false                        -- 定义被删了：任务出队
+    end
+    local record = self:record(name)
+    --- 空闲（没有批次 / 下单 / 下游需求）→ 立刻出队：不推进、也不消耗时间片。
+    --- 编码规范（用户第 1 项）：这属于未定义行为（生成器只该把"有事可做"的流程排进队列），
+    --- 所以必须报错并计数，而不是静默出队 —— 否则出了 bug 谁也看不见。
+    if not self:hasPendingWork(record) or self:idleRecord(record) then
+        self.guardCounters = self.guardCounters or {}
+        self.guardCounters.idleProcessInQueue = (self.guardCounters.idleProcessInQueue or 0) + 1
+        self.log("[IFM] BUG: idle process %s was in the process queue (state=%s) - the generator must not enqueue it",
+            tostring(name), tostring(record and record.state))
+        if record.state ~= "idle" then
+            -- 上一批刚跑完：把残留的运行态清干净（网页那边也才会把这一行移除）
+            record.state = "idle"
+            record.phase = "input"
+            record.progress = nil
+            record.current = nil
+            record.wait = nil
+            self.Cache:markDirty()
+        end
+        return false
+    end
+    local stats = self.tickStats
+    if stats then
+        stats.active = stats.active + 1
+        stats.steps = stats.steps + 1
+    end
+    local ok, err = pcall(self.stepProcess, self, process, now)
+    if not ok then
+        record = self:record(name)
+        record.lastError = tostring(err)
+        self.log("Process %s failed: %s", tostring(name), tostring(err))
+        self.Cache:markDirty()
+    end
+    record = self:record(name)
+    return not self:idleRecord(record)      -- 还有事 → 回队尾
+end
+
+--- 把所有"有事可做但还没在流程队列里"的流程补进队列（调度器的生成器每轮调用一次）。
+--- 队列本身是 FIFO + 出队才回队：同一个进程不会在队列里出现两次；
+--- dispatch:isQueued 只是兜底（例如用户在它排队时又点了一次合成）。
+function Recipe:enqueueActiveProcesses(dispatch)
+    if not dispatch then
+        return 0
+    end
+    local added = 0
     for _, process in ipairs(self.Store:list("processes")) do
-        stats.processes = stats.processes + 1
-        -- 1.5.0：流程一律由主控自己推进（worker 只做搬运/查询，没有“接管流程”一说）
-        -- 空闲流程直接跳过：它们占了绝大多数，逐个 stepProcess 纯属浪费（也不会创建运行态记录）
         local record = self.Cache.data.processes and self.Cache.data.processes[process.name]
-        if self:idleRecord(record) then
-            if record and record.state ~= "idle" then
-                -- 上一批刚跑完：把残留的运行态清干净（网页那边也才会把这一行移除）
-                record.state = "idle"
-                record.phase = "input"
-                record.progress = nil
-                record.current = nil
-                record.wait = nil
-                self.Cache:markDirty()
-            end
-        else
-            stats.active = stats.active + 1
-            stats.steps = stats.steps + 1
-            local ok, err = pcall(self.stepProcess, self, process, now)
-            if not ok then
-                local failed = self:record(process.name)
-                failed.lastError = tostring(err)
-                self.log("Process %s failed: %s", process.name, tostring(err))
-                self.Cache:markDirty()
+        if record then
+            --- 空闲流程（没有批次 / 下单 / 下游需求）不进队列
+            local pending = self:hasPendingWork(record)
+            if not pending then
+                -- 没有任何待办（批次 / 用户下单 / 上游需求都是 0）：清掉残留运行态
+                -- （旧实现是在"每 tick 遍历所有流程"里做这件事，现在由这个生成器负责）
+                if record.state ~= "idle" or record.wait ~= nil or record.progress ~= nil or
+                    record.current ~= nil or record.pulse ~= nil then
+                    record.state = "idle"
+                    record.phase = "input"
+                    record.progress = nil
+                    record.current = nil
+                    record.wait = nil
+                    record.pulse = nil
+                    record.outProgress = nil
+                    self.Cache:markDirty()
+                end
+            elseif not dispatch:isQueued("process", process.name) then
+                if dispatch:enqueue("process", { key = process.name, name = process.name }) then
+                    added = added + 1
+                end
             end
         end
     end
-    stats.reads = (self.Containers.readCount or 0) - readsAtStart
-    stats.readMs = (self.Containers.readMsTotal or 0) - readMsAtStart
+    return added
+end
+
+--- 兼容入口（诊断 / 旧调用方）：维护 + 待发送队列 + 整理。
+--- 1.7.0 起流程推进走调度器的流程队列（见 stepProcessOnce / enqueueActiveProcesses）。
+function Recipe:tick(now)
+    now = now or os.epoch("utc")
+    self:maintain(now)
     local okDeliver, errDeliver = pcall(self.processDeliveries, self, now)
     if not okDeliver then
         self.log("Delivery queue error: %s", tostring(errDeliver))
@@ -2102,9 +2180,7 @@ function Recipe:tick(now)
         self.compact = nil
         self.log("Storage compact error: %s", tostring(errCompact))
     end
-    -- 待发送队列/整理也会读外设，这里把它们算进本 tick 的读取计数（明细里能看出“是谁在读容器”）
-    stats.reads = (self.Containers.readCount or 0) - readsAtStart
-    stats.readMs = (self.Containers.readMsTotal or 0) - readMsAtStart
+    self:finishTick()
 end
 
 --- 最近一次 tick 的明细文本（主控的慢步骤日志会带上它：一眼看出慢在“推进流程”还是“扫描容器”）
@@ -2236,9 +2312,9 @@ function Recipe:currentElement(process, record)
     return entry
 end
 
---- 当前批次里“**正在合成**”的份数（材料已送达机器、还没出货的那些）：
+--- 当前批次里“正在合成”的份数（材料已送达机器、还没出货的那些）：
 ---   * 每个材料输入元素有“每份需要多少个”（element.count），已送达数量 / 该比值 = 这一元素够做几份；
----     取所有输入里的**最小值**（任一材料不够就做不出那么多份），再按当前批次数封顶；
+---     取所有输入里的最小值（任一材料不够就做不出那么多份），再按当前批次数封顶；
 ---   * 没有材料输入的流程（纯等待 / 红石等待）算整批都在合成；
 ---   * 用途：网页流程依赖图的材料节点上显示「正在合成 / 剩余目标」（用户第 11 项要求）。
 function Recipe:activeUnits(process, record)
@@ -2267,31 +2343,20 @@ function Recipe:activeUnits(process, record)
 end
 
 --- ===== 输入容器（role = "input"）=====
---- 用途（用户第 13 项要求）：把外设设成“输入容器”后，IFM 会**像扫描存储容器一样定期扫它**，
+--- 用途（用户第 13 项要求）：把外设设成“输入容器”后，IFM 会像扫描存储容器一样定期扫它，
 --- 一旦里面有东西就搬进存储容器 —— 这样人工/上游丢进去的料会自动进入存储系统，
 --- 参与库存统计与后续合成，不需要手动开容器工具搬。
---- 节奏与代扫限流配合：每 INPUT_DRAIN_INTERVAL 毫秒扫一轮，每轮最多搬 INPUT_DRAIN_OPS 次
---- （每次搬运都是 pushItem/pushFluid，可能交给 worker；pending 时下轮继续）。
-local INPUT_DRAIN_INTERVAL = 1000
-
---- 应用「输入容器扫描间隔」设置（毫秒）：网页「设置」面板可改，缺省 1000（1.6.15 调整）
-function Recipe:applyScanSettings(inputScanMs)
-    local value = tonumber(inputScanMs)
-    if value and value > 0 then
-        self.inputDrainMs = math.max(250, math.floor(value))
-    end
-    return self.inputDrainMs or INPUT_DRAIN_INTERVAL
-end
-local INPUT_DRAIN_OPS = 2
+--- 1.7.0：输入容器卸货不再有毫秒间隔与"每轮最多 N 次"的硬上限：
+--- 每个调度轮次看一遍输入容器的快照（扫描由 inputScan 队列负责），有货就提交入库任务
+--- （进 inventoryIn 队列；重复提交由 Containers.moveInflight 去重），pending 时下轮继续。
 
 function Recipe:drainInputContainers(now)
     now = now or os.epoch("utc")
     self.inputDrain = self.inputDrain or { items = 0, fluids = 0, lastAt = 0, lastLogAt = 0 }
     local state = self.inputDrain
-    local interval = self.inputDrainMs or INPUT_DRAIN_INTERVAL
-    if now - (state.lastAt or 0) < interval then
-        return 0
-    end
+    --- 1.7.0：不再有"每 INPUT_DRAIN_INTERVAL 毫秒扫一轮"的硬间隔 —— 每个调度轮次都会看一遍
+    --- 输入容器的快照（扫描由 inputScan 队列负责），有货就提交入库任务（重复提交会被
+    --- moveInflight 去重），因此"投料 → 入库"的延迟只取决于队列轮转。
     state.lastAt = now
     local sources = {
         item = self.Containers:byRole("input", "item"),
@@ -2314,12 +2379,12 @@ function Recipe:drainInputContainers(now)
             return
         end
         for _, source in ipairs(sources.item) do
-            if ops >= INPUT_DRAIN_OPS or pending then
+            if pending then
                 return
             end
             for _, stack in ipairs(self.Containers:orderStacks(self.Containers:stacks(source),
                 self.Containers.ORDER_FRAGMENT)) do
-                if ops >= INPUT_DRAIN_OPS or pending then
+                if pending then
                     return
                 end
                 local amount = tonumber(stack.count) or 0
@@ -2327,7 +2392,7 @@ function Recipe:drainInputContainers(now)
                     for _, target in ipairs(targets.item) do
                         local got, err = self.Containers:pushItem(source, stack.slot, amount, target, nil,
                             --- 输入容器 → 存储容器：先并入同类槽位，少留碎片（1.6.11）
-                            self.Containers.INSERT_LEAST)
+                            self.Containers.INSERT_LEAST, "inventoryIn")
                         if err == "pending" then
                             pending = true              -- 已交给 worker：下轮接着排
                             return
@@ -2351,17 +2416,17 @@ function Recipe:drainInputContainers(now)
             return
         end
         for _, source in ipairs(sources.fluid) do
-            if ops >= INPUT_DRAIN_OPS or pending then
+            if pending then
                 return
             end
             for _, tank in ipairs(self.Containers:tanks(source)) do
-                if ops >= INPUT_DRAIN_OPS or pending then
+                if pending then
                     return
                 end
                 local amount = tonumber(tank.amount) or 0
                 if amount > 0 then
                     for _, target in ipairs(targets.fluid) do
-                        local got, err = self.Containers:pushFluid(source, amount, tank.name, target)
+                        local got, err = self.Containers:pushFluid(source, amount, tank.name, target, "inventoryIn")
                         if err == "pending" then
                             pending = true
                             return
@@ -2392,7 +2457,7 @@ function Recipe:drainInputContainers(now)
 end
 
 --- 流程运行态（推送给网页）
---- 只下发**有事可做**的流程（idle 的不下发，也不创建记录）：系统里大多数流程大多数时间都是空闲的，
+--- 只下发有事可做的流程（idle 的不下发，也不创建记录）：系统里大多数流程大多数时间都是空闲的，
 --- 之前每个 tick 都把它们推一遍，既浪费带宽也让浏览器白重画。
 function Recipe:runtime()
     local out = {}
@@ -2421,7 +2486,7 @@ function Recipe:runtime()
     return out
 end
 
---- 可以产出该资源的全部流程名（**不含抽象模板**：模板带虚操作，只能用于复制流程设置）
+--- 可以产出该资源的全部流程名（不含抽象模板：模板带虚操作，只能用于复制流程设置）
 function Recipe:producers(kind, name)
     local out = {}
     for _, process in ipairs(self.Store:list("processes")) do
@@ -2471,7 +2536,7 @@ function Recipe:outputPerBatch(process, kind, name)
 end
 
 --- 网页 + 号：按资源启动合成（可指定流程名）
---- 说明：count 是**想要的产物数量**（不是批次数），这里按“每批产出”换算批次数
+--- 说明：count 是想要的产物数量（不是批次数），这里按“每批产出”换算批次数
 function Recipe:startResource(kind, name, count, processName)
     count = math.max(1, math.floor(tonumber(count) or 1))
     if not processName then
