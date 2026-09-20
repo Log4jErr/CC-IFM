@@ -427,18 +427,20 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 /* 机器定义渲染在机器类型卡片内部：**左右排列、流式换行**（用户第 2 项）。
    以前是 auto-fill 网格，但机器类型卡片本身是 width: max-content —— 网格的 max-content 只有一列宽，
    于是里面的机器卡片实际被竖着叠起来。改成 flex 换行：每张按 210px 起排，一行放不下就换行。 */
-.machine-list { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px; }
+/* 用户第 1 项（本轮）：机器卡片在类型卡片里**居中**排布 —— 类型卡片的宽度是 max-content
+   （换行后可能比"实际行宽"宽一点），居中之后多出来的空间左右均分，
+   不会再出现"留白全部堆在右侧"的观感。 */
+.machine-list { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: center; gap: 8px; }
 .machine-card {
     background: var(--panel-bg);
     border: 2px solid var(--border);
     padding: 6px;
     cursor: pointer;
-    /* 用户第 2 项：左右排列（0 增长 = 卡片保持等宽、不拉伸），放不下就换行 */
-    /* 用户第 1 项（本轮修正）：宽度必须**固定** —— 以前是 flex: 0 1 210px：卡片本身按 210px 排版，
-       但它的 max-content 可能大得多（长芯片行 / 长外设名），而机器类型卡片是 width: max-content
-       会把那个大得多的 max-content 当成真实宽度 → 类型卡片比里面的机器宽出一大截、右侧全是留白。 */
-    flex: 0 0 210px;
-    width: 210px;
+    /* 用户第 1 项（本轮）：**不要固定宽度** —— 卡片按内容定宽（跟方块卡片一样 max-content）。
+       上一版为了消掉"类型卡片比机器宽出一大截"给过 210px 固定宽度，但用户要求全部按内容；
+       换行造成的右侧留白改由 .machine-list 的居中排布消化（见下）。 */
+    flex: 0 1 auto;
+    width: max-content;
     max-width: 100%;
     min-width: 0;
 }

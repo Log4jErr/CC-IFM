@@ -581,6 +581,12 @@ function Protocol:hasChanges()
     return self:currentRevision() ~= (self.pushedRevision or 0)
 end
 
+--- 每个类别的最小推送间隔（毫秒，用户第 2 项：incremental 流量几乎全花在 workers 上）。
+--- worker 每秒上报一次 state，负载/计数/当前任务几乎每轮都不同 ⇒ 每次推送都把这几条重发一遍
+--- （实测 4667 次推送 → workers 类别 6.6MB，占增量流量绝大部分）。
+--- 这里只给 workers 一个下限：最多每 3 秒推一次（其它类别不受影响；全量同步照旧）。
+local CATEGORY_PUSH_GAP_MS = { workers = 3000 }
+
 --- 推送全部类别（force 时即使客户端未激活也推送）
 function Protocol:pushUpdates(force)
     if not self.connected then
@@ -615,14 +621,25 @@ function Protocol:pushUpdates(force)
         self:send({ action = "full_sync_start", categories = categories })
     end
     local success = true
+    local pushNow = os.epoch("utc")
+    local categorySentAt = self.categorySentAt or {}
+    self.categorySentAt = categorySentAt
     for _, category in ipairs(CATEGORY_ORDER) do
         local list = collected[category]
         if list ~= nil then
-            local changes = self:diffCategory(category, list, expediteDeletions)
-            self.stats.changedItems = self.stats.changedItems + #changes
-            if not self:sendCategoryChanges(category, changes) then
-                success = false
-                break
+            --- 用户第 2 项：这类别还没到最小间隔就跳过（快照不更新，改动会累积到下一次一起推，
+            --- 所以不会丢变化）；全量同步时不做这个节流。
+            local gap = CATEGORY_PUSH_GAP_MS[category] or 0
+            if gap > 0 and not needFullSync and pushNow - (categorySentAt[category] or 0) < gap then
+                self.stats.categorySkipped = (self.stats.categorySkipped or 0) + 1
+            else
+                local changes = self:diffCategory(category, list, expediteDeletions)
+                categorySentAt[category] = pushNow
+                self.stats.changedItems = self.stats.changedItems + #changes
+                if not self:sendCategoryChanges(category, changes) then
+                    success = false
+                    break
+                end
             end
         end
     end

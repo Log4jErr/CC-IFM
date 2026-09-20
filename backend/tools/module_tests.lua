@@ -1912,38 +1912,67 @@ do
         #pushesMulti == 3 and pushesMulti[1].slot == 1 and pushesMulti[2].slot == 2 and pushesMulti[3].slot == 3,
         'pushes=' .. tostring(#pushesMulti))
 
-    --- 6) 用户第 6 项（海龟合成）：材料"记账上到位" ≠ 真的在物品栏里 ——
-    ---    craft 指令必须先看海龟自己上报的内容快照（alreadyInTargets 读的就是快照）。
+    --- 6) 用户第 3 项（本轮）：海龟合成前只看主控自己的账 ——
+    ---    craft 的唯一条件是"所有输入元素都已结算 + 没有任何输入搬运在飞"，
+    ---    不看海龟上报，也没有任何兜底（合成失败就一直停着）。
     local engineCraft = newDrain()
-    engineCraft.inputContainers = function() return { 'turtle_1' } end
-    engineCraft.alreadyInTargets = function() return 0 end
-    local craftProcess = {
-        name = 'iron_ingot',
-        inputs = {
-            { kind = 'item', id = 'minecraft:iron_nugget', count = 1 },
-            { kind = 'item', id = 'minecraft:iron_nugget', count = 1 },
-        },
-        outputs = {},
+    local craftRecord = { batch = 1, inflight = { ['1'] = 64 } }
+    local inputsList = {
+        { kind = 'item', id = 'minecraft:iron_nugget', count = 1 },
+        { kind = 'item', id = 'minecraft:iron_nugget', count = 1 },
     }
-    local craftRecord = { batch = 1 }
-    local ready, missingText = engineCraft:crafterMaterialsReady(craftProcess, craftRecord, { name = 'turtle_1' })
-    check('the turtle is not asked to craft before the materials really reached its inventory',
-        ready == false and tostring(missingText):find('iron_nugget', 1, true) ~= nil,
-        'ready=' .. tostring(ready) .. ' missing=' .. tostring(missingText))
-    --- 只到位一半（要 2 个、海龟快照里只有 1 个）也不算齐
-    engineCraft.alreadyInTargets = function() return 1 end
-    local halfProcess = { name = 'iron_ingot',
-        inputs = { { kind = 'item', id = 'minecraft:iron_nugget', count = 2 } }, outputs = {} }
-    local halfReady, halfMissing = engineCraft:crafterMaterialsReady(halfProcess, craftRecord,
-        { name = 'turtle_1' })
-    check('a half-filled turtle grid is still not enough to craft',
-        halfReady == false and tostring(halfMissing):find('x1', 1, true) ~= nil,
-        'ready=' .. tostring(halfReady) .. ' missing=' .. tostring(halfMissing))
-    --- 全部到位：这时才允许发 craft
-    engineCraft.alreadyInTargets = function() return 2 end
-    local readyAll = engineCraft:crafterMaterialsReady(halfProcess, craftRecord, { name = 'turtle_1' })
-    check('once the turtle really holds everything the craft may go out', readyAll == true,
-        'ready=' .. tostring(readyAll))
+    check('an input element with an in-flight move blocks the craft',
+        engineCraft:firstInflightInput(craftRecord, inputsList) == '1',
+        'inflight=' .. tostring(engineCraft:firstInflightInput(craftRecord, inputsList)))
+    check('once every input settled there is nothing left in flight',
+        engineCraft:firstInflightInput({ batch = 1, inflight = {} }, inputsList) == nil,
+        'inflight=nil?')
+
+    --- 6b) 用户第 6 项（本轮）：发货派活量 = 剩余量 − 在飞量。
+    ---     现场：要求 64 个，实际发了 64+64+52 个（在飞记忆被清掉后又按原数量派了一次足量搬运）。
+    local deliveryList = { { id = 9, kind = 'item', name = 'minecraft:iron_ingot', container = 'out_1',
+        containerKind = 'item', remaining = 64, total = 64 } }
+    local engineD = RecipeModule.new({
+        Util = { kindOfDef = function() return 'item' end },
+        Store = {
+            list = function() return {} end,
+            findContainer = function() return { name = 'out_1', role = 'output', kind = 'item' } end,
+            get = function() return nil end,
+        },
+        Cache = { data = {}, deliveries = function() return deliveryList end, markDirty = function() end },
+        Containers = {
+            peripheralOf = function() return 'chest_out' end,
+            supports = function() return true end,
+            unusableReason = function() return nil end,
+            ORDER_FRAGMENT = 'fragment', ORDER_SPEED = 'speed', INSERT_LEAST = 'least',
+        },
+        log = function() end,
+    })
+    local asked = {}
+    engineD.transferIn = function(_, spec, itemTargets, fluidTargets, toSlot, amount, token)
+        asked[#asked + 1] = amount
+        --- 模拟"已派给 worker"：pendingMoves 里留下这次请求（与真实实现一致）
+        engineD.pendingMoves = engineD.pendingMoves or {}
+        engineD.pendingMoves[token] = { want = amount, at = os.epoch('utc') }
+        return 0, 'pending'
+    end
+    engineD:processDeliveries(os.epoch('utc'))
+    engineD:processDeliveries(os.epoch('utc'))
+    check('a delivery asks for the missing amount only once (user item 6)',
+        #asked == 2 and asked[1] == 64 and asked[2] == 0,
+        'asked=' .. tostring(#asked) .. ' first=' .. tostring(asked[1]) .. ' second=' .. tostring(asked[2]))
+    check('the in-flight amount is tracked on the delivery',
+        (tonumber(deliveryList[1].inflight) or 0) == 64 and (tonumber(deliveryList[1].remaining) or 0) == 64,
+        'inflight=' .. tostring(deliveryList[1].inflight) .. ' remaining=' .. tostring(deliveryList[1].remaining))
+    --- 结算回来：在飞清零、剩余量只扣一次
+    engineD.transferIn = function(_, spec, itemTargets, fluidTargets, toSlot, amount, token)
+        engineD.pendingMoves[token] = nil
+        return 64, nil
+    end
+    engineD:processDeliveries(os.epoch('utc'))
+    check('the settled amount is booked exactly once',
+        (tonumber(deliveryList[1].remaining) or 0) == 0 and deliveryList[1].inflight == nil,
+        'remaining=' .. tostring(deliveryList[1].remaining) .. ' inflight=' .. tostring(deliveryList[1].inflight))
 
     --- 5) onlyPeripheral：只处理"刚扫到的那个输入容器"
     local engine5, pushes5 = newDrain({

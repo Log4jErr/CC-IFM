@@ -246,15 +246,29 @@
     // "哪台机器在引用它"（提示用户去把机器的容器换成新的外设名 / 重新拖一次）。
     function missingChipHtml(item) {
         if (item.kind === 'machine') {
-            const machine = String(item.machine || '');
+            // 用户第 3 项（本轮）：机器名/外设名在传输层是 \uXXXX 字面量（非 ASCII），
+            // 这里必须解码后再显示（否则网页上直接看到 "\u6405\u62CC"）。
+            const machine = unescapeAsciiText(String(item.machine || ''));
+            const name = unescapeAsciiText(String(item.name || ''));
             const hint = t('missingMachineRef', { machine: machine || '?' });
+            // 用户第 4 项（本轮）：这条也有删除按钮 —— 删的是"机器里对这个外设的引用"
+            // （机器输入/输出/信号列表里的那一项），这样"一键删除"才能把面板收干净。
             return '<span class="chip missing" title="' + escapeHtml(hint) + '">' +
-                escapeHtml(String(item.name || '')) +
-                ' <span class="muted">' + escapeHtml(hint) + '</span></span>';
+                escapeHtml(name) +
+                ' <span class="muted">' + escapeHtml(hint) + '</span>' +
+                '<button class="btn-pixel danger chip-del" type="button" title="' +
+                escapeHtml(t('missingMachineRemove')) + '"' +
+                ' data-delete-missing="' + escapeHtml(String(item.name || '')) + '"' +
+                ' data-missing-kind="machine"' +
+                ' data-missing-machine="' + escapeHtml(String(item.machine || '')) + '">' +
+                '<i class="fa fa-trash"></i></button></span>';
         }
         const isSignal = item.kind === 'signal';
-        return '<span class="chip missing" title="' + escapeHtml(String(item.peripheral || '')) + '">' +
-            escapeHtml(item.name) + ' → ' + escapeHtml(String(item.peripheral || '')) +
+        // 定义名 / 外设名同样要解码（用户第 3 项：中文定义名在传输层是 \uXXXX）
+        const defName = unescapeAsciiText(String(item.name || ''));
+        const peripheralName = unescapeAsciiText(String(item.peripheral || ''));
+        return '<span class="chip missing" title="' + escapeHtml(peripheralName) + '">' +
+            escapeHtml(defName) + ' → ' + escapeHtml(peripheralName) +
             ' <span class="muted">' + escapeHtml(isSignal ? t('signal') : t('container')) + '</span>' +
             '<button class="btn-pixel danger chip-del" type="button" title="' + escapeHtml(t('missingDelete')) + '"' +
             ' data-delete-missing="' + escapeHtml(item.name) + '"' +
@@ -292,11 +306,19 @@
         const blockName = String(block.name || '');
         // 定义以 stores.containers / stores.signals 为准：乐观更新后界面立刻正确，
         // 不必等服务端把 peripherals（含定义）推回来
+        // 用户第 5 项（本轮）：匹配放宽 —— 有的定义里 peripheral 是空的（早期数据只写了 name），
+        // 以前这种定义匹配不上，于是"已经设为存储容器"的方块仍然会冒出一张"未分配功能"卡片
+        // （现场：21 个箱子定义里 14 个仍单独出卡）。peripheral 缺失时按定义名兜底，
+        // 与服务端 containerNameFor 的规则一致。
         const defs = Array.from(stores.containers.values()).filter(function (def) {
-            return String(def.peripheral || '') === blockName;
+            const peripheral = String(def.peripheral || '');
+            const name = String(def.name || '');
+            return peripheral === blockName || (peripheral === '' && name === blockName);
         });
         const signalDefs = Array.from(stores.signals.values()).filter(function (def) {
-            return String(def.peripheral || '') === blockName;
+            const peripheral = String(def.peripheral || '');
+            const name = String(def.name || '');
+            return peripheral === blockName || (peripheral === '' && name === blockName);
         });
         const definedByKind = {};
         defs.forEach(function (def) {
@@ -304,6 +326,9 @@
         });
         const usedByMachine = machineUsedContainerNames();
         const chips = [];
+        // 用户第 5 项（本轮）：把"这张卡片为什么会出现"记下来，F12 里能直接看到
+        // （reportUnassignedBlocks 打印；只在方块名集合变化时打一次，不会刷屏）。
+        const reasons = [];
         // 用户第 5 项（本轮）：机器**直接**引用了这个外设（例如输入列表里写着 minecraft:chest_109）时，
         // 它已经在用了 —— 以前这里还会画一张"未分配功能"的方块卡片，看起来像什么都没配。
         // （引用坏了的情况由"外设缺失"面板负责提示，见 Containers:missingPeripherals。）
@@ -315,6 +340,7 @@
          ['fluid', 'fluid_storage', 'fluidContainer', 'fa-tint']].forEach(function (info) {
             if (referencedByMachine) return;
             if (block.kinds.indexOf(info[1]) < 0 || definedByKind[info[0]]) return;
+            reasons.push(info[0] + '-unassigned');
             chips.push('<span class="chip unassigned" draggable="true"' +
                 ' data-drag-peripheral="' + escapeHtml(block.name) + '"' +
                 ' data-drag-kind="' + info[0] + '"' +
@@ -332,6 +358,7 @@
         if (block.kinds.indexOf('redstone_relay') >= 0 && !usedSignals[blockName] &&
             !usedSignals[String(signalDefs.length ? signalDefs[0].name : '')]) {
             const legacy = signalDefs[0] || null;
+            reasons.push('signal-unassigned');
             // 有旧定义时可点击编辑（def-chip 的样式）；没有定义时就是一个纯拖拽源。
             chips.push('<span class="chip' + (legacy ? ' def-chip' : '') + ' def-signal" draggable="true"' +
                 ' data-drag-peripheral="' + escapeHtml(block.name) + '" data-drag-kind="signal"' +
@@ -342,10 +369,15 @@
         }
         // 2) 有定义、但谁也不引用（output 容器 / 没进机器的 interaction 容器）：不能让它从界面上消失
         defs.forEach(function (def) {
-            if (def.role === 'storage') return;                                        // 在存储卡片里
-            if (def.role === 'input') return;                                          // 在输入卡片里
-            if (def.role === 'output') return;                                         // 在输出卡片里（1.8.0）
-            if (def.role === 'interaction' && usedByMachine[String(def.name)]) return;  // 在机器卡片里
+            // 用户第 5 项（本轮）：role 缺省按 storage 处理 —— 与服务端 Containers:defRole 一致。
+            // 以前 `def.role === 'storage'` 对"没有 role 字段"的旧定义不成立 ⇒ 会落到下面当"孤立定义"
+            // 再生成一张卡片（现场：21 个箱子定义里 14 个仍单独出卡）。
+            const role = String(def.role || 'storage');
+            if (role === 'storage') return;                                             // 在存储卡片里
+            if (role === 'input') return;                                               // 在输入卡片里
+            if (role === 'output') return;                                              // 在输出卡片里（1.8.0）
+            if (role === 'interaction' && usedByMachine[String(def.name)]) return;       // 在机器卡片里
+            reasons.push('isolated-def:' + String(def.name) + ' role=' + role);
             const kind = def.kind === 'fluid' ? 'fluid' : 'item';
             chips.push('<span class="chip def-chip def-' + kind + '" draggable="true"' +
                 ' data-edit-container="' + escapeHtml(containerKeyOf(def)) + '"' +
@@ -354,7 +386,8 @@
                 ' data-drag-def="' + escapeHtml(containerKeyOf(def)) + '"' +
                 ' title="' + escapeHtml(t('clickToEdit')) + '">' +
                 '<i class="fa ' + (kind === 'fluid' ? 'fa-tint' : 'fa-cube') + '"></i> ' +
-                escapeHtml(def.name) + ' <span class="muted">' + escapeHtml(roleLabel(def.role)) + '</span>' +
+                escapeHtml(unescapeAsciiText(String(def.name || ''))) +
+                ' <span class="muted">' + escapeHtml(roleLabel(role)) + '</span>' +
                 '</span>');
         });
         // 3) 多余的旧信号定义（同一个中继器只该有一个定义）：万一旧配置里留了多个，
@@ -364,7 +397,22 @@
                 '" title="' + escapeHtml(t('clickToEdit')) + '">' +
                 '<i class="fa fa-bolt"></i> ' + escapeHtml(def.name) + '</span>');
         });
+        block.chipReasons = reasons;
         return chips;
+    }
+
+    /// 用户第 5 项（本轮）：还有方块卡片残留时，在 F12（网页控制台）里说清"它为什么会出现"。
+    /// 只在出现的方块名集合变化时打印一次，所以不会刷屏。
+    let lastUnassignedReport = '';
+    function reportUnassignedBlocks(blocks) {
+        const signature = blocks.map(function (block) { return String(block.name || ''); }).join(',');
+        if (signature === lastUnassignedReport) return;
+        lastUnassignedReport = signature;
+        if (blocks.length === 0) return;
+        serverLog('[IFM] ' + blocks.length + ' peripheral block card(s) shown: ' +
+            blocks.map(function (block) {
+                return block.name + ' [' + asArray(block.chipReasons).join(' | ') + ']';
+            }).join('  '));
     }
 
     // 存储 / 输入 / 输出 容器卡片（用户第 5/6 项）：
@@ -552,6 +600,8 @@
                 return block;
             })
             .filter(function (block) { return block.chips.length > 0; });
+        // 用户第 5 项（本轮）：还有卡片残留就在 F12 里说明原因（只在方块集合变化时打一次）
+        reportUnassignedBlocks(allBlocks);
         // 选择里已经不存在的卡片（被分配进机器/容器后卡片消失）→ 自动移出
         prunePeripheralSelection(allBlocks);
         const list = sortPeripheralList(allBlocks.filter(function (block) {

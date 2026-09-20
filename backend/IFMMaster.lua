@@ -1228,6 +1228,61 @@ local function handleRequest(payload)
         end
         log("Schedule slices updated: %s", table.concat(parts, " "))
         return { success = true, schedule = applied }
+    elseif action == "remove_machine_peripheral" then
+        --- 用户第 4 项（本轮）：网页「外设缺失」里"机器引用的外设不存在"那条的删除按钮。
+        --- 删的是机器里那条引用（输入/输出/信号列表里的名字），不是任何定义 ——
+        --- 有线网络重连后外设会重新编号，旧名字留在机器配置里就一直是"缺失"。
+        local peripheral = tostring(payload.peripheral or payload.name or "")
+        local removed = 0
+        if peripheral ~= "" then
+            for _, machine in ipairs(store:list("machines")) do
+                --- 虚拟定义（海龟自动生成的机器）由 syncTurtleCrafters 维护，手改会被覆盖
+                if machine.virtual ~= true then
+                    local data = {}
+                    for key, value in pairs(machine) do
+                        data[key] = value
+                    end
+                    local changed = false
+                    for _, listKey in ipairs({ "itemInputs", "fluidInputs", "itemOutputs", "fluidOutputs" }) do
+                        local kept = {}
+                        for _, name in ipairs(machine[listKey] or {}) do
+                            if tostring(name) == peripheral then
+                                changed = true
+                            else
+                                kept[#kept + 1] = name
+                            end
+                        end
+                        data[listKey] = kept
+                    end
+                    local keptSignals = {}
+                    for _, signal in ipairs(machine.signals or {}) do
+                        local signalName = type(signal) == "table" and tostring(signal.peripheral or "")
+                            or tostring(signal)
+                        if signalName == peripheral then
+                            changed = true
+                        else
+                            keptSignals[#keptSignals + 1] = signal
+                        end
+                    end
+                    data.signals = keptSignals
+                    if changed then
+                        local ok, err = store:set("machines", machine.name, data)
+                        if ok then
+                            removed = removed + 1
+                        else
+                            log.error("remove_machine_peripheral: %s failed: %s", tostring(machine.name),
+                                tostring(err))
+                        end
+                    end
+                end
+            end
+        end
+        if removed > 0 then
+            store:markDirty()
+            cache:markDirty()
+            log("remove_machine_peripheral: %s removed from %d machine(s)", tostring(peripheral), removed)
+        end
+        return { success = true, removed = removed, peripheral = peripheral }
     elseif action == "container_view" then
         -- 交互容器管理：查看该容器当前的内容物
         return containerView(payload)
@@ -1473,6 +1528,9 @@ protocol = Protocol.new({
     -- 注意：一次推送要全量收集（每个容器一次外设调用，有线网络上 ≈1 个服务器刻/次），
     -- 12 个容器就 ~0.6s，所以兜底频率别设太小。
     updateInterval = 2,
+    --- 用户第 2 项：增量推送下限（毫秒）—— worker 每秒上报一次 state 会把 revision 顶起来，
+    --- 不设下限时推送频率跟着 worker 数量走（7 台 ≈ 7 次/秒）。1 秒足够网页跟手，流量降一个量级。
+    minPushInterval = 1000,
     -- 增量推送的硬下限（毫秒）：1.6.12 起默认 0 = 不设硬限制（服务端不应当对 WebSocket 收发数据包做速率硬限制）。推送改由“状态变更计数”驱动：
     -- cache.revision 变了就立刻推，同一 tick 内多个请求合并成一次。
     -- 想恢复旧的“最快 N 毫秒一次”节流时，把这里设成毫秒数即可（例如 2000）。

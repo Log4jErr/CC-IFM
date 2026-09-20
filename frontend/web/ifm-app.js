@@ -369,6 +369,11 @@
     // 删除「外设缺失」条目的定义：容器要带上种类（item/fluid），信号只按名字
     /// 一条缺失定义对应的删除请求（action + payload）：单条删除与「一键删除」共用
     function missingDeleteRequest(item) {
+        // 用户第 4 项（本轮）：机器直接引用的外设没有"定义"可删 —— 删的是机器里那条引用
+        // （服务端会把它从该机器的输入/输出/信号列表里移除）。
+        if (item.kind === 'machine') {
+            return { action: 'remove_machine_peripheral', payload: { peripheral: item.name } };
+        }
         const isSignal = item.kind === 'signal';
         const payload = { name: item.name, force: true };
         if (!isSignal) {
@@ -410,13 +415,16 @@
 
     function deleteMissingDefinition(button) {
         const name = button.getAttribute('data-delete-missing');
-        const kind = button.getAttribute('data-missing-kind') === 'signals' ? 'signals' : 'containers';
+        const machineKind = button.getAttribute('data-missing-kind') === 'machine';
+        const kind = machineKind ? 'machine'
+            : (button.getAttribute('data-missing-kind') === 'signals' ? 'signals' : 'containers');
         if (!name) return;
-        if (!window.confirm(t('deleteConfirm', { name: name }))) return;
+        if (!window.confirm(t(machineKind ? 'missingMachineRemoveConfirm' : 'deleteConfirm',
+                { name: unescapeAsciiText(String(name)) }))) return;
         button.disabled = true;
         const entry = {
             name: name,
-            kind: kind === 'signals' ? 'signal' : 'container',
+            kind: kind === 'machine' ? 'machine' : (kind === 'signals' ? 'signal' : 'container'),
             containerKind: button.getAttribute('data-missing-container-kind') === 'fluid' ? 'fluid' : 'item'
         };
         deleteMissingEntry(entry).then(function (ok) {
@@ -1994,7 +2002,7 @@
     // 只报 "el(...) is null"，完全看不出是"哪个文件旧了"。这里做两件事：
     //   ① 版本对账：index.html 上写了 data-ifm-build，和 JS 里这份构建号比对，不一致就直接说明；
     //   ② 页面探针：把当前 URL、实际加载到的脚本路径、关键元素在不在打印出来。
-    const IFM_APP_BUILD = '213';
+    const IFM_APP_BUILD = '214';
     function pageBuild() {
         try {
             return document.documentElement && document.documentElement.getAttribute

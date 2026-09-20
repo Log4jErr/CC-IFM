@@ -550,9 +550,6 @@ function Recipe:transferIn(spec, itemTargets, fluidTargets, toSlot, amount, toke
     if type(spec) == "table" and spec.kind == "fluid" then
         toSlot = nil
     end
-    if amount <= 0 then
-        return 0, nil
-    end
     opts = opts or {}
     local moved = 0
     local reason
@@ -569,6 +566,12 @@ function Recipe:transferIn(spec, itemTargets, fluidTargets, toSlot, amount, toke
         if moved >= amount then
             return moved, nil
         end
+    end
+    --- 用户第 6 项（本轮）：数量为 0 也要先走上面的 token 分支（发货量可能全在飞 ⇒ wantQty = 0，
+    --- 但上一条的结果仍必须取回来记账）；这段只能取结果、不会派新活（resumePendingMove 里
+    --- pushItem 找不到结果/在飞记录才会派活，而那时 pendingMoves 里已经没有这条 token 了）。
+    if amount <= 0 then
+        return moved, nil
     end
     local stacks, tanks = self.Containers:matchSpec(spec, "storage", opts.storageOrder)
     if #itemTargets > 0 and spec.kind ~= "fluid" then
@@ -1289,7 +1292,16 @@ function Recipe:stepInput(process, record, machine, now)
                 local spec = elementSpec(element)
                 local itemTargets = self:inputContainers(machine, "item", element.containerIndex)
                 local fluidTargets = self:inputContainers(machine, "fluid", element.containerIndex)
-                local short = required - transferred
+                --- 用户第 6 项（本轮）：要减掉"已经派出去、还没结算"的那部分 ——
+                --- 否则同一条材料会在在飞记忆被清掉（TTL / 批次边界）之后被重复派活
+                --- （现场：要求 64 个，实际搬了 64+64+52 个）。
+                local inflight = tonumber((record.inflight or {})[key]) or 0
+                local short = required - transferred - inflight
+                if short <= 0 then
+                    --- 在飞的部分还没结算：这一轮什么都别派，等它回来
+                    record.index = index
+                    return
+                end
                 -- 机器输入容器里已有的材料直接算作已输入（材料本来就在机器里时不再搬运）
                 local already = self:alreadyInTargets(spec, itemTargets, fluidTargets)
                 -- 材料齐备检查会读一遍存储容器：1.5.2 起该读取走 Containers 快照的按名合计表（O(1)，
@@ -1322,6 +1334,13 @@ function Recipe:stepInput(process, record, machine, now)
                     -- 材料搬运已交给 IFMWorker：本 tick 不推进（下个 tick 用同一个任务继续等）。
                     -- 但已经回报的那部分要立刻记账 —— 否则下个 tick 会按“还没搬过”重新要一遍，
                     -- 把同一批材料送两遍（用户实测：要 64 个结果搬了 127 个）。
+                    --- 用户第 6 项（本轮）：把"这次派出去的量"记进在飞账本，
+                    --- 派活量 = 需求量 − 已结算 − 在飞，重复派活因此不可能发生。
+                    local pendingMove = self.pendingMoves and self.pendingMoves[token]
+                    if pendingMove and tonumber(pendingMove.want) then
+                        record.inflight = record.inflight or {}
+                        record.inflight[key] = tonumber(pendingMove.want) or 0
+                    end
                     moved = tonumber(moved) or 0
                     if moved > 0 then
                         record.progress[key] = (record.progress[key] or 0) + moved
@@ -1332,6 +1351,10 @@ function Recipe:stepInput(process, record, machine, now)
                 end
                 moved = tonumber(moved) or 0
                 budget = budget - 1
+                --- 已经结算：清掉这个元素的在飞账（它的量已经算进 moved）
+                if record.inflight then
+                    record.inflight[key] = nil
+                end
                 transferred = transferred + moved
                 record.progress[key] = transferred
                 if moved > 0 and record.lastError ~= nil and transferred >= required then
@@ -1366,36 +1389,37 @@ function Recipe:stepInput(process, record, machine, now)
         --- craft 指令是"发出去就不管"的（合成器不回报状态），所以这里只看"有没有空闲合成器"：
         --- 没有就停在本相位、下个 tick 再试 —— 免得流程以为已经合成过而直接去抽空气。
         if self.Store.isTurtleCrafter(machine) then
-            --- 用户第 6 项：材料"记账上到位" ≠ 真的进了海龟物品栏（搬运是异步的）。
-            --- 以前这里立刻发 craft ⇒ 海龟只拿到一两个铁粒就开始合成，必然失败。
-            --- 现在先看海龟自己上报的物品栏快照；没到位就停在本相位，下个 tick 再看。
-            --- 兜底：等太久（快照一直不更新 / 合成器不上报）时照样放行，免得流程永久卡住。
-            local ready, missingText = self:crafterMaterialsReady(process, record, machine)
-            if not ready then
-                record.craftWaitSince = record.craftWaitSince or now
-                local waited = now - record.craftWaitSince
-                if waited < CRAFT_READY_TIMEOUT_MS then
-                    record.wait = { kind = "craft", machine = machine.name }
-                    record.lastError = "\\u7B49\\u5F85\\u6750\\u6599\\u771F\\u6B63\\u8FDB\\u5165\\u6D77\\u9F9F" ..
-                        (missingText and ("\\uFF08\\u8FD8\\u5DEE " .. missingText .. "\\uFF09") or "")
-                    if now - (record.lastCraftWaitLogAt or 0) >= 10000 then
-                        record.lastCraftWaitLogAt = now
-                        self.log("Process %s: waiting for the turtle to really hold %s before crafting",
-                            tostring(process.name), tostring(missingText or "the materials"))
-                    end
-                    self.Cache:markDirty()
-                    return
+            --- 用户第 3 项（本轮）：**不看海龟上报、也没有任何兜底**。
+            --- 现场：9 个铁粒只进去 1 个就发了 craft ⇒ 合成必然失败。
+            --- 判定改成只看主控自己的账：每个输入元素的 record.progress 只由**已结算**的搬运推进
+            --- （pushItem 派活时返回 nil,"pending"，不带数量 ⇒ 不记账），
+            --- 所以"全部元素 progress 达标 + 没有任何输入搬运在飞"= 材料确实都搬进去了。
+            --- 合成失败就一直停在这里，交由用户手动处理（不做超时放行）。
+            local inflightKey = self:firstInflightInput(record, inputs)
+            if inflightKey then
+                record.wait = { kind = "craft", machine = machine.name }
+                record.lastError = "\\u7B49\\u5F85\\u8F93\\u5165\\u642C\\u8FD0\\u7ED3\\u7B97" ..
+                    "\\uFF08\\u8FD8\\u6709\\u5728\\u98DE\\u7684\\u642C\\u8FD0\\uFF09"
+                if now - (record.lastCraftWaitLogAt or 0) >= 10000 then
+                    record.lastCraftWaitLogAt = now
+                    self.log("Process %s: input %s still has an in-flight move - not crafting yet",
+                        tostring(process.name), tostring(inflightKey))
                 end
-                if not record.craftReadyTimedOut then
-                    record.craftReadyTimedOut = true
-                    self.log("Process %s: the turtle never reported %s - crafting anyway (check that " ..
-                        "IFMCrafter.lua is still running and can reach the master)",
-                        tostring(process.name), tostring(missingText or "its materials"))
-                end
-            else
-                record.craftWaitSince = nil
-                record.craftReadyTimedOut = nil
+                self.Cache:markDirty()
+                return
             end
+            --- 发 craft 之前把每个元素的实际数量记一行：以后"合成信号提前发出"的问题看这一行就能定位
+            local detail = {}
+            for elementIndex, element in ipairs(inputs) do
+                if element.kind == "item" or element.kind == "fluid" or element.kind == "filter" then
+                    detail[#detail + 1] = tostring(element.id or element.kind) .. "=" ..
+                        tostring(record.progress[tostring(elementIndex)] or 0) .. "/" ..
+                        tostring(elementDemand(element, record.batch or 1))
+                end
+            end
+            self.log("Process %s: all inputs settled (batch=%s, %s) - asking %s to craft",
+                tostring(process.name), tostring(record.batch or 1), table.concat(detail, " "),
+                tostring(machine.name))
             local status = self:requestMachineCraft(process, record, machine)
             if status ~= "sent" then
                 record.wait = { kind = "craft", machine = machine.name }
@@ -1415,40 +1439,16 @@ function Recipe:stepInput(process, record, machine, now)
     end
 end
 
---- 海龟合成前"等材料真的进物品栏"的最长时间（用户第 6 项）：超过就照样发 craft 指令，
---- 免得合成器不上报时流程永久卡在输入相位。
-local CRAFT_READY_TIMEOUT_MS = 30000
-
---- 材料是否**真的**已经在海龟物品栏里（用户第 6 项）。
---- 现场：一次把 9 个铁粒送进海龟，海龟只收到 1 个就开始合成 → 合成必然失败。
---- 原因：材料搬运是异步的 —— Containers:pushItem 一提交就把数量记进 record.progress
---- （记账：为了避免下个 tick 重复要料），而 record.progress 满了就直接发了 craft 指令。
---- 海龟合成的 3×3 格子就是它自己的物品栏，格子没填满 craft 一定失败。
---- 所以这里改成读**海龟自己上报的内容快照**（IFMCrafter 的 op = "inventory"，主控每 2 秒催一次：
---- 见 IFMMaster 的 refreshCrafterReports）—— 材料真的在格子里才算就绪。
---- 返回：就绪=true / 就绪=false, "还差什么"的可读描述
-function Recipe:crafterMaterialsReady(process, record, machine)
-    local batch = record.batch or 1
-    local missing = {}
-    for _, element in ipairs(process.inputs or {}) do
-        if element.kind == "item" or element.kind == "fluid" or element.kind == "filter" then
-            local required = elementDemand(element, batch)
-            if required > 0 then
-                local spec = elementSpec(element)
-                local itemTargets = self:inputContainers(machine, "item", element.containerIndex)
-                local fluidTargets = self:inputContainers(machine, "fluid", element.containerIndex)
-                local have = self:alreadyInTargets(spec, itemTargets, fluidTargets)
-                if have < required then
-                    missing[#missing + 1] = tostring(spec.name or element.id or "?") .. " x" ..
-                        tostring(required - have)
-                end
-            end
+--- 第一个"还有在飞搬运没结算"的输入元素序号（没有就返回 nil）。
+--- 用户第 3 项（本轮）：海龟合成前用它确认"材料不是还在路上" —— 不看海龟上报，也不做任何兜底。
+function Recipe:firstInflightInput(record, inputs)
+    local inflight = record.inflight or {}
+    for elementIndex in ipairs(inputs or {}) do
+        if (tonumber(inflight[tostring(elementIndex)]) or 0) > 0 then
+            return tostring(elementIndex)
         end
     end
-    if #missing == 0 then
-        return true, nil
-    end
-    return false, table.concat(missing, ", ")
+    return nil
 end
 
 --- 请这台机器的海龟合成（turtle_crafter）：返回 "sent" = 指令已发出 / "idle" = 没有空闲合成器。
@@ -1954,20 +1954,33 @@ function Recipe:processDeliveries(now)
                 if delivery.kind ~= "item" then
                     fluidTargets = targets
                 end
+                --- 用户第 6 项（本轮）：派活量 = 剩余量 − 已经派出去但还没结算的量。
+                --- 以前直接把 remaining 交出去：在飞记忆一旦被清掉（TTL / 批次边界 / 结果被别处取走），
+                --- 同一个发货任务会再派一次足量搬运 —— 现场就是"要 64 个，实际发了 64+64+52 个"。
+                local inflightQty = tonumber(delivery.inflight) or 0
+                local wantQty = math.max(0, remaining - inflightQty)
+                local moveToken = "delivery:" .. tostring(delivery.id or delivery.name)
+                --- wantQty 可能是 0（在飞的那部分还没结算）：这时 transferIn 只负责"取回结算结果"、
+                --- 不会派新活（token 分支在数量检查之前先 resumePendingMove），所以照常调用。
                 local moved, reason = self:transferIn(
                     { kind = delivery.kind, id = delivery.name },
                     itemTargets,
                     fluidTargets,
                     -1,
-                    remaining,
+                    wantQty,
                     --- token 按发货任务 id：同一条发货在 worker 回报之前只会有一条在飞请求
                     --- （以前每次重扫源都会新发一条 → 64 个变成 63 + 64 = 127 个）
-                    "delivery:" .. tostring(delivery.id or delivery.name),
+                    moveToken,
                     --- 发货到输出容器要少碎片：从存储容器优先抽数量最少的那几堆（1.6.11）
                     --- 队列：发货是"库存输出"（1.7.0）
                     { storageOrder = self.Containers.ORDER_FRAGMENT, queue = "inventoryOut" }
                 )
                 if reason == "pending" then
+                    --- 派出去的量记进在飞账本（transferIn 把这次请求的细节存在 pendingMoves[token]）
+                    local pendingMove = self.pendingMoves and self.pendingMoves[moveToken]
+                    if pendingMove and tonumber(pendingMove.want) then
+                        delivery.inflight = (tonumber(delivery.inflight) or 0) + (tonumber(pendingMove.want) or 0)
+                    end
                     -- 发送搬运已交给 IFMWorker：本 tick 不改状态（下个 tick 继续等同一个任务），
                     -- 也不写 lastError —— 这不是失败，只是“等 worker 干完”。delivery 会由下面的
                     -- “remaining > 0 就留在队列里”逻辑原样保留。
@@ -1976,10 +1989,22 @@ function Recipe:processDeliveries(now)
                     local booked = tonumber(moved) or 0
                     if booked > 0 then
                         delivery.remaining = remaining - booked
+                        delivery.inflight = math.max(0, (tonumber(delivery.inflight) or 0) - booked)
                         delivery.lastError = nil
                         self.Cache:markDirty()
                     end
-                else
+                elseif moved > 0 then
+                    delivery.inflight = nil
+                    moved = tonumber(moved) or 0
+                    delivery.remaining = remaining - moved
+                    delivery.lastError = nil
+                    self.Cache:markDirty()
+                    if (tonumber(delivery.remaining) or 0) <= 0 then
+                        self.log("Delivery %s done: %s x%s -> %s", tostring(delivery.id or 0),
+                            tostring(delivery.name), tostring(remaining), tostring(delivery.container))
+                    end
+                elseif wantQty > 0 then
+                    delivery.inflight = nil
                     moved = tonumber(moved) or 0
                     if moved > 0 then
                         delivery.remaining = remaining - moved
