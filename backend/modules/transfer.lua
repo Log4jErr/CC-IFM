@@ -7,7 +7,7 @@
 --   * 主控每隔 HELLO_INTERVAL(3s) 在 self.channel 广播 { op = "hello" }（Transfer:tick）；
 --   * worker 收到 hello 立刻回 { op = "pong", name, caps }；另外 worker 自己每 5s 也会主动广播一次
 --     hello（主控重启后不用等它广播就能发现它）；
---   * 来自某台 worker 的任何消息都会刷新 worker.lastSeen（见 touch()）：
+--   * 来自某台 worker 的任何消息都会刷新 worker.lastSeen（见 Transfer:touchWorker()）：
 --     超过 WORKER_TIMEOUT(15s) 没有任何消息 → 标成「失联」（不再派新活、网页卡片标红）；
 --     超过 WORKER_EVICT_TIMEOUT(30s) → **从 self.workers 移除**（用户第 2 项：到点即移除，
 --     不一直等它恢复），它手上的搬运/查询/详情代查全部作废（引擎下个 tick 重新调度）。
@@ -901,6 +901,47 @@ function Transfer:localStatus()
 end
 
 --- 处理 modem 消息（由主循环的 modem_message 事件调用）
+--- 注册 / 刷新一台 worker（任何来自它的消息都要先过这里）。
+--- version 与 slots 也在这里记下来：hello / pong / state 里都可能带。
+--- 用户现场：网页上「版本」一栏一直空着 —— 以前只有 state 报文里的版本被记下来
+--- （每秒一次，丢一包就空一栏），hello / pong 里带的那份被直接丢掉。
+---
+--- 注意（修 bug）：它以前是 onModemMessage 内部的**局部闭包**，而结果结算被抽成
+--- applyQueryResult / applyDetailResult 等独立方法后，那些方法里的 touch(...) 就变成了
+--- "全局 touch = nil"（现场报错：transfer.lua:1130: attempt to call global 'touch' (a nil value)）。
+--- 现在它是 Transfer 的方法：任何地方都写 self:touchWorker(...)。
+function Transfer:touchWorker(id, caps, name, version, slots)
+    if id == nil then
+        --- 编码规范：未定义行为不许静默失败，但也绝不在这里崩 —— 没有发信人的消息没法登记。
+        self.log.warn("Worker message without a sender id - ignored")
+        return nil
+    end
+    local worker = self.workers[id]
+    local created = false
+    if not worker then
+        worker = { id = id, busy = false, inFlight = 0, jobs = 0 }
+        self.workers[id] = worker
+        created = true
+        self.log("IFMWorker #%s online", tostring(id))
+    end
+    worker.lastSeen = os.epoch("utc")
+    --- 又听到它了：清掉"标失联"的一次性日志标记，下次再安静下来时会重新提示
+    worker.staleLogged = nil
+    if type(version) == "string" and version ~= "" then
+        worker.version = version
+    end
+    if tonumber(slots) and tonumber(slots) >= 1 then
+        worker.slots = math.floor(tonumber(slots))
+    end
+    if type(caps) == "table" then
+        worker.caps = caps
+    end
+    if type(name) == "string" and name ~= "" then
+        worker.name = name
+    end
+    return worker, created
+end
+
 function Transfer:onModemMessage(side, channel, replyChannel, message, distance)
     local chan = tonumber(channel)
     if type(message) ~= "table" then
@@ -920,37 +961,8 @@ function Transfer:onModemMessage(side, channel, replyChannel, message, distance)
         return false
     end
     local now = os.epoch("utc")
-    --- 注册 / 刷新一台 worker。version 与 slots 也在这里记下来：hello / pong / state 里都可能带。
-    --- 用户现场：网页上「版本」一栏一直空着 —— 以前只有 state 报文里的版本被记下来
-    --- （每秒一次，丢一包就空一栏），hello / pong 里带的那份被直接丢掉。
-    local touch = function(id, caps, name, version, slots)
-        local worker = self.workers[id]
-        local created = false
-        if not worker then
-            worker = { id = id, busy = false, inFlight = 0, jobs = 0 }
-            self.workers[id] = worker
-            created = true
-            self.log("IFMWorker #%s online", tostring(id))
-        end
-        worker.lastSeen = now
-        --- 又听到它了：清掉"标失联"的一次性日志标记，下次再安静下来时会重新提示
-        worker.staleLogged = nil
-        if type(version) == "string" and version ~= "" then
-            worker.version = version
-        end
-        if tonumber(slots) and tonumber(slots) >= 1 then
-            worker.slots = math.floor(tonumber(slots))
-        end
-        if type(caps) == "table" then
-            worker.caps = caps
-        end
-        if type(name) == "string" and name ~= "" then
-            worker.name = name
-        end
-        return worker, created
-    end
     if message.op == "hello" then
-        local worker = touch(message.from, message.caps, message.name, message.version, message.slots)
+        local worker = self:touchWorker(message.from, message.caps, message.name, message.version, message.slots)
         --- 私有作业频道（1.8.0）：worker 在 pong/state 里报，之后它的作业只发到这个频道
         if tonumber(message.jobChannel) then
             worker.jobChannel = math.floor(tonumber(message.jobChannel))
@@ -979,12 +991,12 @@ function Transfer:onModemMessage(side, channel, replyChannel, message, distance)
         return true
     end
     if message.op == "pong" then
-        touch(message.from, message.caps, message.name, message.version, message.slots)
+        self:touchWorker(message.from, message.caps, message.name, message.version, message.slots)
         return true
     end
     if message.op == "state" then
         -- worker 每秒上报一次：当前工作 / 能力 / 并发槽位 / 计数
-        local worker = touch(message.from, message.caps, message.name, message.version, message.slots)
+        local worker = self:touchWorker(message.from, message.caps, message.name, message.version, message.slots)
         self:applyWorkerState(worker, message)
         return true
     end
@@ -992,7 +1004,7 @@ function Transfer:onModemMessage(side, channel, replyChannel, message, distance)
         --- worker 说“收到了，正在扫”（1.5.7 起）：记下来，超时时就能说清是哪一边的问题 ——
         --- 有 ack = 消息送到了、结果没回来（多半是回报太大被丢 / worker 屏幕上有 modem 发送错误）；
         --- 没 ack = 消息根本没到那台 worker（频道/网络/它换了电脑号）。
-        local worker = touch(message.from)
+        local worker = self:touchWorker(message.from)
         local record = self.queries[tonumber(message.id) or -1]
         if record then
             record.ack = now
@@ -1010,7 +1022,7 @@ function Transfer:onModemMessage(side, channel, replyChannel, message, distance)
     if message.op == "busy" then
         -- worker 说它的任务表满了（1.8.0：每台最多 64 条并发，只有满时才回 busy）：
         -- 收回这条任务，下个 tick 再派（可能是竞态，也可能它的槽位确实被占满了）。
-        local worker = touch(message.from, message.caps, message.name, message.version, message.slots)
+        local worker = self:touchWorker(message.from, message.caps, message.name, message.version, message.slots)
         self:workerRelease(worker)
         worker.busyKind = nil
         local id = tonumber(message.id) or -1
@@ -1039,14 +1051,17 @@ function Transfer:onModemMessage(side, channel, replyChannel, message, distance)
     --- 信封：{ op = "results", results = { {op="done"|"error"|"query_result"|"detail_result", ...}, ... } }
     --- 不做老版本兼容（用户第 4 项）：即使只有一条结果也走这个信封 —— 所以这里只认 results。
     if message.op == "results" then
-        local worker = touch(message.from, message.caps, message.name, message.version, message.slots)
+        local worker = self:touchWorker(message.from, message.caps, message.name, message.version, message.slots)
         local results = type(message.results) == "table" and message.results or {}
         for _, entry in ipairs(results) do
             local entryOp = type(entry) == "table" and entry.op or nil
+            --- 注意（修 bug）：信封里的每条结果**没有** from/caps/name —— 发信人只在信封上。
+            --- 所以这里把刚登记好的 worker 直接传下去（各方法内部只有在 worker 为 nil 时
+            --- 才回退到 message.from，用于单条直发的老入口）。
             if entryOp == "query_result" then
-                self:applyQueryResult(entry)
+                self:applyQueryResult(entry, worker)
             elseif entryOp == "detail_result" then
-                self:applyDetailResult(entry)
+                self:applyDetailResult(entry, worker)
             else
                 self:applyWorkerResult(worker, entry)     -- done / error（搬运）
             end
@@ -1091,9 +1106,14 @@ end
 --- 结算 worker 报回来的一条查询结果（容器扫描 / 快照代读）。
 --- 用户第 3 项：这些结果现在和搬运结果一起走 { op = "results" } 信封，所以抽成独立方法，
 --- 单条直接到达（老路径）与信封里逐条派发都走同一段逻辑。
-function Transfer:applyQueryResult(message)
-    -- worker 扫完本机外设的结果：进缓存，调用方/网页按 key 取
-    local worker = touch(message.from, message.caps, message.name, message.version, message.slots)
+function Transfer:applyQueryResult(message, worker)
+    -- worker 扫完本机外设的结果：进缓存，调用方/网页按 key 取。
+    -- worker 由调用方传入（信封里只有发信人；单条直发时回退到 message.from）。
+    worker = worker or self:touchWorker(message.from, message.caps, message.name, message.version, message.slots)
+    if not worker then
+        self.log.warn("Query result without a sender id - dropped (id=%s)", tostring(message.id))
+        return false
+    end
     self:workerEnd(worker)
     worker.busyKind = nil
     local id = tonumber(message.id) or -1
@@ -1124,10 +1144,14 @@ function Transfer:applyQueryResult(message)
 end
 
 --- 结算 worker 报回来的一条物品详情代查结果（getItemDetail）。
-function Transfer:applyDetailResult(message)
+function Transfer:applyDetailResult(message, worker)
     -- worker 代查回来的物品详情：先收进 detailResults，
     -- 主控每个 tick 用 takeDetailResults 取走并吸收进 Containers 的物品详情字典。
-    local worker = touch(message.from, message.caps, message.name, message.version, message.slots)
+    worker = worker or self:touchWorker(message.from, message.caps, message.name, message.version, message.slots)
+    if not worker then
+        self.log.warn("Item detail result without a sender id - dropped (id=%s)", tostring(message.id))
+        return false
+    end
     local id = tonumber(message.id) or -1
     local request = self.details[id]
     self.details[id] = nil

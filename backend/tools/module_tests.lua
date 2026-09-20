@@ -2431,6 +2431,46 @@ do
             second.error == 'target full',
         'first=' .. tostring(first.state) .. '/' .. tostring(first.moved) ..
             ' second=' .. tostring(second.state) .. '/' .. tostring(second.error))
+
+    --- 用户第 1 项（现场 bug：transfer.lua:1130 attempt to call global 'touch'）：
+    --- 结果结算被抽成 applyQueryResult / applyDetailResult 之后，这些方法里不能直接引用
+    --- onModemMessage 的局部闭包 —— 这里把信封里的**每一种**结果都真跑一遍：
+    --- 查询（写缓存 + 通知主控）与详情（出队）都会经过 touchWorker，漏一个就是 nil 崩溃。
+    t.queries = { [21] = { id = 21, key = 'scan:chest_1', worker = 7, at = os.epoch('utc') } }
+    t.queryRunning['scan:chest_1'] = 21
+    t.details = { [22] = { id = 22, worker = 7, samples = {} } }
+    local seenKey, seenItems = nil, nil
+    t.onQueryResult = function(_, key, message)
+        seenKey = key
+        seenItems = #(message.items or {})
+    end
+    t:onModemMessage('back', TransferModule.CHANNEL, 0, {
+        proto = 'ifm_transfer', op = 'results', from = 7, version = 'test', slots = 64,
+        results = {
+            { op = 'query_result', id = 21, ok = true, container = 'chest_1', at = os.epoch('utc'),
+                items = { { slot = 1, name = 'minecraft:coal', count = 3 } } },
+            { op = 'detail_result', id = 22, ok = true, details = {} },
+        },
+    }, 0)
+    check('a results envelope with a query_result is settled (no nil-global crash)',
+        t.queryCache['scan:chest_1'] ~= nil and seenKey == 'scan:chest_1' and seenItems == 1 and
+            t.queries[21] == nil and t.queryRunning['scan:chest_1'] == nil,
+        'cached=' .. tostring(t.queryCache['scan:chest_1'] ~= nil) .. ' key=' .. tostring(seenKey) ..
+            ' items=' .. tostring(seenItems))
+    check('a results envelope with a detail_result is settled too',
+        t.details[22] == nil, 'details=' .. tostring(t.details[22] and 1 or 0))
+
+    --- 同一条结果走"单条直发"的老入口也要能结算（两个入口共用同一段逻辑）
+    t.queries = { [23] = { id = 23, key = 'scan:chest_2', worker = 7, at = os.epoch('utc') } }
+    t.queryRunning['scan:chest_2'] = 23
+    t:onModemMessage('back', TransferModule.CHANNEL, 0, {
+        proto = 'ifm_transfer', op = 'query_result', from = 7, version = 'test', slots = 64,
+        id = 23, ok = true, container = 'chest_2', at = os.epoch('utc'), items = {},
+    }, 0)
+    check('a single query_result message is settled through the same method',
+        t.queryCache['scan:chest_2'] ~= nil and t.queries[23] == nil,
+        'cached=' .. tostring(t.queryCache['scan:chest_2'] ~= nil))
+    t.onQueryResult = nil
 end
 
 print('')
