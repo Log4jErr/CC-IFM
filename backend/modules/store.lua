@@ -11,16 +11,93 @@ Store.KINDS = { "containers", "signals", "filters", "machineTypes", "machines", 
 ---   "schedule" —— 各任务队列的调度时间片（正整数，见 Store.SCHEDULE_*）。
 --- 1.7.0 起不再有"毫秒级扫描间隔"（settings.scan 已删除：扫描由 storageScan / inputScan 队列驱动）。
 
---- 调度时间片设置（1.7.0）：每条队列每次轮到时最多执行几步（正整数）。
---- 「设置」面板改完立即生效，并写入 config.json -> settings.schedule。
+--- 调度权重（1.8.0）：**0.01 ~ 1-0.01n 的小数（n = 队列条数），所有队列加起来等于 1**。
+--- 为什么不允许 0：一旦允许，用户可能把所有滑条都拖到 0 → 没法归一化（除零），而且"整条队列停摆"
+--- 这种状态对工厂是没有意义的。所以每条队列永远至少占 0.01（1 分），单条最多 1-0.01n。
+--- 网页「设置」里滑动一条滑条会按比例影响其它滑条（归一化）。
+--- 之所以能这么改：轮转算法本来就是"平滑加权轮转"（权重只需要是正数），并不要求整数时间片。
 Store.SCHEDULE_NAME = "schedule"
 Store.SCHEDULE_DEFAULTS = {
     process = 1, storageScan = 1, inputScan = 1,
+    --- interactionScan / outputScan（1.9.x）：交互容器与输出容器**各自一条**扫描队列
+    --- （它们现在都会被扫描；输出容器单独一条是用户第 1 项的要求）
+    interactionScan = 1, outputScan = 1,
     inventoryIn = 1, inventoryOut = 1, compact = 1, detail = 1, manual = 1,
+    --- stackScan（1.8.0）：槽位堆叠上限扫描队列（自动整理计划的输入）
+    stackScan = 1,
 }
-Store.SCHEDULE_QUEUES = { "process", "storageScan", "inputScan", "inventoryIn", "inventoryOut",
-    "compact", "detail", "manual" }
-Store.SCHEDULE_LIMITS = { min = 1, max = 50 }
+Store.SCHEDULE_QUEUES = { "process", "storageScan", "inputScan", "interactionScan", "outputScan",
+    "inventoryIn", "inventoryOut", "compact", "stackScan", "detail", "manual" }
+--- 1 分 = 0.01；权重一律按"整数分"（1 ~ 100）计算，这样"合计正好 1"不会有四舍五入误差
+Store.SCHEDULE_CENTS = 100
+--- 注意：max 只是"当前 11 条队列时"的展示值，真正的上限由 Store.weightMax() 按队列条数算（1-0.01n）
+Store.SCHEDULE_LIMITS = { min = 0.01, max = 0.91, step = 0.01 }
+Store.SCHEDULE_MIN_SHARE = 0.01
+--- 自动整理的空槽位阈值（用户第 4 项）：存储容器的**空槽位比例**低于它才自动整理
+---（空槽位还够多时搬来搬去没意义）。1 = 总是整理，0 = 从不整理；网页「设置」里可改。
+--- 自动整理的空槽位阈值缺省值（用户第 3 项）：0 ~ 1；
+--- 存储容器的空槽位低于这个比例才触发自动整理（0 = 关掉自动整理）。缺省 0.30（空槽不足 30% 就整理）。
+Store.SCHEDULE_COMPACT_FREE_DEFAULT = 0.30
+
+--- 单条队列的最大权重：其它队列每条至少留 1 分 ⇒ (100 - n) 分
+function Store.weightMax()
+    local maxCents = Store.SCHEDULE_CENTS - #Store.SCHEDULE_QUEUES
+    return math.max(Store.SCHEDULE_MIN_SHARE, maxCents / Store.SCHEDULE_CENTS)
+end
+
+--- 归一化权重（**浮点**，不再截断到小数点后 2 位 —— 用户第 2 项：前端拖出的 0.1174 保存后不该
+--- 变成 0.12）。规则与前端 rebalanceWeights 一致：
+---   * 按比例缩放到合计正好 1；每条至少 SCHEDULE_MIN_SHARE（低于下限的先钉下限，其余按比例分剩下的）；
+---   * 保留 6 位小数（只去掉浮点噪声，不做业务意义上的取整）。
+--- 返回：权重表, 是否原本全 0（调用方据此提示"回退到平均分"）。
+local function round6(value)
+    return math.floor((tonumber(value) or 0) * 1000000 + 0.5) / 1000000
+end
+
+function Store.normalizeSlices(slices)
+    local names = Store.SCHEDULE_QUEUES
+    local count = #names
+    local min = Store.SCHEDULE_MIN_SHARE
+    local raw, total = {}, 0
+    for _, name in ipairs(names) do
+        local value = tonumber(slices and slices[name]) or 0
+        if value < 0 then
+            value = 0
+        end
+        raw[name] = value
+        total = total + value
+    end
+    local out = {}
+    if total <= 0 then
+        local each = 1 / count
+        for _, name in ipairs(names) do
+            out[name] = round6(each)
+        end
+        return out, true
+    end
+    --- 低于下限的先钉在下限，剩下的按原比例在其余队列之间分配
+    local frozen, frozenCount, freeSum = {}, 0, 0
+    for _, name in ipairs(names) do
+        if raw[name] / total < min then
+            frozen[name] = true
+            frozenCount = frozenCount + 1
+        else
+            freeSum = freeSum + raw[name]
+        end
+    end
+    local budget = 1 - min * frozenCount
+    local freeCount = count - frozenCount
+    for _, name in ipairs(names) do
+        if frozen[name] then
+            out[name] = min
+        elseif freeSum > 0 then
+            out[name] = round6(budget * (raw[name] / freeSum))
+        else
+            out[name] = round6(budget / math.max(1, freeCount))
+        end
+    end
+    return out, false
+end
 
 local VALID_ROLES = { storage = true, interaction = true, output = true, input = true }
 --- 容器定义的种类：item = 物品容器（inventory 外设），fluid = 流体容器（fluid_storage 外设）。
@@ -110,23 +187,50 @@ function Store.emptyData()
 end
 
 
---- 调度时间片设置：缺省 + 逐字段回退（正整数），保证任何时候都拿得到可用值
+--- 调度权重设置：缺省 + 归一化（总和 = 1 的小数），保证任何时候都拿得到可用值
 function Store:scheduleSettings()
     local saved = self:get("settings", Store.SCHEDULE_NAME) or {}
     local savedSlices = type(saved.slices) == "table" and saved.slices or {}
-    local limits = Store.SCHEDULE_LIMITS
     local slices = {}
     for _, name in ipairs(Store.SCHEDULE_QUEUES) do
         local value = tonumber(savedSlices[name])
-        if not value then
-            value = Store.SCHEDULE_DEFAULTS[name] or limits.min
+        if not value or value < 0 then
+            value = Store.SCHEDULE_DEFAULTS[name] or 0
         end
-        slices[name] = math.max(limits.min, math.min(limits.max, math.floor(value)))
+        slices[name] = value
+    end
+    local normalized, allZero = Store.normalizeSlices(slices)
+    if allZero then
+        self.log("Schedule weights were all zero - falling back to an equal split (%d queues)", #Store.SCHEDULE_QUEUES)
+    end
+    --- 主控本机协程池开关（用户第 1 项）：关掉后主控不再自己处理任务 —— 只在有 worker 在线时才生效。
+    --- 用户第 3 项：**缺省关**（分布式部署下主控只管调度/网页，搬运交给 worker；
+    --- 没有 worker 在线时后端仍会本机干活，所以网络里一台 worker 都没有也不会卡住）。
+    local localPool = saved.localPool
+    if localPool == nil then
+        localPool = false
+    end
+    --- 给网页推日志的开关（用户第 1 项）：日志在 WS 上是最大的一块流量，可以按需关掉。
+    --- 用户第 3 项：**缺省关**（要在线看日志请在网页「设置」里打开）。
+    local sendLog = saved.sendLog
+    if sendLog == nil then
+        sendLog = false
+    end
+    --- 自动整理的空槽位阈值（用户第 4 项）：0 ~ 1，缺省 0.10（空槽位不足 10% 才整理）
+    local compactFreeRatio = tonumber(saved.compactFreeRatio)
+    if not compactFreeRatio or compactFreeRatio < 0 then
+        compactFreeRatio = Store.SCHEDULE_COMPACT_FREE_DEFAULT
+    elseif compactFreeRatio > 1 then
+        compactFreeRatio = 1
     end
     return {
-        slices = slices,
-        limits = limits,
+        slices = normalized,
+        limits = Store.SCHEDULE_LIMITS,
+        minShare = Store.SCHEDULE_MIN_SHARE,
         queues = Store.SCHEDULE_QUEUES,
+        localPool = localPool ~= false,
+        sendLog = sendLog ~= false,
+        compactFreeRatio = compactFreeRatio,
     }
 end
 
@@ -154,6 +258,19 @@ end
 function Store:load()
     local parsed, why = self.file:read("config.json")
     if not parsed then
+        --- 文件**存在**却读不出来（写盘被打断 / 手工编辑坏了）→ 进只读保护：
+        --- 绝不把内存里的空配置写回去覆盖用户的定义（那等于静默清空整座工厂）。
+        --- 文件不存在（全新安装）不算：这时写一份空配置没有任何损失。
+        local exists = false
+        if self.file.path and type(fs) == "table" and fs.exists then
+            local ok, value = pcall(fs.exists, self.file.path)
+            exists = ok and value == true
+        end
+        self.readOnly = exists and true or false
+        if self.readOnly then
+            self.log("config.json exists but could not be read (%s) - the store is READ-ONLY until it is " ..
+                "fixed; nothing will be written back over it", tostring(why))
+        end
         self.data = Store.emptyData()
         return false, why
     end
@@ -216,8 +333,68 @@ function Store:tick(now)
 end
 
 --- 立即写盘（原子写由 modules/jsonfile.lua 负责）
+--- 只读保护（见 Store:load）：配置读不出来时一个字节都不写，避免用空配置覆盖用户数据。
 function Store:flush()
+    if self.readOnly then
+        return false, "config.json could not be read - refusing to overwrite it"
+    end
     return self.file:flush(self.data)
+end
+
+--- 预设机器类型名（用户第 3 项）：运行 IFMCrafter.lua 的机械臂（海龟）**自动**成为这个类型的机器，
+--- 用户不必再走"添加机器类型 → 添加机器 → 添加外设"三步。
+Store.TURTLE_CRAFTER_TYPE = "turtle_crafter"
+
+--- 虚拟定义（不落盘）：{ [kind] = { 键 -> 定义 } }。
+--- 用途：turtle_crafter —— 主控看到的海龟外设 × 合成器上报的网络名 → 自动生成
+--- "容器（role = interaction，输入输出都是海龟自己）+ 机器（parallel 恒 1）"。
+--- 它们**不写进 config.json**（self.data 里没有它们），只在本机内存里生效，
+--- 但 get / findContainer / list / names 都会看到它们 —— 引擎与网页因此当作真实定义。
+function Store:setVirtual(kind, list)
+    self.virtual = self.virtual or {}
+    local bucket = {}
+    for _, def in ipairs(list or {}) do
+        if type(def) == "table" and type(def.name) == "string" and def.name ~= "" then
+            --- 容器定义按"种类:名称"做键（与 findContainer 一致），其它定义用名称
+            local key = def.name
+            if kind == "containers" then
+                key = Store.containerKey(def.kind or "item", def.name)
+            end
+            bucket[key] = def
+        end
+    end
+    local changed = false
+    local previous = self.virtual[kind] or {}
+    for key, def in pairs(bucket) do
+        if previous[key] ~= def then
+            changed = true
+            break
+        end
+    end
+    if not changed then
+        for key in pairs(previous) do
+            if bucket[key] == nil then
+                changed = true
+                break
+            end
+        end
+    end
+    self.virtual[kind] = bucket
+    --- **不标脏**：虚拟定义不落盘（config.json 里没有它们），标脏只会让主控白白写盘 ——
+    --- 而且万一 config.json 读不出来（Store:load 的只读保护）就会把空配置写回去。
+    --- 网页照旧能看到它们：快照推送本来就有 1 秒一次的定时推送。
+    return bucket, changed
+end
+
+--- 某个 kind 的虚拟定义表（没有就是空表）
+function Store:virtualOf(kind)
+    return (self.virtual and self.virtual[kind]) or {}
+end
+
+--- 这台机器是不是"机械臂合成器"（turtle_crafter 预设类型）：
+--- 引擎在"材料输入完成"之后要额外给海龟发一条 craft 指令（用户第 3 项）。
+function Store.isTurtleCrafter(machine)
+    return type(machine) == "table" and machine.type == Store.TURTLE_CRAFTER_TYPE
 end
 
 function Store:get(kind, name, containerKind)
@@ -228,7 +405,7 @@ function Store:get(kind, name, containerKind)
     if not bucket or type(name) ~= "string" then
         return nil
     end
-    return bucket[name]
+    return bucket[name] or self:virtualOf(kind)[name]
 end
 
 --- 查找容器定义：nameOrKey 可以是纯名称（可指定 kind）或 "item:名称"/"fluid:名称" 键。
@@ -237,41 +414,54 @@ function Store:findContainer(nameOrKey, containerKind)
     if type(nameOrKey) ~= "string" or nameOrKey == "" then
         return nil
     end
-    local direct = self.data.containers[nameOrKey]
+    local virtual = self:virtualOf("containers")
+    local direct = self.data.containers[nameOrKey] or virtual[nameOrKey]
     if direct then
         return direct
     end
     local plain = Store.containerPlainName(nameOrKey)
     if containerKind then
         return self.data.containers[Store.containerKey(containerKind, plain)]
+            or virtual[Store.containerKey(containerKind, plain)]
     end
     return self.data.containers[Store.containerKey("item", plain)]
         or self.data.containers[Store.containerKey("fluid", plain)]
+        or virtual[Store.containerKey("item", plain)]
+        or virtual[Store.containerKey("fluid", plain)]
 end
 
---- 按名称排序的数组
+--- 按名称排序的数组（含虚拟定义：turtle_crafter 的机器/容器，见 setVirtual）
 function Store:list(kind)
     local bucket = self.data[kind] or {}
+    local virtual = self:virtualOf(kind)
     local names = {}
     for name in pairs(bucket) do
         names[#names + 1] = name
     end
+    for _, def in pairs(virtual) do
+        local name = def.name
+        if type(name) == "string" and not bucket[name] then
+            names[#names + 1] = name
+        end
+    end
     table.sort(names)
     local out = {}
     for i = 1, #names do
-        out[i] = bucket[names[i]]
+        local name = names[i]
+        out[i] = bucket[name] or virtual[name]
+            or virtual[Store.containerKey("item", name)] or virtual[Store.containerKey("fluid", name)]
     end
     return out
 end
 
 function Store:names(kind)
-    local bucket = self.data[kind] or {}
-    local names = {}
-    for name in pairs(bucket) do
-        names[#names + 1] = name
+    local out = {}
+    for _, def in ipairs(self:list(kind)) do
+        if type(def) == "table" and type(def.name) == "string" then
+            out[#out + 1] = def.name
+        end
     end
-    table.sort(names)
-    return names
+    return out
 end
 
 --- 是否被引用（用于删除保护）
@@ -352,7 +542,68 @@ function Store:references(kind, name, containerKind)
     return refs
 end
 
---- 容器定义名：只有输出容器需要用户起名字（机器按名字引用它、点「发送」也要选它）；
+--- 强制删除时"顺手摘掉引用"（用户第 3 项）：把机器定义里指向这条容器/信号定义的名字去掉。
+--- 为什么需要它：一键删除缺失外设之后，网页上机器卡片里那张「缺失的外设卡片」还挂在机器的
+--- 输入/输出列表里 —— 用户看到的还是"没删掉"。摘掉引用后机器卡片就干净了。
+--- 注意：机器的输入/输出是**按顺序**引用的（流程里的容器序号指向列表下标），从中间摘掉一条会
+--- 让它后面的序号前移 —— 被删的这台外设本来就已经不在，机器本来也跑不动，这里以"卡片能清干净"为准。
+--- 返回被改动的机器数量。
+function Store:purgeReferences(kind, name, containerKind)
+    local touched = 0
+    local function purgeList(machine, listKey, match)
+        local list = machine[listKey]
+        if type(list) ~= "table" then
+            return false
+        end
+        local kept = {}
+        local changed = false
+        for _, entry in ipairs(list) do
+            if match(entry) then
+                changed = true
+            else
+                kept[#kept + 1] = entry
+            end
+        end
+        if changed then
+            machine[listKey] = kept
+        end
+        return changed
+    end
+    if kind == "containers" then
+        --- 物品容器与流体容器可以同名：只摘对得上种类的那几个列表
+        local wanted = containerKind or (self:findContainer(name) or {}).kind or "item"
+        local isItem = wanted ~= "fluid"
+        local match = function(entry) return Store.containerPlainName(entry) == name end
+        for _, machine in ipairs(self:list("machines")) do
+            local changed = false
+            if isItem then
+                changed = purgeList(machine, "itemInputs", match) or changed
+                changed = purgeList(machine, "itemOutputs", match) or changed
+            else
+                changed = purgeList(machine, "fluidInputs", match) or changed
+                changed = purgeList(machine, "fluidOutputs", match) or changed
+            end
+            if changed then
+                touched = touched + 1
+            end
+        end
+    elseif kind == "signals" then
+        local match = function(entry) return entry == name end
+        for _, machine in ipairs(self:list("machines")) do
+            if purgeList(machine, "signals", match) then
+                touched = touched + 1
+            end
+        end
+    end
+    if touched > 0 then
+        self:markDirty()
+        if self.log then
+            self.log("Cleared references to the deleted %s %s in %d machine(s)", tostring(kind),
+                tostring(name), touched)
+        end
+    end
+    return touched
+end
 --- 存储容器与交互容器都用外设名作定义名 —— 一个外设 + 一种容器只对应一个定义，用户不必（也不该）起名。
 function Store:containerNameFor(obj, name)
     local plain = Store.containerPlainName(self.Util.trim(name or ""))
@@ -408,6 +659,26 @@ function Store:dropContainerByPeripheral(containerKind, peripheral, keepName)
         end
     end
     return dropped
+end
+
+--- 局部更新一条 settings（1.8.0）：读出现有内容 → 覆盖 patch 里的键 → 整条写回。
+--- 为什么需要它：Store:set 是**整条替换** —— 直接提交 { slices = ..., sendLog = false } 会把
+--- localPool 这个键一起丢掉，读回来又回落成默认 true，表现就是"关掉一个开关，另一个自己打开，
+--- 两个永远无法同时关闭"（用户第 5 项）。网页提交调度设置走这里，只覆盖它带的字段。
+function Store:patchSettings(name, patch, opts)
+    local current = self:get("settings", name)
+    local merged = {}
+    if type(current) == "table" then
+        for key, value in pairs(current) do
+            merged[key] = value
+        end
+    end
+    if type(patch) == "table" then
+        for key, value in pairs(patch) do
+            merged[key] = value
+        end
+    end
+    return self:set("settings", name, merged, opts)
 end
 
 --- 新增/修改定义。
@@ -505,6 +776,9 @@ function Store:delete(kind, name, containerKind, opts)
         if self.log then
             self.log("Force delete %s %s (still referenced by: %s)", tostring(kind), tostring(name), head)
         end
+        --- 用户第 3 项：顺手把机器里的引用摘掉 —— 一键删除缺失外设之后，机器卡片上那张
+        --- 「缺失的外设卡片」也要跟着消失（以前只删定义、机器里留着名字，看起来"没删掉"）。
+        self:purgeReferences(kind, name, containerKind)
     end
     self.data[kind][key] = nil
     self:markDirty()
@@ -588,13 +862,6 @@ function Store:normalizeElement(el, allowPlaceholder)
         return {
             kind = kind,
             seconds = math.max(0, Util.num(el.seconds, 1)),
-        }
-    elseif kind == "virtual" then
-        -- 虚操作（抽象模板元素）：不对应任何真实资源，输入/输出都能放；
-        -- 含虚操作的流程不能合成，只作为网页“流程设置复制”的来源。
-        return {
-            kind = kind,
-            name = el.name or "",
         }
     end
     return nil
@@ -789,27 +1056,35 @@ function Store:validateElement(el, allowPlaceholder, index, label)
             return false, label .. "\\u5143\\u7D20 " .. index .. " \\u7684\\u65F6\\u957F\\u4E0D\\u80FD\\u4E3A\\u8D1F"
         end
         return true
-    elseif kind == "virtual" then
-        -- 虚操作：输入与输出都可以放（它就是“这里以后要换成真实材料/产物”的占位步骤）。
-        -- 名称必须有，网页端在复制到别的流程后要靠它认出这一行。
-        if not isName(el.name) then
-            return false, label .. "\\u5143\\u7D20 " .. index .. "\\u7684\\u865A\\u64CD\\u4F5C\\u540D\\u79F0\\u4E0D\\u80FD\\u4E3A\\u7A7A"
-        end
-        return true
     end
     return false, label .. "\\u5143\\u7D20 " .. index .. " \\u7684\\u7C7B\\u578B\\u672A\\u77E5\\uFF1A" .. tostring(kind)
 end
 
---- 流程里是否含有“虚操作”元素（kind = "virtual"）：含虚操作的流程是抽象模板 —— 
---- 不能执行 / 不能被选作上游 / 不能下单合成，只能被网页的“流程设置复制”拷贝到别的流程。
+--- 抽象操作（用户第 3 项，取代原来的"虚操作"元素）：把物品/流体元素的**注册名写成 abstract**
+--- 就表示"这里以后要换成真实材料/产物"，它不对应任何真实资源。
+Store.ABSTRACT_ID = "abstract"
+
+--- 单个元素是不是抽象操作。只有物品/流体能是抽象操作 —— 过滤器指向的是真实的过滤器定义。
+function Store.elementIsAbstract(element)
+    if type(element) ~= "table" then
+        return false
+    end
+    if element.kind ~= "item" and element.kind ~= "fluid" then
+        return false
+    end
+    return element.id == Store.ABSTRACT_ID
+end
+
+--- 流程里是否含抽象操作（物品/流体注册名 = abstract）：含它的流程是**抽象流程** ——
+--- 不能执行 / 不能被选作上游 / 不能下单合成，但可以保存，也可以作为网页"流程设置复制"的来源。
 --- 引擎（modules/recipe.lua）与主控（IFMMaster.lua）都用它做判断。
-function Store.processHasVirtual(process)
+function Store.processIsAbstract(process)
     if type(process) ~= "table" then
         return false
     end
     local function has(list)
         for _, element in ipairs(type(list) == "table" and list or {}) do
-            if type(element) == "table" and element.kind == "virtual" then
+            if Store.elementIsAbstract(element) then
                 return true
             end
         end
@@ -948,18 +1223,19 @@ function Store:validate(kind, name, obj)
             if type(obj.slices) ~= "table" then
                 return false, "slices must be a table"
             end
-            local sliceLimits = Store.SCHEDULE_LIMITS
+            local limits = Store.SCHEDULE_LIMITS
+            local maxShare = Store.weightMax()
             for name, value in pairs(obj.slices) do
                 if Store.SCHEDULE_DEFAULTS[name] == nil then
                     return false, "unknown queue " .. tostring(name)
                 end
                 local number = tonumber(value)
-                if not number or number ~= math.floor(number) then
-                    return false, "slice for " .. tostring(name) .. " must be a positive integer"
+                if not number then
+                    return false, "weight for " .. tostring(name) .. " must be a number"
                 end
-                if number < sliceLimits.min or number > sliceLimits.max then
-                    return false, "slice for " .. tostring(name) .. " out of range (" ..
-                        sliceLimits.min .. " ~ " .. sliceLimits.max .. ")"
+                if number < limits.min or number > maxShare then
+                    return false, "weight for " .. tostring(name) .. " out of range (" ..
+                        limits.min .. " ~ " .. maxShare .. ")"
                 end
             end
         end

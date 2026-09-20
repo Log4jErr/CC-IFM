@@ -20,7 +20,11 @@
         else if (typeof worker.age === 'number') age = worker.age;
         if (age === null) return { text: t('workerWaiting'), kind: 'waiting' };
         if (age > 30) return { text: t('workerStale'), kind: 'missing' };
-        if (worker.busy || asArray(worker.tasks).length > 0) return { text: t('workerWorking'), kind: 'running' };
+        // 本轮第 6 项：任务很短（常常 1 个游戏刻），"这一刻的任务表"多半是空的 ——
+        // 但只要这一秒里跑过东西（peak > 0）就是"工作中"，别再显示成空闲。
+        if (worker.busy || asArray(worker.tasks).length > 0 || (worker.peak || 0) > 0) {
+            return { text: t('workerWorking'), kind: 'running' };
+        }
         return { text: t('idle'), kind: 'idle' };
     }
 
@@ -34,6 +38,7 @@
         if (workers.length === 0) {
             list.innerHTML = '<span class="muted">' + escapeHtml(t('workerNone')) + '</span>';
             if (hint) hint.textContent = '';
+            renderWorkerTotalLoad([]);
             return;
         }
         list.innerHTML = workers.map(function (worker) {
@@ -49,6 +54,37 @@
                 }) });
             } else if (worker.version) {
                 info.push({ text: t('workerVersion', { version: worker.version }) });
+            }
+            // 并发槽位（1.8.0）：64 条的 worker 一次能同时跑很多条任务 ——
+            // 只显示「空闲/工作中」会让人以为它闲着，这里把负载写清楚。
+            // 本轮第 5/6 项：负载改成"这一秒的峰值并发"并配一条进度条 ——
+            // worker 的任务往往 1 个游戏刻就结束，只显示"上报这一刻"的数永远是 0。
+            const slots = typeof worker.slots === 'number' ? worker.slots : 0;
+            const peak = typeof worker.peak === 'number' ? worker.peak : null;
+            const loadValue = Math.max(Number(worker.load) || 0, peak || 0);
+            let barHtml = '';
+            if (slots > 1) {
+                const percent = Math.min(100, Math.round(loadValue / slots * 100));
+                const barClass = percent >= 100 ? 'bad' : (percent > 0 ? ' warn' : '');
+                barHtml = '<div class="progress worker-load" title="' +
+                    escapeHtml(t('workerLoadTitle', { slots: slots })) + '">' +
+                    '<div class="bar' + barClass + '" style="width:' + percent + '%"></div></div>';
+                info.push(peak === null
+                    ? t('workerLoad', { load: loadValue, slots: slots })
+                    : t('workerLoadPeak', { load: loadValue, slots: slots }));
+            }
+            // 卡住被摘掉的任务（1.8.0）：某个容器/外设长时间不响应时，worker 会摘掉这些任务
+            // 把槽位还回来。不显示的话，用户只会看到“搬运老是超时”而不知道是哪个方块的问题。
+            if ((worker.stuck || 0) > 0) {
+                info.push({ bad: true, text: t('workerStuck', { n: worker.stuck }) });
+            }
+            // 失联（用户第 1 项）：卡片不再消失，但要把"多久没消息了"写清楚 ——
+            // 一眼能看出是链路抖了一下（几秒后就自己恢复）还是真的掉线了。
+            if (worker.stale === true) {
+                const ageText = typeof worker.stateAge === 'number'
+                    ? worker.stateAge
+                    : (typeof worker.age === 'number' ? worker.age : 0);
+                info.push({ bad: true, text: t('workerSilentFor', { n: ageText }) });
             }
             if (tasks.length > 0) {
                 info.push(t('workerCurrent', { task: tasks.join(' | ') }));
@@ -76,7 +112,7 @@
                         ms: ms
                     }));
                 } else {
-                    // 扫到的容器是空的：也要显示**外设名与用时**（任务 6：以前只显示“扫过 N 个容器”）
+                    // 扫到的容器是空的：也要显示外设名与用时（任务 6：以前只显示“扫过 N 个容器”）
                     info.push(t('workerLastQueryEmpty', { container: container, ms: ms }));
                 }
             }
@@ -95,6 +131,7 @@
                 '<span class="grow">' +
                 '<strong>#' + escapeHtml(String(worker.id)) + ' ' + escapeHtml(worker.name || '') + '</strong> ' +
                 '<span class="muted">' + escapeHtml(caps) + '</span>' +
+                barHtml +
                 (lines.bad.length > 0 ? '<div class="worker-warn">' + escapeHtml(lines.bad.join(' · ')) + '</div>' : '') +
                 (lines.plain.length > 0 ? '<div class="muted">' + escapeHtml(lines.plain.join(' · ')) + '</div>' : '') +
                 '</span>' +
@@ -111,4 +148,43 @@
             const queriers = workers.filter(function (worker) { return worker.query; }).length;
             hint.textContent = t('workerSummary', { n: workers.length, query: queriers });
         }
+        renderWorkerTotalLoad(workers);
+    }
+
+    /// 用户第 4 项：从节点"总负载"进度条（放在「从节点」面板标题右侧）。
+    /// 只统计从节点自己的槽位与负载 —— 主控本机那 32 个槽位不计入（它压根不在 stores.workers 里，
+    /// 见 Transfer:workersForUi / Transfer:localStatus）。负载口径与单卡一致：max(load, peak)。
+    function renderWorkerTotalLoad(workers) {
+        const bar = el('workerLoadBar');
+        const text = el('workerLoadText');
+        if (!bar || !text) return;
+        let load = 0;
+        let slots = 0;
+        asArray(workers).forEach(function (worker) {
+            const workerSlots = typeof worker.slots === 'number' ? worker.slots : 0;
+            const peak = typeof worker.peak === 'number' ? worker.peak : 0;
+            slots += Math.max(0, workerSlots);
+            load += Math.max(Number(worker.load) || 0, peak);
+        });
+        if (slots <= 0) {
+            // 没有从节点（或都不支持并发）：不显示进度条，避免留一条永远为 0 的空条
+            bar.style.display = 'none';
+            text.textContent = '';
+            text.removeAttribute('title');
+            bar.removeAttribute('title');
+            return;
+        }
+        const percent = Math.min(100, Math.round(load / slots * 100));
+        const barNode = bar.firstElementChild;
+        if (barNode) {
+            barNode.className = 'bar' + (percent >= 100 ? 'bad' : (percent > 0 ? 'warn' : ''));
+            barNode.style.width = percent + '%';
+        }
+        bar.style.display = '';
+        const title = t('workerTotalLoadTitle', { slots: fmtCount(slots) });
+        bar.setAttribute('title', title);
+        text.setAttribute('title', title);
+        text.textContent = t('workerTotalLoad', {
+            load: fmtCount(load), slots: fmtCount(slots), percent: percent
+        });
     }

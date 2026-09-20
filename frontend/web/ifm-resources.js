@@ -99,10 +99,10 @@
     // 只在中文界面 + pinyinlite 可用时生效。pinyinlite 由 index.html 里的
     // <script src="dist/pinyinlite_full.min.js"> 提供：pinyinlite('增长') => [['ceng','zeng'],['zhang','chang']]
     // 匹配规则（用户给出的例子，逐条实现）：
-    //   * 忽略声调（pinyinlite 给的就是无声调音节），**任意读音都算**（孳生读音全都要试）；
-    //   * 查询串按空格切成若干段，每段吃「1 个或多个连续音节」，每个音节可以只吃它读音的**前缀**
+    //   * 忽略声调（pinyinlite 给的就是无声调音节），任意读音都算（孳生读音全都要试）；
+    //   * 查询串按空格切成若干段，每段吃「1 个或多个连续音节」，每个音节可以只吃它读音的前缀
     //     （所以 "g" 能匹配 gong、"zt" 能匹配 gong+zuo+tai 的第 2、3 个音节的声母）；
-    //   * 段与段之间必须**紧挨**（不许跳音节）："gt" ✗、"gong tai" ✗；但可以从中间开始："tai" ✓、"zt" ✓。
+    //   * 段与段之间必须紧挨（不许跳音节）："gt" ✗、"gong tai" ✗；但可以从中间开始："tai" ✓、"zt" ✓。
     const pinyinCache = new Map();
 
     function pinyinAvailable() {
@@ -134,7 +134,7 @@
     }
 
     // 一段（seg）能否恰好由 syllables[start..start+count-1] 拼出来。
-    // 规则：每个音节只吃它读音的**前缀**（≥1 个字符），片与片之间紧挨着（不许跳音节）；
+    // 规则：每个音节只吃它读音的前缀（≥1 个字符），片与片之间紧挨着（不许跳音节）；
     // 本音节吃过至少一个字符后，可以结束这一片、到下一个音节继续吃（这就是 "gzt" = g|z|t 的由来）。
     function pinyinSegmentFits(seg, syllables, start, count) {
         const limit = start + count;
@@ -173,7 +173,7 @@
             states = next;
             if (states.length === 0) return false;
         }
-        // 必须**吃满** count 个音节（最后一个可以只吃一半，但必须至少吃了一个字符）：
+        // 必须吃满 count 个音节（最后一个可以只吃一半，但必须至少吃了一个字符）：
         // 否则片段会“假装”跨过中间音节，出现 "gong tai" 这种越位匹配。
         return states.some(function (state) {
             if (state.index === limit) return true;
@@ -224,7 +224,7 @@
     function matchesSearch(entry, query) {
         if (searchQueryEmpty(query)) return true;
         const name = String(entry.name || '').toLowerCase();
-        // 注册名的**路径部分**（去掉模组命名空间）：搜索 "create" 不该命中所有 create 模组的物品，
+        // 注册名的路径部分（去掉模组命名空间）：搜索 "create" 不该命中所有 create 模组的物品，
         // 想按模组搜请写 @create（用户第 5 项要求）；标签同理，必须写 #tag。
         const colon = name.indexOf(':');
         const namePath = colon >= 0 ? name.slice(colon + 1) : name;
@@ -255,7 +255,17 @@
             const query = parseSearchQuery(searchText);
             list = list.filter(function (entry) { return matchesSearch(entry, query); });
         }
+        // 用户第 1 项：主键顺序 = 占位符 > 过滤器 > 可合成 > 其他（次键才看排序模式）。
+        // 这样待发送网格里"能现造出来"的东西永远排在最上面。
+        const rank = function (entry) {
+            if (entry.kind === 'placeholder') return 0;
+            if (entry.kind === 'filter') return 1;
+            if (entry.craftable) return 2;
+            return 3;
+        };
         list.sort(function (a, b) {
+            const byRank = rank(a) - rank(b);
+            if (byRank !== 0) return byRank;
             if (sortMode === 'name') {
                 return displayName(a.kind, a.name).localeCompare(displayName(b.kind, b.name), undefined,
                     { numeric: true, sensitivity: 'base' });
@@ -291,15 +301,19 @@
         button.innerHTML = '<i class="fa ' + sortModeIcon(sortMode) + '"></i>';
     }
 
-    function plainIconImg(kind, name) {
+    // components（可选）= 这个物品的 NBT（components 表）：给了就能在同一个注册名的若干
+    // 变体里挑“NBT 最接近”的那张图标。CC:T 的物品详情只给得出 NBT 哈希字符串，
+    // 所以网格里通常不传；此时仍然用同一注册名的导出图，不会回退到 blocksitems。
+    function plainIconImg(kind, name, components) {
         const realKind = kind === 'fluid' ? 'fluid' : 'item';
         const key = resourceKey(realKind, name);
         queueMeta(realKind, name);
         // 三档优先级（1.6.12，任务 8）：① icon-exports 本地导出图片（离线可用、与游戏里一致；
-        // NBT 变体优先匹配）→ ② blocksitems 接口图标 → ③ 名称字形兜底（见 ifmIconFallback）。
+        // NBT 变体优先匹配：完全一致 → 最接近 → 同注册名的任意一条）→ ② blocksitems 接口图标
+        // → ③ 名称字形兜底（见 ifmIconFallback）。
         // 出图统一走 iconImgTagHtml：与资源网格主图标 / 外设方块卡是同一个实现，
         // 免得哪条路径漏掉第 ① 层（导出图就会“有文件却没被引用”）。
-        const exported = iconExportFile(realKind, name);
+        const exported = iconExportFile(realKind, name, components);
         // 本地也没有、接口又明确说“没有这个资源”时别白刷一次 404，直接用名称字形
         if (exported || (metaState(key) !== 'missing' && !iconFailedKeys.has(key))) {
             return iconImgTagHtml(realKind, name, '', exported);
@@ -591,33 +605,68 @@
     // 后台真正发完物品后，界面上的「发送中」偶尔会一直留着那条占位：以前只在渲染时按时间猜
     // （“服务端 1.5 秒后又推过队列”），没有推送就不会重算。
     // 现在改成确定性做法：
-    //   ① 服务端**确认收到**这次发送请求之后（send_items 的响应回来）才“武装”这些占位；
+    //   ① 服务端确认收到这次发送请求之后（send_items 的响应回来）才“武装”这些占位；
     //   ② 之后每收到一次发送队列的增量更新，就核对一次：队列里没有它 = 已经发完/被拒 → 立刻退休，
     //      并主动重画（不再等下一次渲染）。这就是它要求的“相同的增量更新行为”。
+    //   ③ （用户第 1 项）再加一次“定时核对”——物品已经在存储里、目标容器又近时，
+    //      服务端可能在这条发送**入队与出队之间**就把它搬完了：网页既收不到“加入队列”，
+    //      也收不到“出队”的推送，光等推送的话那条占位会一直留在「发送中」（用户看到的就是
+    //      “物品其实已经发出去了，网页还写着发送中”）。到点了就自己核对一次并重画。
     let optimisticArmed = false;
     let optimisticArmedAt = 0;
     let optimisticSweeps = 0;
+    let optimisticTimer = null;
+    /// 定时核对的延时（毫秒）：比服务端“没有变化时的兜底推送间隔”（2 秒）稍长一点，
+    /// 这样到点前服务端至少推过一次，不会把“刚发出、还在队列里”的占位误清掉。
+    const OPTIMISTIC_SETTLE_MS = 2500;
+
+    function clearOptimisticTimer() {
+        if (optimisticTimer) {
+            clearTimeout(optimisticTimer);
+            optimisticTimer = null;
+        }
+    }
 
     function armOptimisticDeliveries() {
         optimisticArmed = true;
         optimisticArmedAt = Date.now();
         optimisticSweeps = 0;
+        clearOptimisticTimer();
+        optimisticTimer = setTimeout(function () {
+            optimisticTimer = null;
+            /// 到点了：不管服务端推没推过，都把对不上的占位收掉并重画（见上面的 ③）
+            const before = optimisticDeliveries.length;
+            settleOptimisticDeliveries();
+            if (before > 0) {
+                markDirty('deliveries');
+                scheduleRender();
+            }
+        }, OPTIMISTIC_SETTLE_MS);
+    }
+
+    /// 清掉所有乐观占位（服务端的真实条目由 deliveryEntries 自己接管）；返回前是否还有占位
+    function settleOptimisticDeliveries() {
+        clearOptimisticTimer();
+        const before = optimisticDeliveries.length;
+        optimisticDeliveries = [];
+        optimisticSweeps = 0;
+        return before > 0;
     }
 
     /// 核对并移除已经不在服务端队列里的占位；返回是否真的移除了（调用方据此重画）
-    function reconcileOptimisticDeliveries() {
+    /// force = true：不再等“响应之后的第 2 次推送”，立刻清（定时核对用）
+    function reconcileOptimisticDeliveries(force) {
         if (!optimisticArmed || optimisticDeliveries.length === 0) return false;
         optimisticSweeps += 1;
-        // 响应回来之后的**第 1 次**推送，内容可能是在服务端处理这条请求之前收集的，
+        // 响应回来之后的第 1 次推送，内容可能是在服务端处理这条请求之前收集的，
         // 那时队列里当然还没有它 —— 所以再等一次推送（或 1.5 秒）才敢把“队列里没有它”
         // 当成“已经发完 / 被拒”，避免刚发出的东西立刻从「发送中」闪掉。
-        const settled = optimisticSweeps >= 2 || (Date.now() - optimisticArmedAt) >= 1500;
+        const settled = force === true || optimisticSweeps >= 2 ||
+            (Date.now() - optimisticArmedAt) >= 1500;
         if (!settled) return false;
-        const before = optimisticDeliveries.length;
         // 队列里有它 → 由服务端的真实条目接管；队列里没有它 → 已经发完/被拒 → 退休。
         // 两种情况都该把本地占位清掉（否则就是一直留着的那条“发送中”）。
-        optimisticDeliveries = [];
-        return before !== 0;
+        return settleOptimisticDeliveries();
     }
 
     // 发送中：乐观项（最新提交的排最前）+ 服务端队列（按 id 从后往前 = 最新提交的排最前）
@@ -645,6 +694,9 @@
                     kind: item.kind,
                     name: item.name,
                     count: Number(item.remaining || item.total || 0),
+                    // 用户第 5 项：总共多少也带上 —— 服务端会把"同容器 + 同资源"的多次发送合并成
+                    // 一条（remaining/total 相加），网页只有拿到 total 才能显示成"剩余/总共"。
+                    total: Number(item.total || 0),
                     container: item.container,
                     process: item.processName,
                     error: item.lastError
@@ -660,42 +712,101 @@
             ? '<span class="grid-mark danger" data-delivery-cancel="' + escapeHtml(String(entry.id)) + '" title="' +
               escapeHtml(t('deliveryCancel')) + '">×</span>'
             : '';
-        return '<div class="grid-item delivery-item' + (entry.pending ? ' pending' : '') + '"' +
+        // 用户第 5 项：数量显示成"剩余 / 总共"。以前只显示 remaining —— 同一目标容器 + 同一资源
+        // 的多次发送会在服务端合并（见 Recipe:addDelivery，remaining/total 相加），网页上却只看到
+        // 一个大数字（例如 381 发两次 → 762），没人知道它是两次并起来的。
+        const total = Number(entry.total || 0);
+        const countText = fmtCount(entry.count) +
+            (total > 0 && total !== Number(entry.count || 0)
+                ? '<span class="delivery-total" title="' + escapeHtml(t('deliveryTotalTitle')) + '">/' +
+                  fmtCount(total) + '</span>'
+                : '');
+        // 发送卡住的原因（服务端 lastError）除了 tooltip，再给一个左上角的红色感叹号 ——
+        // 以前它只藏在 title 里，卡片看起来和正常的一模一样（"显然是发送不了了"却看不出来）。
+        const errorMark = entry.error
+            ? '<span class="grid-mark danger delivery-error-mark" title="' + escapeHtml(entry.error) + '">!</span>'
+            : '';
+        return '<div class="grid-item delivery-item' + (entry.pending ? ' pending' : '') +
+            (entry.error ? ' error' : '') + '"' +
             ' data-delivery="' + escapeHtml(sendKeyOf(entry)) + '"' +
             (entry.id ? ' data-delivery-id="' + escapeHtml(String(entry.id)) + '"' : '') +
             (tip ? ' title="' + escapeHtml(tip) + '"' : '') + '>' +
             cancel +
+            errorMark +
             kindBadgeHtml(entry.kind) +
             resourceIconHtml(entry) +
-            '<span class="grid-count">' + fmtCount(entry.count) + '</span>' +
+            '<span class="grid-count">' + countText + '</span>' +
             '</div>';
+    }
+
+    // 底部 dock 的显隐（用户第 3 项："有多个发送中的物品时，移除其中一个，整个 dock 会消失再出现"）：
+    // 以前一次渲染里发现两栏都空就立刻 display:none —— 而"瞬时为空"很常见：
+    //   * 客户端 30 秒超时 / 重连 / 服务端主动全量同步时，deliveries 会先被清掉再填回来；
+    //   * 缓存条目在两次推送之间被清空（例如刚发出去的那条被服务端删掉）。
+    // 现在：空态先等一小会儿（HIDE_GRACE_MS）再隐藏；期间数据回来了就取消隐藏；
+    // 并且只在"服务端确实在线"（serverSeen）时才隐藏 —— 失联时保留上一次的内容而不是整块消失。
+    const HIDE_GRACE_MS = 600;
+    let panelHideTimer = null;
+    let lastSendHtml = '';
+    let lastDeliveryHtml = '';
+
+    function scheduleDeliveryPanelHide() {
+        const panel = el('deliveryPanel');
+        if (!panel || panelHideTimer) return;
+        panelHideTimer = setTimeout(function () {
+            panelHideTimer = null;
+            if (!serverSeen) return;                       // 服务端失联/同步中：宁可留着旧内容
+            const grid = el('sendGrid');
+            const deliveryGrid = el('deliveryGrid');
+            const stillEmpty = (!grid || grid.innerHTML === '') &&
+                (!deliveryGrid || deliveryGrid.innerHTML === '');
+            if (!stillEmpty) return;
+            const node = el('deliveryPanel');
+            if (node) node.style.display = 'none';
+            syncDeliveryPanelSpacing();
+        }, HIDE_GRACE_MS);
+    }
+
+    function syncDeliveryPanelVisibility(hasAny) {
+        const panel = el('deliveryPanel');
+        if (!panel) return;
+        if (hasAny) {
+            if (panelHideTimer) {
+                clearTimeout(panelHideTimer);
+                panelHideTimer = null;
+            }
+            if (panel.style.display === 'none') panel.style.display = '';
+            return;
+        }
+        scheduleDeliveryPanelHide();
     }
 
     function renderSend() {
         const entries = Array.from(sendList.values());
         const deliveries = deliveryEntries();
-        const panel = el('deliveryPanel');
         const hasAny = entries.length > 0 || deliveries.length > 0;
-        // 两栏都空时整块面板隐藏（用户要求），页面下方不再留一条空 dock；
-        // 只在真的变化时才写 display：反复写同一个值也会让浏览器重新算布局
-        if (panel) {
-            const display = hasAny ? '' : 'none';
-            if (panel.style.display !== display) panel.style.display = display;
-        }
+        syncDeliveryPanelVisibility(hasAny);
         const grid = el('sendGrid');
         const deliveryGrid = el('deliveryGrid');
         if (!grid || !deliveryGrid) return;
         if (!hasAny) {
-            grid.innerHTML = '';
-            deliveryGrid.innerHTML = '';
+            // 立刻清空两栏（数据可能在下一次推送里就回来）；只在真的写过内容时才动 DOM
+            if (lastSendHtml !== '') {
+                grid.innerHTML = '';
+                lastSendHtml = '';
+            }
+            if (lastDeliveryHtml !== '') {
+                deliveryGrid.innerHTML = '';
+                lastDeliveryHtml = '';
+            }
             syncDeliveryPanelSpacing();
             return;
         }
-        grid.innerHTML = entries.map(function (entry) {
+        // 与资源网格同样的显示方式：类型徽标 + 图标 + 右上角 ×（移除）+ 右下角数量。
+        // 必须用 resourceIconHtml：过滤器/占位符不是物品，按 item 去查图标接口会 404，
+        // 结果就只能显示名称兜底（以前“待发送”里的过滤器图标不显示就是这个原因）。
+        const sendHtml = entries.map(function (entry) {
             const key = resourceKey(entry.kind, entry.name);
-            // 与资源网格同样的显示方式：类型徽标 + 图标 + 右上角 ×（移除）+ 右下角数量。
-            // 必须用 resourceIconHtml：过滤器/占位符不是物品，按 item 去查图标接口会 404，
-            // 结果就只能显示名称兜底（以前“待发送”里的过滤器图标不显示就是这个原因）。
             return '<div class="grid-item" data-send="' + escapeHtml(key) + '" data-tip-send="' + escapeHtml(key) + '">' +
                 kindBadgeHtml(entry.kind) +
                 '<span class="grid-mark danger" data-send-remove="' + escapeHtml(key) + '" title="' +
@@ -704,7 +815,17 @@
                 '<span class="grid-count">' + fmtCount(entry.count) + '</span>' +
                 '</div>';
         }).join('');
-        deliveryGrid.innerHTML = deliveries.map(deliveryItemHtml).join('');
+        const deliveryHtml = deliveries.map(deliveryItemHtml).join('');
+        // 内容没变就不动 DOM（用户第 3 项）：重画（资源每秒都在变 → 会带着重画一次）时
+        // 反复写同一份 HTML 会让浏览器重建这些卡片（图标重新解码、布局重排），看起来就是"闪一下"。
+        if (sendHtml !== lastSendHtml) {
+            grid.innerHTML = sendHtml;
+            lastSendHtml = sendHtml;
+        }
+        if (deliveryHtml !== lastDeliveryHtml) {
+            deliveryGrid.innerHTML = deliveryHtml;
+            lastDeliveryHtml = deliveryHtml;
+        }
         syncDeliveryPanelSpacing();
     }
 

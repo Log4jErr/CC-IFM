@@ -1,7 +1,7 @@
 // IFM :: web/ifm-translate.js
 // 物品名翻译（英 → 简体中文）：用 Bergamot（@browsermt/bergamot-translator 的 WebAssembly 版 Marian NMT）
-// 在浏览器端**离线**翻译。blocksitems 接口只给英文名，所以这里把英文显示名翻成中文，
-// 供资源网格 / 悬停详情 / 库存选择器显示；搜索时**翻译前后都能搜到**（见主脚本的 matchesSearch）。
+// 在浏览器端离线翻译。blocksitems 接口只给英文名，所以这里把英文显示名翻成中文，
+// 供资源网格 / 悬停详情 / 库存选择器显示；搜索时翻译前后都能搜到（见主脚本的 matchesSearch）。
 //
 // 说明：
 //  * 模型取自 Mozilla 的翻译数据桶（与 Firefox 本地翻译同款）：清单是
@@ -14,7 +14,7 @@
 //    旧结构（Remote Settings records / 旧版桶清单）仍然兼容，见 normalizeManifest。
 //  * wasm 运行时取自 jsDelivr 上的 @browsermt/bergamot-translator@0.4.9/worker/bergamot-translator-worker.js。
 //  * 翻译结果缓存在 localStorage：翻过的名字不会再翻第二次（页面刷新也保留）。
-//  * 全部是**懒加载**：开关关闭时不会下载任何东西，也不会发任何请求。
+//  * 全部是懒加载：开关关闭时不会下载任何东西，也不会发任何请求。
 (function () {
     'use strict';
 
@@ -185,7 +185,7 @@
         notify();
     }
 
-    // 运行时（wasm + 胶水代码）：**本地优先**（frontend/web/bergamot/，随前端一起部署），
+    // 运行时（wasm + 胶水代码）：本地优先（frontend/web/bergamot/，随前端一起部署），
     // 本地缺失/打不开才退回 jsDelivr —— 以前每次都从 CDN 拉 ~10MB，慢或被墙时界面就卡在
     // “正在加载翻译引擎”，看起来像“下载进度卡住”。
     const LOCAL_WASM_BASE = 'web/bergamot/';
@@ -200,7 +200,7 @@
                 const wasmBinary = await fetchBytes(wasmUrl);
                 console.info('[IFM] 翻译引擎来源：' + base);
                 // wasmUrl 一起带出去：实例化时优先用它做 instantiateStreaming，
-                // 这样 DevTools 里 wasm 帧带的是**真实 URL**，不会去解析合成出来的
+                // 这样 DevTools 里 wasm 帧带的是真实 URL，不会去解析合成出来的
                 // "wasm:<脚本 URL>" 源映射（用户第 4 项里控制台那条 URL 报错就来自这里）。
                 return { base: base, wasmBinary: wasmBinary, wasmUrl: wasmUrl };
             } catch (err) {
@@ -212,7 +212,7 @@
         throw new Error('翻译引擎下载失败：' + failures.join(' | '));
     }
 
-    // bergamot 的 wasm 依赖一个名为 `wasm_gemm` 的**导入模块**（intgemm 的 int8 函数）。
+    // bergamot 的 wasm 依赖一个名为 `wasm_gemm` 的导入模块（intgemm 的 int8 函数）。
     // 官方用法是在 Web Worker 里跑 worker/translator-worker.js，由它把这个模块补进 import 对象
     // （native: Firefox 的 WebAssembly.mozIntGemm；否则用 wasm 自己导出的 *Fallback 函数重映射）。
     // 我们为了进度条直接在主页面加载胶水代码，所以必须自己补上这一步 ——
@@ -227,7 +227,7 @@
         'int8_select_columns_of_b': 'int8SelectColumnsOfBFallback',
     };
 
-    /** wasm 里自带的朴素 int8 gemm（导出名 int8*Fallback），按 gemm 期望的名字重新映射 */
+    // wasm 里自带的朴素 int8 gemm（导出名 int8*Fallback），按 gemm 期望的名字重新映射
     function fallbackGemm() {
         const out = {};
         Object.keys(GEMM_MAP).forEach(function (name) {
@@ -241,7 +241,7 @@
         return out;
     }
 
-    /** 给 emscripten 的 import 对象补上 wasm_gemm（优先用 Firefox 的 mozIntGemm，失败就退回朴素实现） */
+    // 给 emscripten 的 import 对象补上 wasm_gemm（优先用 Firefox 的 mozIntGemm，失败就退回朴素实现）
     function withWasmGemm(imports) {
         let gemm = null;
         if (WebAssembly.mozIntGemm) {
@@ -277,10 +277,8 @@
                 wasmBinary: runtime.wasmBinary,
                 print: function (text) { console.log('[bergamot] ' + text); },
                 printErr: function (text) { console.warn('[bergamot] ' + text); },
-                /**
-                 * 自己实例化 wasm：这样才来得及把 wasm_gemm 塞进 import 对象。
-                 * （返回 {} 是 emscripten 约定的“实例化是异步的，等 accept 回调”。）
-                 */
+                // 自己实例化 wasm：这样才来得及把 wasm_gemm 塞进 import 对象。
+                // （返回 {} 是 emscripten 约定的“实例化是异步的，等 accept 回调”。）
                 instantiateWasm: function (imports, accept) {
                     const fail = function (err) {
                         console.error('[bergamot] wasm 实例化失败：' + ((err && err.message) || err));
@@ -293,7 +291,7 @@
                             .then(function (result) { accept(result.instance); })
                             .catch(fail);
                     };
-                    // 优先 instantiateStreaming（参数是**真实的 wasm URL**）：
+                    // 优先 instantiateStreaming（参数是真实的 wasm URL）：
                     // 用字节实例化时，DevTools 会把这一帧的“资源 URL”记成
                     // "wasm:<脚本 URL> line N > WebAssembly.instantiate"，随后去解析源映射，
                     // 在控制台留下 “URL constructor: ... is not a valid URL” 的报错（用户第 4 项）。
@@ -394,7 +392,7 @@
             });
         });
 
-        // Remote Settings：顶层数组或 { data: [...] } —— 一条记录就是**一个文件**，
+        // Remote Settings：顶层数组或 { data: [...] } —— 一条记录就是一个文件，
         // 所以同一语言对的文件要归到同一个 group（否则每个文件各成一组，拼不出完整模型）。
         const records = Array.isArray(body) ? body : (body && Array.isArray(body.data) ? body.data : []);
         records.forEach(function (record, index) {
@@ -448,7 +446,7 @@
         return sets;
     }
 
-    // ===== 模型文件来源：**本地优先** =====
+    // ===== 模型文件来源：本地优先 =====
     // 把 Mozilla 的模型随前端一起发布（frontend/web/models/en-zh/）时优先用它：
     // 走本机/局域网，比从 Google 存储桶拉 33MB 快得多，也不依赖外网。
     // 本地没有（或本地文件坏了，见 ensureModel 的回退）时才去请求 Mozilla 清单。
@@ -534,7 +532,7 @@
     }
 
     function createService(api) {
-        // 0.4.9 的 wasm 里导出的类是 **BlockingService**（官方 worker/translator-worker.js 就是这么用的：
+        // 0.4.9 的 wasm 里导出的类是 BlockingService（官方 worker/translator-worker.js 就是这么用的：
         //   new this.module.BlockingService({ cacheSize })）；
         // 旧版/别的构建才叫 TranslationService。以前只试 TranslationService，于是加载模型时
         // 报 “api.TranslationService is not a constructor”，本地模型白白下载完却用不了（1.6.9 修）。
@@ -636,7 +634,7 @@
                             sets = sets.concat(remote.sets);
                             console.info('[IFM] 本地模型不可用，改用 Mozilla 清单（' + remote.sets.length + ' 个候选）');
                         } catch (remoteErr) {
-                            // Mozilla 的清单放在 Google 存储桶上，**没有 CORS 头** —— 浏览器会直接拦下这次请求
+                            // Mozilla 的清单放在 Google 存储桶上，没有 CORS 头 —— 浏览器会直接拦下这次请求
                             // （控制台里那条 “CORS Missing Allow Origin” 就是它）。所以本地模型缺失时，
                             // 唯一可靠的办法是手动把模型放到 web/models/en-zh/ 下，而不是靠远端回退。
                             failures.push('remote manifest: ' + ((remoteErr && remoteErr.message) || remoteErr) +
@@ -710,7 +708,7 @@
         }
     }
 
-    // 交给翻译模型的文本**只能是“英文显示名”**：绝不能把模组名/注册名（create:andesite_casing）
+    // 交给翻译模型的文本只能是“英文显示名”：绝不能把模组名/注册名（create:andesite_casing）
     // 或下划线原样丢给模型（翻出来的东西会莫名其妙）。调用方通常已经传了 display_name，
     // 这里再兜一层：去掉命名空间前缀、下划线换空格（"create:andesite_casing" → "andesite casing"）。
     function cleanTranslateInput(text) {

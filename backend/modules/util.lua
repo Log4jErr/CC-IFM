@@ -83,7 +83,7 @@ function M.count(t)
 end
 
 --- ===== 日志 =====
---- CC:T 计算机磁盘有限，日志**不写文件**、也不刷屏终端：只保存最近若干条在内存环形缓冲里，
+--- CC:T 计算机磁盘有限，日志不写文件、也不刷屏终端：只保存最近若干条在内存环形缓冲里，
 --- 由 modules/protocol.lua 推送给网页（浏览器在控制台里打印）。
 local LOG_LIMIT = 200
 local logBuffer = {}
@@ -95,16 +95,41 @@ function M.setLogHandler(fn)
     logHandler = fn
 end
 
---- 追加一条日志（内部使用）
-function M.pushLog(prefix, text)
+--- ===== 日志分级（用户第 2 项）=====
+--- 三个级别：info（默认）/ warn / error，**由调用点显式指定**（`log.warn(...)` / `log.error(...)`）。
+--- 行首带标记（`[IFM] [warn] ...`）：终端与网页都能一眼看出等级，网页端按标记上色；
+--- 后端终端另外用 CC:T 的颜色区分（见 IFMMaster.lua 的日志接收者）。
+--- 注意：这里**不做关键字猜测**（用户第 2 项：不按关键字分级，级别要由调用点慢慢改）——
+--- 没写级别的就是 info。
+M.LOG_TAGS = { info = nil, warn = "[warn] ", error = "[error] " }
+
+--- 终端颜色（CC:T 没有 colors 时返回 nil：fengari 测试环境就没有）
+function M.logColour(level)
+    if type(colors) ~= "table" then
+        return nil
+    end
+    if level == "error" then
+        return colors.red
+    end
+    if level == "warn" then
+        return colors.yellow
+    end
+    return nil
+end
+
+--- 追加一条日志（内部使用）：level = "info" | "warn" | "error"（缺省 info，不做内容猜测）
+function M.pushLog(prefix, text, level)
+    level = M.LOG_TAGS[level] and level or "info"
     logSeq = logSeq + 1
-    local line = "[" .. (prefix or "IFM") .. "] " .. tostring(text)
+    local tag = M.LOG_TAGS[level]
+    local body = tag and (tag .. tostring(text)) or tostring(text)
+    local line = "[" .. (prefix or "IFM") .. "] " .. body
     logBuffer[#logBuffer + 1] = { seq = logSeq, line = line }
     while #logBuffer > LOG_LIMIT do
         table.remove(logBuffer, 1)
     end
     if logHandler then
-        pcall(logHandler, line, logSeq)
+        pcall(logHandler, line, logSeq, level)
     end
 end
 
@@ -121,8 +146,12 @@ function M.logSince(seq)
 end
 
 --- 构造日志函数（只进内存缓冲，由网页端在控制台输出）
+--- 级别接口（用户第 2 项）：logger(fmt, ...) = 信息；logger.warn(...) = 警告；logger.error(...) = 错误
+--- 为什么返回的是"可调用的表"而不是函数：Lua 里**函数既不能挂字段、也不能设元表**
+--- （`fn.warn = ...` / `setmetatable(fn, ...)` 都会报 attempt to index a function value），
+--- 所以用 setmetatable({...}, { __call = ... }) —— 照旧 `log("...")`，同时能 `log.warn("...")`。
 function M.makeLogger(prefix, enabled)
-    return function(fmt, ...)
+    local function emit(level, fmt, ...)
         if enabled == false then
             return
         end
@@ -137,8 +166,24 @@ function M.makeLogger(prefix, enabled)
         else
             msg = tostring(fmt)
         end
-        M.pushLog(prefix, msg)
+        M.pushLog(prefix, msg, level)
     end
+    return setmetatable({
+        warn = function(fmt, ...)
+            return emit("warn", fmt, ...)
+        end,
+        error = function(fmt, ...)
+            return emit("error", fmt, ...)
+        end,
+        --- 显式分级（如果调用方自己知道级别）
+        log = function(level, fmt, ...)
+            return emit(level or "info", fmt, ...)
+        end,
+    }, {
+        __call = function(_, fmt, ...)
+            return emit("info", fmt, ...)
+        end,
+    })
 end
 
 --- 简易唯一 id

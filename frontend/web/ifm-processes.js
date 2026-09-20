@@ -55,6 +55,7 @@
         if (wait === 'time') return t('processWaitTime');
         const current = record.current;
         if (!current) return '';
+        if (elementIsAbstract(current)) return t('abstractOp') + ' ' + (current.id || '');
         if (current.kind === 'item' || current.kind === 'fluid' || current.kind === 'filter') {
             const name = current.kind === 'filter'
                 ? (t('filterKind2') + ' ' + (current.id || ''))
@@ -63,8 +64,6 @@
             return current.phase === 'output' ? t('processExtracting', params) : t('processSending', params);
         }
         if (current.kind === 'placeholder') return t('placeholderKind') + ' ' + (current.name || '');
-        // 虚操作（抽象模板元素）：不是真实资源，也没有进度可言
-        if (current.kind === 'virtual') return t('virtual') + ' ' + (current.name || '');
         if (current.kind === 'waitTime') return t('processWaitTime') + ' ' + fmtCount(current.seconds || 0) + 's';
         if (current.kind === 'waitSignal') return t('processWaitSignal');
         if (current.kind === 'emitSignal') return t('emitSignal');
@@ -153,10 +152,13 @@
 
 
     // 外设卡片标题：主标题显示方块名（走 blocksitems 的方块接口，和物品一样），
-    // 拿不到元信息时回落成方块注册名；灰色小字显示**外设名**（minecraft:chest_13）——
+    // 拿不到元信息时回落成方块注册名；灰色小字显示外设名（minecraft:chest_13）——
     // 定义、容器管理、诊断里用的都是这个名字，写方块注册名（minecraft:chest）对不上。
     function peripheralTitleHtml(peripheralName) {
-        const blockId = blockIdOf(peripheralName);
+        // resolvedBlockIdOf：不带命名空间的外设名（redstone_relay_0）会先按 candidates 找到
+        // 真正存在的方块 id（computercraft:redstone_relay），这样标题与图标都正确
+        // （见 ifm-core.js 的 blockIdCandidates）。
+        const blockId = resolvedBlockIdOf(peripheralName);
         if (blockId) queueMeta('block', blockId);
         const label = blockId ? displayName('block', blockId) : String(peripheralName || '');
         return '<h3>' + blockIconHtml(peripheralName) + ' ' + escapeHtml(label) +
@@ -166,9 +168,11 @@
 
     // 外设搜索用的文本池：外设名 / 方块名 / 方块注册名 / 定义名（容器与信号）
     function peripheralSearchTexts(block) {
-        const blockId = blockIdOf(block.name) || '';
+        const raw = blockIdOf(block.name) || '';
+        const blockId = resolvedBlockIdOf(block.name) || raw;
         const texts = [
             String(block.name || ''),
+            raw,
             blockId,
             displayName('block', blockId),
             englishName('block', blockId)
@@ -206,8 +210,8 @@
         const byName = function (a, b) { return String(a.name).localeCompare(String(b.name)); };
         if (peripheralSortMode === 'block') {
             return list.sort(function (a, b) {
-                const left = displayName('block', blockIdOf(a.name)) || a.name;
-                const right = displayName('block', blockIdOf(b.name)) || b.name;
+                const left = displayName('block', resolvedBlockIdOf(a.name)) || a.name;
+                const right = displayName('block', resolvedBlockIdOf(b.name)) || b.name;
                 const diff = String(left).localeCompare(String(right));
                 return diff !== 0 ? diff : byName(a, b);
             });
@@ -292,7 +296,7 @@
         const usedByMachine = machineUsedContainerNames();
         const chips = [];
         // 1) 功能还没定义 → 未分配。
-        //    chip 自己可拖拽（拖到存储卡片 / 机器位置 = 把**这个功能**分配过去），
+        //    chip 自己可拖拽（拖到存储卡片 / 机器位置 = 把这个功能分配过去），
         //    方块卡片本身不再整体可拖拽（否则拖里面任何地方都会带动整张卡片）。
         [['item', 'inventory', 'itemContainer', 'fa-archive'],
          ['fluid', 'fluid_storage', 'fluidContainer', 'fa-tint']].forEach(function (info) {
@@ -308,7 +312,7 @@
                 '"><i class="fa fa-plus"></i></button></span>');
         });
         // 红石中继器：一个可拖拽的“信号”芯片（拖到机器的红石信号卡片 = 让那台机器用它）。
-        // 1.6.10：**已经被机器引用的中继器不再显示方块卡片**——用户要求“被机器引用后卡片应当消失”；
+        // 已经被机器引用的中继器不再显示方块卡片——被机器引用后卡片应当消失；
         // 想再给别的机器用，就从已引用它的那台机器的信号卡片拖过去（拖拽=复制归属）。
         const usedSignals = machineUsedSignalNames();
         if (block.kinds.indexOf('redstone_relay') >= 0 && !usedSignals[blockName] &&
@@ -326,6 +330,7 @@
         defs.forEach(function (def) {
             if (def.role === 'storage') return;                                        // 在存储卡片里
             if (def.role === 'input') return;                                          // 在输入卡片里
+            if (def.role === 'output') return;                                         // 在输出卡片里（1.8.0）
             if (def.role === 'interaction' && usedByMachine[String(def.name)]) return;  // 在机器卡片里
             const kind = def.kind === 'fluid' ? 'fluid' : 'item';
             chips.push('<span class="chip def-chip def-' + kind + '" draggable="true"' +
@@ -348,69 +353,164 @@
         return chips;
     }
 
-    // 存储 / 输入 容器卡片：role=storage（或 input）的容器外设按种类聚合在这里。
-    // 拖一张外设卡片进来 = 把它设成这种角色的容器；把里面的外设卡片拖到卡片外 = 删掉这条定义。
-    //   存储容器：仓库本体（库存统计的来源）
-    //   输入容器（1.6.10 新增）：人工/上游放料的中转箱 —— IFM 会定期扫它并把里面的东西搬进存储容器
+    // 存储 / 输入 / 输出 容器卡片（用户第 5/6 项）：
+    //   一**张**卡片按角色聚合（物品容器与流体容器不再分成两张），拖外设卡片进来的含义：
+    //     role=storage / input → 直接把它设成该角色的容器（种类按芯片/能力判定）；
+    //     role=output          → 弹出"已经填好外设与角色"的容器定义卡片，名称留给用户填。
+    //   拖出去（或点 ×）= 删掉这条定义。
     function containerRoleCardsHtml(role, config) {
-        const byKind = { item: [], fluid: [] };
+        const defs = [];
         Array.from(stores.containers.values()).forEach(function (def) {
-            if (def.role !== role) return;
-            byKind[def.kind === 'fluid' ? 'fluid' : 'item'].push(def);
+            if (def.role === role) defs.push(def);
         });
-        const card = function (kind, titleKey, icon) {
-            const defs = byKind[kind].sort(function (a, b) {
-                return (Number(b.priority || 0) - Number(a.priority || 0)) ||
-                    String(a.name).localeCompare(String(b.name));
-            });
-            const chips = defs.map(function (def) {
-                const peripheral = String(def.peripheral || '');
-                const priority = Number(def.priority || 0);
-                const badge = (role === 'storage' && priority !== 0)
-                    ? ' <span class="muted" title="' + escapeHtml(t('containerPriority')) + '">P' +
-                      escapeHtml(String(priority)) + '</span>'
-                    : '';
-                return '<span class="chip pc-chip" draggable="true"' +
-                    ' data-pc-peripheral="' + escapeHtml(peripheral) + '"' +
-                    ' data-pc-def="' + escapeHtml(def.name) + '"' +
-                    ' data-pc-kind="' + escapeHtml(kind) + '"' +
-                    ' data-pc-role="' + escapeHtml(role) + '"' +
-                    ' data-edit-container="' + escapeHtml(containerKeyOf(def)) + '"' +
-                    ' title="' + escapeHtml(peripheral + ' · ' + t(config.roleLabelKey) + ' · ' + t('clickToEdit')) + '">' +
-                    '<i class="fa ' + (kind === 'fluid' ? 'fa-tint' : 'fa-archive') + '"></i>' +
-                    ' <span class="chip-text">' + escapeHtml(peripheral || def.name) + '</span>' + badge +
-                    '<button class="btn-pixel danger chip-del" type="button" data-pc-role-remove="' + escapeHtml(role) + '" title="' +
-                    escapeHtml(t(config.removeKey)) + '"><i class="fa fa-times"></i></button>' +
-                    '</span>';
-            }).join('');
-            const dropAttr = role === 'storage'
-                ? ' data-storage-drop="' + escapeHtml(kind) + '"'
-                : ' data-input-drop="' + escapeHtml(kind) + '"';
-            return '<div class="card-block storage-card"' + dropAttr + '>' +
-                '<div class="card-head">' +
-                '<h3><i class="fa ' + icon + '"></i> ' + escapeHtml(t(titleKey)) +
-                ' <span class="muted">' + defs.length + '</span></h3>' +
-                '</div>' +
-                '<div class="chip-list">' + (chips ||
-                    ('<span class="muted slot-empty">' + escapeHtml(t(config.hintKey)) + '</span>')) +
-                '</div></div>';
-        };
-        return card('item', config.itemKey, 'fa-archive') + card('fluid', config.fluidKey, 'fa-tint');
+        defs.sort(function (a, b) {
+            const kindA = a.kind === 'fluid' ? 'fluid' : 'item';
+            const kindB = b.kind === 'fluid' ? 'fluid' : 'item';
+            if (kindA !== kindB) return kindA < kindB ? -1 : 1;
+            return (Number(b.priority || 0) - Number(a.priority || 0)) ||
+                String(a.name).localeCompare(String(b.name));
+        });
+        const chips = defs.map(function (def) {
+            const peripheral = String(def.peripheral || '');
+            const kind = def.kind === 'fluid' ? 'fluid' : 'item';
+            const priority = Number(def.priority || 0);
+            // 用户第 2 项：输出容器可以自己命名（存储 / 输入容器的定义名就是外设名）——
+            // 名字和外设名不同时额外显示，一眼认出这条定义。
+            const defLabel = String(def.name || '');
+            const hasLabel = defLabel !== '' && defLabel !== peripheral;
+            const badge = (role === 'storage' && priority !== 0)
+                ? ' <span class="muted" title="' + escapeHtml(t('containerPriority')) + '">P' +
+                  escapeHtml(String(priority)) + '</span>'
+                : '';
+            return '<span class="chip pc-chip" draggable="true"' +
+                ' data-pc-peripheral="' + escapeHtml(peripheral) + '"' +
+                ' data-pc-def="' + escapeHtml(def.name) + '"' +
+                ' data-pc-kind="' + escapeHtml(kind) + '"' +
+                ' data-pc-role="' + escapeHtml(role) + '"' +
+                ' data-edit-container="' + escapeHtml(containerKeyOf(def)) + '"' +
+                ' title="' + escapeHtml(peripheral + (hasLabel ? ' (' + defLabel + ')' : '') + ' · ' +
+                    t(config.roleLabelKey) + ' · ' + t('clickToEdit')) + '">' +
+                '<i class="fa ' + (kind === 'fluid' ? 'fa-tint' : 'fa-archive') + '"></i>' +
+                ' <span class="chip-text">' + escapeHtml(peripheral || def.name) + '</span>' +
+                (hasLabel ? '<span class="muted"> ' + escapeHtml(defLabel) + '</span>' : '') + badge +
+                '<button class="btn-pixel danger chip-del" type="button" data-pc-role-remove="' + escapeHtml(role) + '" title="' +
+                escapeHtml(t(config.removeKey)) + '"><i class="fa fa-times"></i></button>' +
+                '</span>';
+        }).join('');
+        const dropAttr = ' data-' + role + '-drop="any"';
+        return '<div class="card-block storage-card"' + dropAttr + '>' +
+            '<div class="card-head">' +
+            '<h3><i class="fa ' + (config.icon || 'fa-archive') + '"></i> ' + escapeHtml(t(config.cardKey)) +
+            ' <span class="muted">' + defs.length + '</span></h3>' +
+            '</div>' +
+            '<div class="chip-list">' + (chips ||
+                ('<span class="muted slot-empty">' + escapeHtml(t(config.hintKey)) + '</span>')) +
+            '</div></div>';
     }
 
     function storageCardsHtml() {
         return containerRoleCardsHtml('storage', {
-            itemKey: 'storageItemCard', fluidKey: 'storageFluidCard',
+            cardKey: 'storageCard', icon: 'fa-archive',
             hintKey: 'storageDropHint', removeKey: 'storageRemove', roleLabelKey: 'storage',
         });
     }
 
-    // 输入容器卡片（1.6.10）：与存储卡片同构，但角色是 input、drop 属性是 data-input-drop
+    // 输入容器卡片（1.6.10）：与存储卡片同构，但角色是 input
     function inputCardsHtml() {
         return containerRoleCardsHtml('input', {
-            itemKey: 'inputItemCard', fluidKey: 'inputFluidCard',
+            cardKey: 'inputCard', icon: 'fa-download',
             hintKey: 'inputDropHint', removeKey: 'inputRemove', roleLabelKey: 'inputRole',
         });
+    }
+
+    // 输出容器卡片（1.8.0，用户第 6 项）：所有 role=output 的容器外设。
+    // 拖外设进来不直接建定义，而是打开容器定义弹窗（外设/种类/角色=输出已填好，名称等用户填）。
+    function outputCardsHtml() {
+        return containerRoleCardsHtml('output', {
+            cardKey: 'outputCard', icon: 'fa-upload',
+            hintKey: 'outputDropHint', removeKey: 'outputRemove', roleLabelKey: 'outputRole',
+        });
+    }
+
+    // ===================== 外设卡片的批量选择（用户第 6 项） =====================
+    //   * Ctrl / Cmd + 左键点**外设芯片**（方块卡片里的"未分配功能"芯片 / 机器卡片里的外设芯片）= 加入或移出选择；
+    //   * 在外设面板或机器面板里按住**右键拖动** = 框选（松开时把框到的芯片设为选择；按住 Ctrl 则追加）；
+    //   * 选中多个时，拖其中任意一个 = 把选中的全部一起拖过去（类型不匹配的自动忽略并汇总提示）；
+    //   * 点面板空白处 / Esc = 清空选择。
+    // 本轮第 3 项：命中目标是**外设卡片（芯片）**而不是方块卡片 —— 这样能只选某个方块的某个外设；
+    // 并且机器卡片里的外设芯片也能框选（以前不行）。
+    // 选择只按外设名记在内存里：重画（每秒都可能发生）后依然保留，卡片不在了就自动移出。
+    const selectedPeripheralCards = new Set();
+
+    function peripheralSelected(name) {
+        return selectedPeripheralCards.has(String(name || ''));
+    }
+
+    function peripheralSelection() {
+        return Array.from(selectedPeripheralCards);
+    }
+
+    function togglePeripheralSelection(name) {
+        const key = String(name || '');
+        if (!key) return;
+        if (selectedPeripheralCards.has(key)) {
+            selectedPeripheralCards.delete(key);
+        } else {
+            selectedPeripheralCards.add(key);
+        }
+        renderPeripherals();
+    }
+
+    /// 整体替换选择（框选用）
+    function setPeripheralSelection(names, additive) {
+        if (!additive) selectedPeripheralCards.clear();
+        asArray(names).forEach(function (name) {
+            if (name) selectedPeripheralCards.add(String(name));
+        });
+        renderPeripherals();
+    }
+
+    function clearPeripheralSelection() {
+        if (selectedPeripheralCards.size === 0) return;
+        selectedPeripheralCards.clear();
+        renderPeripherals();
+    }
+
+    /// 机器卡片里当前看得见的外设名（本轮第 3 项：机器内的外设卡片也参与框选，
+    /// 所以"选择清理"必须把它们算作仍然可见，否则选完下一秒重画就被清掉）
+    function machinePeripheralNames() {
+        const present = {};
+        Array.from(stores.machines.values()).forEach(function (machine) {
+            ['in', 'out'].forEach(function (slotId) {
+                machineSlotEntries(machine, slotId).forEach(function (entry) {
+                    if (entry.peripheral) present[String(entry.peripheral)] = true;
+                });
+            });
+            machineSlotEntries(machine, 'signal').forEach(function (entry) {
+                if (entry.peripheral) present[String(entry.peripheral)] = true;
+            });
+        });
+        return present;
+    }
+
+    /// 卡片已经不在面板里（被分配进机器/容器、或外设拔出）→ 从选择里去掉，别"看不见却被拖着走"。
+    /// 机器卡片里的外设芯片也是"看得见的外设卡片"（本轮第 3 项），所以一并算进 present。
+    function prunePeripheralSelection(blocks) {
+        if (selectedPeripheralCards.size === 0) return;
+        const present = machinePeripheralNames();
+        asArray(blocks).forEach(function (block) { present[String(block.name)] = true; });
+        selectedPeripheralCards.forEach(function (name) {
+            if (!present[name]) selectedPeripheralCards.delete(name);
+        });
+    }
+
+    /// 面板标题旁的"已选 N 张外设卡片"提示（让用户知道拖一下会带走几张）
+    function renderPeripheralSelectionHint() {
+        const node = el('peripheralSelHint');
+        if (!node) return;
+        const count = selectedPeripheralCards.size;
+        node.textContent = count > 0 ? t('peripheralSelected', { n: count }) : '';
+        node.title = count > 0 ? t('peripheralSelectedHint') : '';
     }
 
     function renderPeripherals() {
@@ -431,24 +531,38 @@
             blocks.set(item.name, block);
         });
         const query = parseSearchQuery(peripheralSearchText);
-        // 只显示“还有未分配功能 / 还有孤立定义”的方块卡片（用户要求：不再显示物品容器、流体容器那些单独的块）
-        const list = sortPeripheralList(Array.from(blocks.values())
+        // 只显示“还有未分配功能 / 还有孤立定义”的方块卡片（不再显示物品容器、流体容器那些单独的块）
+        const allBlocks = Array.from(blocks.values())
             .map(function (block) {
                 block.chips = peripheralUnassignedChips(block);
                 return block;
             })
-            .filter(function (block) { return block.chips.length > 0; })
-            .filter(function (block) { return peripheralMatchesSearch(block, query); }));
+            .filter(function (block) { return block.chips.length > 0; });
+        // 选择里已经不存在的卡片（被分配进机器/容器后卡片消失）→ 自动移出
+        prunePeripheralSelection(allBlocks);
+        const list = sortPeripheralList(allBlocks.filter(function (block) {
+            return peripheralMatchesSearch(block, query);
+        }));
         const html = list.map(function (block) {
-            // 注意：**卡片本身不可拖拽**（用户反馈：拖卡片内部的外设芯片时会把整张卡片拖走）。
+            // 注意：卡片本身不可拖拽（用户反馈：拖卡片内部的外设芯片时会把整张卡片拖走）。
             // 拖拽源是卡片里的每个芯片（未分配功能 / 孤立定义），见 peripheralUnassignedChips。
-            return '<div class="card-block">' +
-                peripheralTitleHtml(block.name) +
+            // 用户第 6 项：卡片支持批量选择（Ctrl+点击 / 右键框选），选中的卡片带 .selected 高亮，
+            // 它的芯片样式由 CSS（.card-block.selected .chip）统一处理。
+            const selected = peripheralSelected(block.name);
+            return '<div class="card-block' + (selected ? ' selected' : '') + '"' +
+                ' data-peripheral-card="' + escapeHtml(block.name) + '">' +
+                // 标题行本身可拖（用户第 6 项）：拖卡片标题 = 把这张（或选中的那一批）外设拖到机器/容器卡片上；
+                // 卡片里的芯片仍然各自可拖（带各自的种类）。不写 data-drag-kind：种类按外设自己的能力推断。
+                '<div class="peripheral-card-head" draggable="true"' +
+                ' data-drag-peripheral="' + escapeHtml(block.name) + '"' +
+                ' title="' + escapeHtml(t('peripheralDragHint')) + '">' +
+                peripheralTitleHtml(block.name) + '</div>' +
                 '<div class="chip-list">' + block.chips.join('') + '</div>' +
                 '</div>';
         }).join('');
         el('peripheralList').innerHTML = html ||
             ('<span class="muted">' + escapeHtml(t('peripheralsAllAssigned')) + '</span>');
+        renderPeripheralSelectionHint();
 
         // 机器类型卡片、存储容器卡片、缺失外设：各自一块（显示顺序由 index.html 决定）
         const machineBox = el('machineTypeList');
@@ -458,6 +572,9 @@
         // 输入容器卡片（1.6.10）：与存储卡片同构，角色是 input
         const inputBox = el('inputList');
         if (inputBox) inputBox.innerHTML = inputCardsHtml();
+        // 输出容器卡片（1.8.0，用户第 6 项）：role=output —— 拖外设进来会弹出容器定义弹窗
+        const outputBox = el('outputList');
+        if (outputBox) outputBox.innerHTML = outputCardsHtml();
         const missing = Array.from(stores.missing.values()).filter(function (item) {
             return missingMatchesSearch(item, query);
         }).sort(function (a, b) { return String(a.name).localeCompare(String(b.name)); });
@@ -465,8 +582,14 @@
         if (missingBox) {
             missingBox.innerHTML = missing.length > 0
                 ? ('<div class="card-block" style="border-color:var(--bad)">' +
+                    '<div class="card-head">' +
                     '<h3><i class="fa fa-exclamation-triangle"></i> ' + escapeHtml(t('missingPeripheral')) +
                     ' <span class="muted">' + missing.length + '</span></h3>' +
+                    // 用户第 2 项：一键删除 —— 所有缺失定义一次删掉（单条删除是 chip 里的垃圾桶按钮）
+                    '<button class="btn-pixel danger" type="button" data-delete-missing-all="1" title="' +
+                    escapeHtml(t('missingDeleteAllHint')) + '"><i class="fa fa-trash"></i> ' +
+                    escapeHtml(t('missingDeleteAll')) + '</button>' +
+                    '</div>' +
                     '<div class="chip-list">' + missing.map(missingChipHtml).join('') + '</div></div>')
                 : '';
         }
@@ -483,8 +606,21 @@
         { id: 'signal', icon: 'fa-bolt', label: 'machineSlotSignal' },
     ];
 
+    // 用户第 3 项：机器槽位里的外设卡片要能标出"这个引用指向的外设已经不在了"（红框）。
+    // 判定来源是服务端的「外设缺失」列表（Containers:missingPeripherals）：它给出的条目是
+    // { kind = "container" | "signal", name = 定义名 } —— 卡片上的键与它一一对应。
+    // 用服务端下发的列表（而不是前端自己猜"定义没了/外设没了"）可以避免推送还没到时的闪烁。
+    function missingReferenceSet() {
+        const set = new Set();
+        Array.from(stores.missing.values()).forEach(function (item) {
+            set.add(String(item.kind || '') + ':' + String(item.name || ''));
+        });
+        return set;
+    }
+
     // 某个位置上的外设卡片清单（容器定义 → 背后的外设；信号定义 → 背后的红石外设）
-    function machineSlotEntries(machine, slotId) {
+    function machineSlotEntries(machine, slotId, missingRefs) {
+        const refs = missingRefs || missingReferenceSet();
         const out = [];
         if (slotId === 'signal') {
             asArray(machine.signals).forEach(function (name) {
@@ -493,7 +629,8 @@
                     defName: name,
                     kind: 'signal',
                     // 信号定义还没回推时用定义名兜底（信号定义名通常就是外设名）
-                    peripheral: def ? String(def.peripheral || '') : String(name || '')
+                    peripheral: def ? String(def.peripheral || '') : String(name || ''),
+                    missing: refs.has('signal:' + String(name || ''))
                 });
             });
             return out;
@@ -509,15 +646,18 @@
                     kind: pair[0],
                     // 非输出容器的定义名就是外设名（服务端 Store:containerNameFor）：
                     // 定义还没回推时也能直接显示成外设名，不会闪一下“缺失外设”
-                    peripheral: def ? String(def.peripheral || '') : String(name || '')
+                    peripheral: def ? String(def.peripheral || '') : String(name || ''),
+                    missing: refs.has('container:' + String(name || ''))
                 });
             });
         });
         return out;
     }
 
-    // 位置卡片里的外设卡片：可拖拽 —— 拖到别的位置 = 换位置，拖到机器卡片外 = 从这台机器移出
-    function machinePeripheralCardHtml(machine, slotId, entry) {
+    // 位置卡片里的外设卡片：可拖拽 —— 拖到别的位置 = 换位置，拖到机器卡片外 = 从这台机器移出。
+    // 只读机器（用户第 3 项：海龟合成器）里的卡片例外：不能拖、也没有 × 删除按钮 ——
+    // 这些外设是后端按海龟自动生成/收回的归属，人工删掉没有意义。
+    function machinePeripheralCardHtml(machine, slotId, entry, readOnly) {
         const kind = entry.kind;
         const badgeTitle = kind === 'signal' ? t('machineSlotSignal')
             : t(slotId === 'in'
@@ -526,40 +666,82 @@
         const badgeClass = kind === 'signal' ? 'chip-badge kind-signal' : 'chip-badge kind-' + kind + '-' + slotId;
         const badgeIcon = kind === 'fluid' ? 'fa-tint' : (kind === 'signal' ? 'fa-bolt' : 'fa-cube');
         const peripheral = String(entry.peripheral || '');
-        const missing = peripheral === '';
+        // 用户第 3 项：这条引用指向的外设不在了（服务端的缺失列表里有它）→ 卡片加红框
+        const missing = peripheral === '' || entry.missing === true;
         const text = missing ? entry.defName : peripheral;
-        // 标题里写清“哪个外设 + 在机器的哪个位置”：名字太长被省略号截断时靠它看全
-        const title = (missing ? t('missingPeripheral') + ': ' + entry.defName : peripheral) + ' · ' + badgeTitle;
-        return '<span class="chip pc-chip" draggable="true"' +
+        // 用户第 2 项：输出容器允许自己命名 —— 名字和外设名不一样时补一个灰色标签，
+        // 机器卡片里也能一眼看出这个位置接的是哪条定义。
+        const defLabel = String(entry.defName || '');
+        const hasLabel = !missing && defLabel !== '' && defLabel !== peripheral;
+        // 标题里写清“哪个外设 / 哪条定义 + 在机器的哪个位置”：名字太长被省略号截断时靠它看全
+        const title = (missing ? t('missingPeripheral') + ': ' + entry.defName : peripheral) +
+            (hasLabel ? ' (' + defLabel + ')' : '') + ' · ' + badgeTitle;
+        // 本轮第 3 项：机器卡片里的外设芯片也能被选中（框选 / Ctrl+点击）—— 选中的带 .selected
+        const selectedChip = peripheral !== '' && peripheralSelected(peripheral);
+        return '<span class="chip pc-chip' + (readOnly ? ' chip-readonly' : '') +
+            (missing ? ' chip-missing' : '') +
+            (selectedChip ? ' selected' : '') + '"' +
+            (readOnly ? '' : ' draggable="true"') +
             ' data-pc-peripheral="' + escapeHtml(peripheral) + '"' +
             ' data-pc-machine="' + escapeHtml(machine.name) + '"' +
             ' data-pc-slot="' + escapeHtml(slotId) + '"' +
             ' data-pc-kind="' + escapeHtml(kind) + '"' +
             ' data-pc-def="' + escapeHtml(entry.defName) + '"' +
+            (readOnly ? ' data-pc-readonly="1"' : '') +
             ' title="' + escapeHtml(title) + '">' +
             '<span class="' + badgeClass + '" title="' + escapeHtml(badgeTitle) + '">' +
             '<i class="fa ' + badgeIcon + '"></i></span>' +
             (missing ? '' : blockIconHtml(peripheral)) +
             ' <span class="chip-text">' + escapeHtml(text) + '</span>' +
-            '<button class="btn-pixel danger chip-del" type="button" data-pc-remove="1" title="' +
-            escapeHtml(t('machineRemove')) + '"><i class="fa fa-times"></i></button>' +
+            (hasLabel ? '<span class="muted"> ' + escapeHtml(defLabel) + '</span>' : '') +
+            (readOnly ? '' :
+                '<button class="btn-pixel danger chip-del" type="button" data-pc-remove="1" title="' +
+                escapeHtml(t('machineRemove')) + '"><i class="fa fa-times"></i></button>') +
             '</span>';
     }
     // 机器类型卡片（含机器卡片）+ 没有归属类型的机器：拼进「外设与定义」板块的末尾
     // 层级：机器类型卡片 → 机器卡片 → 输入容器 / 输出容器 / 红石信号 → 外设卡片
+    // 预设机器类型（后端 Store.TURTLE_CRAFTER_TYPE）：机器由海龟自动出现
+    const TURTLE_CRAFTER_TYPE = 'turtle_crafter';
+
+    /// 机器类型显示名（用户第 1 项）：预设类型在网页上本地化（turtle_crafter → 海龟合成器），
+    /// 用户自定义类型原样显示（没有译文就退回原始类型名）。
+    const MACHINE_TYPE_LABEL_KEYS = { turtle_crafter: 'machineTypeTurtleCrafter' };
+    function machineTypeLabel(name) {
+        const key = MACHINE_TYPE_LABEL_KEYS[String(name)];
+        if (!key) return String(name);
+        const text = t(key);
+        return (text && text !== key) ? text : String(name);
+    }
+
     function machinesHtml() {
         const machines = Array.from(stores.machines.values());
         machines.sort(function (a, b) { return a.name.localeCompare(b.name); });
+        // 用户第 3 项：机器卡片里的外设卡片 / 位置框靠它标红（= 服务端「缺失外设」列表里的定义）
+        const missingRefs = missingReferenceSet();
         const machineCard = function (machine) {
             const parallel = machine.parallel || 1;
             const running = machine.running || 0;
             const percent = Math.min(100, Math.round(running / Math.max(1, parallel) * 100));
-            const slots = MACHINE_SLOTS.map(function (info) {
-                const entries = machineSlotEntries(machine, info.id);
+            // 只读机器（用户第 5 项 / 本轮第 1 项）：自动生成的机器（virtual = true，海龟合成器）
+            // **以及预设类型的机器**都只读 —— 不能点开编辑、不给红石信号位置
+            //（信号只能人工配置；海龟机器的输入/输出就是海龟自己）。
+            // 以前只按 virtual 判定：手工建的 / 旧配置里的同类型机器照样显示红石信号。
+            const readOnly = machine.virtual === true || machineTypeIsReadOnly(machine.type);
+            const slotInfos = readOnly ? MACHINE_SLOTS.filter(function (info) {
+                return info.id !== 'signal';
+            }) : MACHINE_SLOTS;
+            const slots = slotInfos.map(function (info) {
+                const entries = machineSlotEntries(machine, info.id, missingRefs);
                 const cards = entries.map(function (entry) {
-                    return machinePeripheralCardHtml(machine, info.id, entry);
+                    return machinePeripheralCardHtml(machine, info.id, entry, readOnly);
                 }).join('');
-                return '<div class="machine-slot" data-machine-slot="' + escapeHtml(info.id) + '"' +
+                // 用户第 3 项：这个位置里有"外设已缺失"的卡片 → 位置框也标红
+                const slotMissing = entries.some(function (entry) {
+                    return String(entry.peripheral || '') === '' || entry.missing === true;
+                });
+                return '<div class="machine-slot' + (slotMissing ? ' slot-missing' : '') + '"' +
+                    ' data-machine-slot="' + escapeHtml(info.id) + '"' +
                     ' data-machine="' + escapeHtml(machine.name) + '">' +
                     '<div class="slot-head"><i class="fa ' + info.icon + '"></i> ' +
                     escapeHtml(t(info.label)) + '</div>' +
@@ -567,10 +749,13 @@
                         ('<span class="muted slot-empty">' + escapeHtml(t('machineSlotEmpty')) + '</span>')) +
                     '</div></div>';
             }).join('');
-            return '<div class="machine-card" data-edit-machine="' + escapeHtml(machine.name) + '"' +
+            return '<div class="machine-card"' + (readOnly ? '' :
+                ' data-edit-machine="' + escapeHtml(machine.name) + '"') +
                 ' data-machine-card="' + escapeHtml(machine.name) + '">' +
                 '<h4><i class="fa fa-cog"></i> ' + escapeHtml(machine.name) +
                 (machine.usable === false ? ' <span class="muted">(' + escapeHtml(t('missingPeripheral')) + ')</span>' : '') +
+                (readOnly ? ' <span class="muted" title="' + escapeHtml(t('machineReadOnlyHint')) + '">(' +
+                    escapeHtml(t('machineReadOnly')) + ')</span>' : '') +
                 ' <span class="muted">' + escapeHtml(t('machineUsed')) + ' ' + running + '/' + parallel + '</span></h4>' +
                 '<div class="progress"><div class="bar' + (percent >= 100 ? ' bad' : (percent > 0 ? ' warn' : '')) +
                 '" style="width:' + percent + '%"></div></div>' +
@@ -578,8 +763,13 @@
                 '</div>';
         };
 
-        // 机器类型卡片右上角的「+ 机器」：新建的机器自动属于该类型（机器名仍按类型自动推导）
+        // 机器类型卡片右上角的「+ 机器」：新建的机器自动属于该类型（机器名仍按类型自动推导）。
+        // 预设类型 turtle_crafter 例外（用户第 1 项）：它的机器由海龟自己出现（后端 syncTurtleCrafters），
+        // 手工加机器没有意义 —— 这里只显示一句说明，不给按钮。
         const addMachineButton = function (type) {
+            if (type === TURTLE_CRAFTER_TYPE) {
+                return '<span class="muted">' + escapeHtml(t('machineAutoTurtle')) + '</span>';
+            }
             return '<button class="btn-pixel primary" type="button" data-add-machine="' + escapeHtml(type) +
                 '" title="' + escapeHtml(t('addMachineHint')) + '"><i class="fa fa-plus"></i> ' +
                 escapeHtml(t('machine')) + '</button>';
@@ -590,9 +780,18 @@
         let html = types.map(function (item) {
             const children = machines.filter(function (machine) { return machine.type === item.name; });
             if (children.length > 0) usedTypes[item.name] = true;
-            return '<div class="card-block" data-edit-machine-type="' + escapeHtml(item.name) + '">' +
+            const typeLabel = machineTypeLabel(item.name);
+            // 用户第 3 项：预设类型（海龟合成器）的卡片不给编辑入口 —— 它没有人工可配的东西
+            //（机器由海龟自动出现）。属性不写，点击委托里也再挡一次（见 ifm-app.js）。
+            const typeEditable = !machineTypeIsReadOnly(item.name);
+            return '<div class="card-block"' + (typeEditable
+                ? ' data-edit-machine-type="' + escapeHtml(item.name) + '"'
+                : ' data-machine-type-card="' + escapeHtml(item.name) + '"') +
+                '>' +
                 '<div class="card-head">' +
-                '<h3><i class="fa fa-cubes"></i> ' + escapeHtml(item.name) +
+                '<h3><i class="fa fa-cubes"></i> ' + escapeHtml(typeLabel) +
+                (typeLabel === item.name ? '' :
+                    ' <span class="muted">(' + escapeHtml(item.name) + ')</span>') +
                 ' <span class="muted">' + children.length + ' ' + escapeHtml(t('machine')) + '</span></h3>' +
                 addMachineButton(item.name) +
                 '</div>' +
@@ -661,7 +860,7 @@
         return displayName(kind, id);
     }
 
-    // 材料节点的图标：**在 mermaid 渲染完成后**再写进 DOM（见 applyGraphIcons）。
+    // 材料节点的图标：在 mermaid 渲染完成后再写进 DOM（见 applyGraphIcons）。
     // 为什么不直接写在 mermaid 的节点标签里：节点标签会被 mermaid 自己加工（HTML 标签在它手里
     // 不可靠：实测 <img> 到不了最终 SVG 里），于是标签只剩一个定尺占位符，
     // 渲染完拿到真正的 DOM 之后再把图标塞进去 —— 和资源网格用的是同一套图标逻辑
@@ -767,8 +966,8 @@
             return nodeId;
         };
         const isMaterial = function (element) {
-            // 虚操作（抽象模板元素）不是真实资源：它在依赖图里连节点都不建
-            if (element.kind === 'virtual') return false;
+            // 抽象操作（注册名 = abstract 的物品/流体元素）不是真实资源：它在依赖图里连节点都不建
+            if (elementIsAbstract(element)) return false;
             return element.kind === 'item' || element.kind === 'fluid' ||
                 element.kind === 'filter' || element.kind === 'placeholder';
         };
@@ -787,15 +986,39 @@
             details.push('', t('tipGraphClick'));
             nodeTooltip.set(nodeId, { title: processTitleText(process), lines: details });
             lines.push('    ' + nodeId + '(("' + GRAPH_DOT + '"))');
-            asArray(process.inputs).forEach(function (element) {
-                if (!isMaterial(element)) return;
-                const materialId = materialNode(materialKindOf(element), materialIdOf(element));
-                if (materialId) edgeLines.push('    ' + materialId + ' --> ' + nodeId);
+            // 用户第 1/2 项：同一种材料在同一个流程里可能出现在多条元素上（例如 9 条 1x Iron Nugget）。
+            //   ① **聚合**：材料 ↔ 流程之间每个材料只留一条连线（以前 N 条重复连线叠在一起）；
+            //   ② 连线两端都标注"这个流程合成一次消耗 / 产出的此项目总数"（Σ 各条数量）。
+            const materialEdges = function (list, amountOf) {
+                const totals = new Map();
+                const order = [];
+                asArray(list).forEach(function (element) {
+                    if (!isMaterial(element)) return;
+                    const materialId = materialNode(materialKindOf(element), materialIdOf(element));
+                    if (!materialId) return;
+                    if (!totals.has(materialId)) {
+                        totals.set(materialId, 0);
+                        order.push(materialId);
+                    }
+                    totals.set(materialId, totals.get(materialId) + amountOf(element));
+                });
+                return order.map(function (materialId) {
+                    return { materialId: materialId, amount: totals.get(materialId) };
+                });
+            };
+            const inputAmount = function (element) {
+                return Math.max(1, Math.round(Number(element.count) || 1));
+            };
+            const outputAmount = function (element) {
+                return Math.max(1, Math.round(Number(element.max) || 1));
+            };
+            // 用户第 2 项：连线两端都标注"这个流程合成一次消耗 / 产出的此项目总数"（Σ 各条数量）：
+            //   材料 → 流程  = 消耗总数（Σ count）        流程 → 产物 = 产出总数（Σ max）
+            materialEdges(process.inputs, inputAmount).forEach(function (edge) {
+                edgeLines.push('    ' + edge.materialId + ' -->|"' + escapeHtml(fmtCount(edge.amount)) + 'x"| ' + nodeId);
             });
-            asArray(process.outputs).forEach(function (element) {
-                if (!isMaterial(element)) return;
-                const materialId = materialNode(materialKindOf(element), materialIdOf(element));
-                if (materialId) edgeLines.push('    ' + nodeId + ' --> ' + materialId);
+            materialEdges(process.outputs, outputAmount).forEach(function (edge) {
+                edgeLines.push('    ' + nodeId + ' -->|"' + escapeHtml(fmtCount(edge.amount)) + 'x"| ' + edge.materialId);
             });
         });
         // mermaid 的 JS 回调必须写成 `click <id> call <fn>()`（写成 `click <id> <fn>` 会被当成链接）

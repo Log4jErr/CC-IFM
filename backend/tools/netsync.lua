@@ -7,7 +7,7 @@
 
     同步流程(严格按这个顺序):
       1. 抓取服务端文件清单
-      2. **把所有文件完整下载到内存**(任何一个文件失败就整体放弃, 磁盘保持原样)
+      2. 把所有文件完整下载到内存(任何一个文件失败就整体放弃, 磁盘保持原样)
       3. 全部下载成功后才开始写盘(逐文件覆盖, 目录按需创建)
       4. 写盘成功后记录版本号到 /.netsync/<name>.version
       5. 重启整台计算机(os.reboot)
@@ -294,7 +294,7 @@ local function resolveDest(rel)
     return fs.combine("/", rel)
 end
 
--- 第 2 步: 把服务端的一个文件**完整读进内存**(失败返回 nil, 不碰磁盘)
+-- 第 2 步: 把服务端的一个文件完整读进内存(失败返回 nil, 不碰磁盘)
 local function fetchFile(server, entry, index, total)
     local size = entry.size or 0
     if size <= 0 then
@@ -402,7 +402,7 @@ local function syncFrom(server)
         return false
     end
     --- 空清单 = 服务端的同步根目录里什么都没有（或者里面的东西全被跳过规则过滤了）。
-    --- **绝不能当成同步成功**：那样客户端会记下这个版本号，服务端之后放了文件也不会再来取
+    --- 绝不能当成同步成功：那样客户端会记下这个版本号，服务端之后放了文件也不会再来取
     --- （版本号没变就不算"有新版本"）。这里按失败处理，等下一次广播重试。
     if #files == 0 then
         log("server returned 0 files: its sync root (%s/%s) is empty, or everything inside is excluded",

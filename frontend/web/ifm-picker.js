@@ -94,10 +94,18 @@
             '" style="width:' + width + 'px"></span>';
     }
 
+    // 元素行列表的容器 id：必须与 index.html 里的固定 id 不重名
+    // （#inputList 是「外设与定义」板块的输入容器卡片，页面里排在编辑弹窗前面 ——
+    // 重名时 el('inputList') 拿到的是它，新加的材料行会被塞进那个隐藏板块，
+    // 表现就是“新建流程时加不了输入材料”，见 window.ifmAddElement）。
+    function elementRowListId(side) {
+        return side === 'input' ? 'elementInputList' : 'elementOutputList';
+    }
+
     function elementRowHtml(side, element) {
         const data = element || {};
         const kind = data.kind || 'item';
-        // 虚操作（抽象模板）在输入与输出都能放；占位符只在输出里
+        // 占位符只在输出里（输入里放占位符没有意义）；其余种类输入/输出都能放
         const kinds = ELEMENT_KINDS.filter(function (item) {
             return side === 'output' || (item !== 'placeholder');
         });
@@ -111,12 +119,6 @@
         parts.push('<span class="element-icon" data-element-icon></span>');
         parts.push('<span data-when="item fluid filter"><span class="muted">' + escapeHtml(t('name')) +
             '</span> <span class="id-slot">' + elementIdControl(kind, data.id) + '</span></span>');
-        // 虚操作：只要一个名字（不指向任何真实资源），含虚操作的流程是抽象模板，不能合成
-        parts.push('<span data-when="virtual" class="muted">' + escapeHtml(t('name')) +
-            ' <input type="text" class="e-vname" value="' + escapeHtml(data.name || '') +
-            '" style="width:150px" placeholder="' + escapeHtml(t('virtual')) + '" title="' +
-            escapeHtml(t('virtualHint')) + '"></span>');
-        parts.push('<span data-when="virtual" class="muted">' + escapeHtml(t('virtualHint')) + '</span>');
         parts.push('<span data-when="item fluid filter" class="muted">' + escapeHtml(t('nbtHash')) +
             ' <input type="text" class="e-nbt" value="' + escapeHtml(data.nbt || '') + '" style="width:120px" placeholder="' +
             escapeHtml(t('nbtAny')) + '"></span>');
@@ -126,7 +128,9 @@
             parts.push(numberField('item fluid filter', t('amount'), 'e-count', data.count === undefined ? 1 : data.count, 70));
             parts.push(numberField('item fluid filter', t('containerIndex'), 'e-container',
                 (data.containerIndex === undefined || data.containerIndex === -1) ? '' : data.containerIndex, 60));
-            parts.push(numberField('item fluid filter', t('slot'), 'e-slot',
+            // 用户第 2 项：**流体从不指定槽位** —— 「槽位序号」只对物品元素显示
+            // （输出侧的流体抽取也从不指定槽位，见 modules/recipe.lua）。
+            parts.push(numberField('item', t('slot'), 'e-slot',
                 (data.slot === undefined || data.slot === -1) ? '' : data.slot, 60));
         } else {
             parts.push(numberField('item fluid filter', t('min'), 'e-min', data.min || 0, 60));
@@ -186,10 +190,15 @@
             const kind = kindSelect ? kindSelect.value : 'item';
             const idNode = row.querySelector('.e-id');
             const id = idNode ? String(idNode.value || '').trim() : '';
-            if (kind === 'virtual' || kind === 'placeholder') {
-                // 虚操作 / 占位符不是真实资源：直接显示类型字形（cog / 图钉），不必去查图标接口
+            if (elementIsAbstract({ kind: kind, id: id })) {
+                // 抽象操作（注册名 = abstract）：不是真实资源，显示一个字形即可（也不去查图标接口）
+                holder.innerHTML = '<i class="fa ' + iconGlyphClass('abstract') + '"></i>';
+                holder.setAttribute('title', t('abstractHint'));
+                return;
+            }
+            if (kind === 'placeholder') {
                 holder.innerHTML = '<i class="fa ' + iconGlyphClass(kind) + '"></i>';
-                holder.setAttribute('title', t(kind === 'virtual' ? 'virtualHint' : 'placeholderKind'));
+                holder.setAttribute('title', t('placeholderKind'));
                 return;
             }
             if ((kind !== 'item' && kind !== 'fluid') || !id) {
@@ -199,7 +208,10 @@
             }
             const realKind = kind === 'fluid' ? 'fluid' : 'item';
             queueMeta(realKind, id);
-            holder.innerHTML = plainIconImg(realKind, id);
+            // 元素行的「NBT 哈希」也一起交给图标层：能对上就挑 NBT 最接近的导出变体，
+            // 对不上（CC:T 只给哈希、导出侧是 components 表）就用同一个注册名的图标
+            const nbtNode = row.querySelector('.e-nbt');
+            holder.innerHTML = plainIconImg(realKind, id, nbtNode ? String(nbtNode.value || '').trim() : '');
             holder.setAttribute('title', displayName(kind, id));
             if (metaState(resourceKey(realKind, id)) === 'unknown') pending = true;
         });
@@ -211,13 +223,38 @@
         }
     }
 
+    // 用户第 3 项：一键清掉所有"注册名 = abstract"的物品/流体操作（输入与输出一起清）。
+    // 抽象操作只是"以后要换成真实材料/产物"的占位步骤（见 ifm-core.js 的 elementIsAbstract）。
+    window.ifmClearAbstractOps = function () {
+        let removed = 0;
+        Array.prototype.forEach.call(document.querySelectorAll('#editorBody .element-row'), function (row) {
+            const kindSelect = row.querySelector('.e-kind');
+            const kind = kindSelect ? kindSelect.value : '';
+            if (kind !== 'item' && kind !== 'fluid') return;
+            const idNode = row.querySelector('.e-id');
+            const id = idNode ? String(idNode.value || '').trim() : '';
+            if (id.toLowerCase() !== IFM_ABSTRACT_ID) return;
+            if (row.parentNode) row.parentNode.removeChild(row);
+            removed += 1;
+        });
+        if (removed > 0) {
+            refreshElementIcons();
+            toast(t('clearAbstractOpsDone', { n: removed }), 'success');
+            return;
+        }
+        toast(t('clearAbstractOpsNone'), 'info');
+    };
+
     window.ifmRemoveElement = function (button) {
         const row = button.closest('.element-row');
         if (row) row.remove();
     };
 
     window.ifmAddElement = function (side) {
-        const list = el(side === 'input' ? 'inputList' : 'outputList');
+        // 注意：这里不能叫 inputList / outputList —— 页面里「外设与定义」板块的输入容器卡片
+        // 也叫 #inputList，而它在 DOM 里排在编辑弹窗前面，`el('inputList')` 会先拿到它，
+        // 新加的材料行就被塞进那个隐藏板块（看起来“加不了材料”，只有产物能加）。见 elementRowListId。
+        const list = el(elementRowListId(side));
         if (!list) return;
         const holder = document.createElement('div');
         holder.innerHTML = elementRowHtml(side, { kind: 'item' });
@@ -268,7 +305,9 @@
                     nbt: elementRowValue(row, '.e-nbt'),
                     ignoreNbt: elementRowIgnoreNbt(row),
                     containerIndex: elementRowNumber(row, '.e-container', -1),
-                    slot: elementRowNumber(row, '.e-slot', -1)
+                    // 用户第 2 项：流体从不指定槽位（这一栏只对物品元素存在）——
+                    // 其它种类一律记成 -1 = 未指定，老配置里残留的槽位也在这里被丢掉。
+                    slot: kind === 'item' ? elementRowNumber(row, '.e-slot', -1) : -1
                 };
                 if (!entry.id) return;
                 if (side === 'input') {
@@ -284,11 +323,6 @@
                 const placeholderItem = elementRowValue(row, '.e-pitem');
                 if (!placeholderName || !placeholderItem) return;
                 out.push({ kind: kind, name: placeholderName, item: placeholderItem });
-            } else if (kind === 'virtual') {
-                // 虚操作：只有一个名字（抽象模板元素，含它的流程不能合成）
-                const virtualName = elementRowValue(row, '.e-vname');
-                if (!virtualName) return;
-                out.push({ kind: kind, name: virtualName });
             } else if (kind === 'waitSignal' || kind === 'emitSignal' || kind === 'emitPulse') {
                 const sides = [];
                 Array.prototype.forEach.call(row.querySelectorAll('.e-side'), function (box) {
@@ -357,8 +391,8 @@
         }
         const maxField = el('fldMaxMultiplier');
         if (maxField) maxField.value = Math.max(1, Math.floor(Number(source.maxMultiplier) || 1));
-        const inputList = el('inputList');
-        const outputList = el('outputList');
+        const inputList = el(elementRowListId('input'));
+        const outputList = el(elementRowListId('output'));
         if (inputList) {
             inputList.innerHTML = asArray(source.inputs).map(function (item) {
                 return elementRowHtml('input', deepClone(item));
@@ -381,7 +415,7 @@
         const suggestions = suggestionValues().map(function (value) {
             return '<option value="' + escapeHtml(value) + '"></option>';
         }).join('');
-        // 复制来源：只列同一机器类型的流程；带虚操作的抽象模板排在最前（见 processCopyCandidates）
+        // 复制来源：只列同一机器类型的流程；抽象流程排在最前（见 processCopyCandidates）
         const copyRow = fieldRow(t('copyProcessFrom'),
             '<span style="display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap">' +
             '<select id="fldCopyFrom" style="min-width:200px">' +
@@ -389,22 +423,30 @@
             '<button class="btn-pixel" type="button" onclick="window.ifmProcessCopySettings()">' +
             '<i class="fa fa-clone"></i> ' + escapeHtml(t('copyProcessApply')) + '</button></span>') +
             '<div class="muted" style="margin:-4px 0 6px 0">' + escapeHtml(t('copyProcessHint')) + '</div>';
+        // 用户第 3 项：一键清除所有 abstract 操作（输入与输出里的物品/流体注册名 = abstract）
+        const abstractRow = fieldRow(t('abstractOp'),
+            '<span style="display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap">' +
+            '<button class="btn-pixel danger" type="button" onclick="window.ifmClearAbstractOps()">' +
+            '<i class="fa fa-eraser"></i> ' + escapeHtml(t('clearAbstractOps')) + '</button>' +
+            '<span class="muted">' + escapeHtml(t('clearAbstractOpsHint')) + '</span></span>');
         return fieldRow(t('machineTypeField'), selectHtml('fldMachineType', machineTypeOptions(), data.machineType, true,
                 'onchange="window.ifmProcessMachineTypeChanged(this)"')) +
             copyRow +
+            abstractRow +
             fieldRow(t('maxMultiplier'), numberInput('fldMaxMultiplier', data.maxMultiplier || 1, 1, 1)) +
             '<datalist id="ifmSuggestions">' + suggestions + '</datalist>' +
             '<div class="editor-block"><h4>' + escapeHtml(t('inputs')) +
             '<button class="btn-pixel" type="button" onclick="window.ifmAddElement(\'input\')"><i class="fa fa-plus"></i> ' +
             escapeHtml(t('add')) + '</button></h4>' +
-            '<div id="inputList">' + inputs.map(function (item) { return elementRowHtml('input', item); }).join('') + '</div>' +
+            '<div id="' + elementRowListId('input') + '">' + inputs.map(function (item) { return elementRowHtml('input', item); }).join('') + '</div>' +
             '<div class="muted">' + escapeHtml('流程名会按首个产物自动生成；材料名可手输，也可从“从库存选择…”下拉里挑选；' +
                 '容器序号/槽位留空等同 -1（任意容器 / 任意空槽）；输入为空表示流程只输出产物。') + '</div>' +
+            '<div class="muted">' + escapeHtml(t('abstractHint')) + '</div>' +
             '</div>' +
             '<div class="editor-block"><h4>' + escapeHtml(t('outputs')) +
             '<button class="btn-pixel" type="button" onclick="window.ifmAddElement(\'output\')"><i class="fa fa-plus"></i> ' +
             escapeHtml(t('add')) + '</button></h4>' +
-            '<div id="outputList">' + outputs.map(function (item) { return elementRowHtml('output', item); }).join('') + '</div>' +
+            '<div id="' + elementRowListId('output') + '">' + outputs.map(function (item) { return elementRowHtml('output', item); }).join('') + '</div>' +
             '<div class="muted">' + escapeHtml('抽取按“最多数目”进行，达到“最少数目”即视为该产物完成；优先级越大越先被选作上游。') + '</div>' +
             '</div>';
     }

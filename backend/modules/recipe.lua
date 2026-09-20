@@ -7,10 +7,10 @@ Recipe.__index = Recipe
 
 local MAX_CHAIN_DEPTH = 8
 
---- 抽象模板（含“虚操作”元素的流程）不能执行 / 合成：它只作为“流程设置复制”的来源。
+--- 抽象流程（含"注册名 = abstract"的物品/流体操作的流程）不能执行 / 合成：它只作为"流程设置复制"的来源。
 --- 网页上把这类流程排在下拉框最前，就是让用户先复制它再去改真实材料。
-local TEMPLATE_MESSAGE = "\\u6A21\\u677F\\uFF08\\u542B\\u865A\\u64CD\\u4F5C\\uFF09\\u4E0D\\u80FD\\u7528\\u4E8E\\u5408\\u6210\\uFF0C\\u53EA\\u80FD\\u4F5C\\u4E3A\\u6D41\\u7A0B\\u8BBE\\u7F6E\\u7684\\u590D\\u5236\\u6765\\u6E90"
-local TEMPLATE_FROZEN = "\\u6D41\\u7A0B\\u662F\\u62BD\\u8C61\\u6A21\\u677F\\uFF08\\u542B\\u865A\\u64CD\\u4F5C\\uFF09\\uFF0C\\u4E0D\\u80FD\\u6267\\u884C\\uFF1A\\u53EA\\u80FD\\u7528\\u4E8E\\u590D\\u5236\\u6D41\\u7A0B\\u8BBE\\u7F6E"
+local ABSTRACT_MESSAGE = "\\u62BD\\u8C61\\u6D41\\u7A0B\\uFF08\\u542B abstract \\u64CD\\u4F5C\\uFF09\\u4E0D\\u80FD\\u7528\\u4E8E\\u5408\\u6210\\uFF0C\\u53EA\\u80FD\\u4F5C\\u4E3A\\u6D41\\u7A0B\\u8BBE\\u7F6E\\u7684\\u590D\\u5236\\u6765\\u6E90"
+local ABSTRACT_FROZEN = "\\u6D41\\u7A0B\\u662F\\u62BD\\u8C61\\u6D41\\u7A0B\\uFF08\\u542B abstract \\u64CD\\u4F5C\\uFF09\\uFF0C\\u4E0D\\u80FD\\u6267\\u884C\\uFF1A\\u53EA\\u80FD\\u7528\\u4E8E\\u590D\\u5236\\u6D41\\u7A0B\\u8BBE\\u7F6E"
 
 --- 未指定方向时的默认方向：六面全开（网页端新建元素时默认也是六面全选）
 local ALL_SIDES = { "top", "bottom", "left", "right", "front", "back" }
@@ -116,6 +116,10 @@ function Recipe.new(opts)
     self.stepBudget = 1
     --- 存储整理（网页手动触发）：每个 tick 最多执行多少次搬运，避免一次整理卡住主循环
     self.compactOpsPerTick = opts.compactOpsPerTick or 3
+    --- 自动整理的空槽位阈值（用户第 4 项）：存储容器空槽位比例 ≥ 它时**不整理**
+    --- （空槽位还够多，搬来搬去没意义）；默认 0.10 = 空槽位不足 10% 才整理。
+    --- 网页「设置」里可改，见 Recipe:setCompactFreeRatio / Store.SCHEDULE_COMPACT_FREE_DEFAULT。
+    self.compactFreeRatio = tonumber(opts.compactFreeRatio) or 0.10
     --- 引擎存活信息（诊断用）：tick 次数、最后一次 tick 时间、最后一次 tick 异常
     self.tickCount = 0
     self.lastTickAt = 0
@@ -130,10 +134,10 @@ function Recipe:record(name)
     return self.Cache:proc(name)
 end
 
---- 该流程是不是“抽象模板”（含虚操作元素）：模板不能执行、不能被选作上游、不能下单合成，
---- 只作为网页“流程设置复制”的来源。
-function Recipe:isTemplate(process)
-    return self.Store.processHasVirtual(process)
+--- 该流程是不是"抽象流程"（含注册名为 abstract 的物品/流体操作）：抽象流程不能执行、
+--- 不能被选作上游、不能下单合成，只作为网页"流程设置复制"的来源。
+function Recipe:isAbstract(process)
+    return self.Store.processIsAbstract(process)
 end
 
 --- 该类型的全部机器定义（按名称排序）
@@ -522,7 +526,7 @@ function Recipe:resumePendingMove(token)
         moved, err = self.Containers:pushFluid(record.container, record.want, record.fluid, record.target, queueName)
     else
         moved, err = self.Containers:pushItem(record.container, record.slot, record.want, record.target,
-            record.toSlot, record.mode, queueName)
+            record.toSlot, record.mode, queueName, record.item)
     end
     if err == "pending" then
         return nil, "pending"
@@ -541,6 +545,11 @@ end
 function Recipe:transferIn(spec, itemTargets, fluidTargets, toSlot, amount, token, opts)
     --- 1.7.0：这次搬运进哪条队列（默认"库存输入" = 送料进机器；发货用 opts.queue = "inventoryOut"）
     local queueName = (type(opts) == "table" and opts.queue) or "inventoryIn"
+    --- 用户第 2 项：流体**从不指定槽位**（流程里的"输入流体槽位"参数已移除）——
+    --- 老配置里残留的值也一律忽略，免得"看起来指定了、实际不起作用"。
+    if type(spec) == "table" and spec.kind == "fluid" then
+        toSlot = nil
+    end
     if amount <= 0 then
         return 0, nil
     end
@@ -671,6 +680,12 @@ function Recipe:alreadyInTargets(spec, itemTargets, fluidTargets)
             return
         end
         seen[name] = true
+        --- 用户规则：interaction / output 容器**不可读**（读它们会直接报错）——
+        --- 于是"机器里已经有这些材料"这件事无从得知，这里一律记 0：
+        --- 引擎只按成功推送量记账（与海龟盲容器同一语义）。
+        if not self.Containers:isReadableContainer(name) then
+            return
+        end
         total = total + self.Containers:countIn(name, spec)
     end
     for _, target in ipairs(itemTargets or {}) do
@@ -727,9 +742,16 @@ function Recipe:transferFailureReason(machine, element, itemTargets, fluidTarget
         .. "\\uFF08\\u5BB9\\u5668\\u5DF2\\u6EE1\\u3001\\u69FD\\u4F4D\\u4E0D\\u5339\\u914D\\u6216\\u8BE5\\u7269\\u54C1\\u4E0D\\u652F\\u6301\\u81EA\\u52A8\\u63D2\\u5165\\uFF09")
 end
 
---- 输出：从机器输出容器抽取匹配资源到存储容器
---- token：同 transferIn（同一逻辑抽取每次传同一个值，见在飞搬运的记忆）
-function Recipe:transferOut(spec, machine, amount, token)
+--- 输出：从机器输出容器抽取产物到存储容器。
+--- token：同 transferIn（同一逻辑抽取每次传同一个值，见在飞搬运的记忆）。
+--- opts.fromSlot：流程"输出产物"元素里填的槽位序号（盲抽用；nil = 交给外设自己找第一个非空槽）。
+---
+--- 用户规则（见 modules/containers.lua 顶部"读取规则"）：**interaction / output 角色的容器绝不可读**
+---（读一次要在搬运前多等 1 个游戏刻，输入/输出速度直接减半）。所以对这类容器改成**盲抽**：
+---不读内容、不按种类筛选，直接把指定槽位（或外设自己找的槽位）里的东西推到存储容器，
+---完成判定只按成功搬运量记账（record.outProgress）与"机器自己推进存储的增量"（storageGain）。
+---只有可读的机器输出容器（storage/input 角色）才保持旧的精确抽取（先读、按种类筛）。
+function Recipe:transferOut(spec, machine, amount, token, opts)
     if amount <= 0 then
         return 0, nil
     end
@@ -742,6 +764,38 @@ function Recipe:transferOut(spec, machine, amount, token)
     end
     local moved = 0
     local reason
+    --- 盲抽的源槽位：流程"输出产物"里填的槽位序号（nil = 让外设自己找第一个非空槽）
+    --- 用户第 2 项：抽取按**内容快照**决策；只有"物品类"产物才用"槽位序号"作为限定
+    --- （流体从不指定槽位 —— 流程编辑器里流体元素已不再提供该输入框）。
+    local fromSlot = (spec.kind ~= "fluid" and type(opts) == "table") and tonumber(opts.fromSlot) or nil
+    if fromSlot ~= nil and fromSlot < 1 then
+        fromSlot = nil
+    end
+    --- 单次推送 + 记账。返回 got（0/n）；返回 nil,"pending" = 已交给 worker，调用方要立刻 return moved,"pending"
+    local function pushOne(source, target, slot, want)
+        local got, err = self.Containers:pushItem(source, slot, want, target, nil,
+            --- 机器产物进存储容器要快：优先放进能一次放下、余量最小的槽位（1.6.11）
+            self.Containers.INSERT_SPEED, "inventoryOut",
+            --- 用户第 2 项：把"想抽的物品"一起交给 Containers —— 盲源（海龟）要靠它去查源槽位
+            { name = spec.id, nbt = spec.nbt })
+        if err == "pending" then
+            self:rememberPendingMove(token, {
+                kind = "item", container = source, slot = slot,
+                want = want, target = target, toSlot = nil,
+                mode = self.Containers.INSERT_SPEED,
+                --- 续传时同样要带上它：不然盲源又拿不到槽位（见 resumePendingMove）
+                item = { name = spec.id, nbt = spec.nbt },
+            })
+            return nil, "pending"
+        end
+        got = tonumber(got) or 0
+        if got > 0 then
+            self.Containers:invalidate()
+        elseif err then
+            reason = reason or err
+        end
+        return got, nil
+    end
     if token then
         --- 上一次这条抽取交给了 worker、还没回报：先取它的结果（绝不再扫输出容器重发）
         local got, pendingReason = self:resumePendingMove(token)
@@ -762,39 +816,31 @@ function Recipe:transferOut(spec, machine, amount, token)
             end
             local peripheralName = self.Containers:peripheralOf(source, "item")
             if peripheralName then
+                --- 用户第 2/3 项（1.9.0）：输出容器**一律按快照抽取** —— 交互容器现在也会被扫描
+                --- （海龟由它自己上报物品栏，见 Containers:applyScan + Transfer.onCrafterInventory）：
+                ---   * 只抽快照里与产物匹配的槽位（同名 + 同 NBT，由 Filter:specMatches 判）；
+                ---   * 跳过已被其它任务认领的脏槽位（用户第 3 项）；
+                ---   * opts.fromSlot（流程"输出产物"里填的槽位序号）现在只是**限定**：填了它就只抽那一个槽位；
+                ---   * 旧的"按固定槽位盲抽"分支已删除：拿不到快照 = 这一轮什么都不做（pushItem 会给出原因）。
                 for _, stack in ipairs(self.Containers:stacksPeripheral(peripheralName)) do
                     if moved >= amount then
                         break
                     end
                     local resource = { kind = "item", name = stack.name, nbt = stack.nbt }
-                    if self.Filter:specMatches(spec, resource) then
+                    local slotAllowed = (fromSlot == nil) or (tonumber(stack.slot) == fromSlot)
+                    if slotAllowed and self.Filter:specMatches(spec, resource)
+                        and not self.Containers:isDirtySlot(peripheralName, stack.slot, false) then
                         for _, target in ipairs(itemTargets) do
                             if moved >= amount then
                                 break
                             end
                             local want = math.min(amount - moved, stack.count)
                             if want > 0 then
-                                local got, err = self.Containers:pushItem(source, stack.slot, want, target, nil,
-                                    --- 机器产物进存储容器要快：优先放进能一次放下、余量最小的槽位（1.6.11）
-                                    self.Containers.INSERT_SPEED, "inventoryOut")
-                                if err == "pending" then
-                                    self:rememberPendingMove(token, {
-                                        kind = "item",
-                                        container = source,
-                                        slot = stack.slot,
-                                        want = want,
-                                        target = target,
-                                        mode = self.Containers.INSERT_SPEED,
-                                    })
+                                local got, pending = pushOne(source, target, stack.slot, want)
+                                if pending then
                                     return moved, "pending"
                                 end
-                                got = tonumber(got) or 0
-                                if got > 0 then
-                                    moved = moved + got
-                                    self.Containers:invalidate()
-                                elseif err then
-                                    reason = reason or err
-                                end
+                                moved = moved + got
                             end
                         end
                     end
@@ -809,12 +855,15 @@ function Recipe:transferOut(spec, machine, amount, token)
             end
             local peripheralName = self.Containers:peripheralOf(source, "fluid")
             if peripheralName then
+                --- 用户第 2/3 项：输出容器的储罐也按快照抽取（跳过已被认领的脏储罐）；
+                --- "盲抽流体"分支已随盲路径一起删除。
                 for _, tank in ipairs(self.Containers:tanksPeripheral(peripheralName)) do
                     if moved >= amount then
                         break
                     end
                     local resource = { kind = "fluid", name = tank.name }
-                    if self.Filter:specMatches(spec, resource) then
+                    if self.Filter:specMatches(spec, resource)
+                        and not self.Containers:isDirtySlot(peripheralName, tank.tank, true) then
                         for _, target in ipairs(fluidTargets) do
                             if moved >= amount then
                                 break
@@ -846,16 +895,26 @@ function Recipe:transferOut(spec, machine, amount, token)
     return moved, reason
 end
 
---- 机器输出容器中剩余的可抽取数量
+--- 用户第 2 项（1.9.0）：所有角色的容器都会被扫描（interaction / output 也一样，海龟由它自己上报），
+--- 所以**不存在"按设计不可读"的机器输出容器**了 —— 这里恒为 false。
+--- 保留函数是为了调用点（"等机器产出"的文案判断）不必改动。
+function Recipe:machineOutputsBlind(spec, machine)
+    return false
+end
+
+--- 机器输出容器中剩余的可抽取数量（用户第 2/3 项：所有角色的容器都有内容快照，
+--- 所以一律按快照算）。抽取完成判定仍然以记账为主：record.outProgress 与 storageGain。
 function Recipe:machineRemaining(spec, machine)
     local total = 0
     if spec.kind ~= "fluid" then
         for _, source in ipairs(self:outputContainers(machine, "item")) do
-            local peripheralName = self.Containers:peripheralOf(source, "item")
-            if peripheralName then
-                for _, stack in ipairs(self.Containers:stacksPeripheral(peripheralName)) do
-                    if self.Filter:specMatches(spec, { kind = "item", name = stack.name, nbt = stack.nbt }) then
-                        total = total + stack.count
+            if self.Containers:isReadableContainer(source, "item") then
+                local peripheralName = self.Containers:peripheralOf(source, "item")
+                if peripheralName then
+                    for _, stack in ipairs(self.Containers:stacksPeripheral(peripheralName)) do
+                        if self.Filter:specMatches(spec, { kind = "item", name = stack.name, nbt = stack.nbt }) then
+                            total = total + stack.count
+                        end
                     end
                 end
             end
@@ -863,11 +922,13 @@ function Recipe:machineRemaining(spec, machine)
     end
     if spec.kind ~= "item" then
         for _, source in ipairs(self:outputContainers(machine, "fluid")) do
-            local peripheralName = self.Containers:peripheralOf(source, "fluid")
-            if peripheralName then
-                for _, tank in ipairs(self.Containers:tanksPeripheral(peripheralName)) do
-                    if self.Filter:specMatches(spec, { kind = "fluid", name = tank.name }) then
-                        total = total + tank.amount
+            if self.Containers:isReadableContainer(source, "fluid") then
+                local peripheralName = self.Containers:peripheralOf(source, "fluid")
+                if peripheralName then
+                    for _, tank in ipairs(self.Containers:tanksPeripheral(peripheralName)) do
+                        if self.Filter:specMatches(spec, { kind = "fluid", name = tank.name }) then
+                            total = total + tank.amount
+                        end
                     end
                 end
             end
@@ -936,12 +997,12 @@ function Recipe:outputMatchesInput(output, element)
 end
 
 --- 查找可以产出该输入元素的上游流程（按输出优先级从高到低）
---- 抽象模板（含虚操作）永远不能当上游：它只是“流程设置复制”的来源，不能真的生产东西。
+--- 抽象流程（含 abstract 操作）永远不能当上游：它只是"流程设置复制"的来源，不能真的生产东西。
 function Recipe:upstreamCandidates(processName, element)
     local result = {}
     local index = {}
     for _, other in ipairs(self.Store:list("processes")) do
-        if other.name ~= processName and not self:isTemplate(other) then
+        if other.name ~= processName and not self:isAbstract(other) then
             for _, output in ipairs(other.outputs or {}) do
                 local yieldPerBatch = 0
                 if output.kind == "item" or output.kind == "fluid" or output.kind == "filter" then
@@ -1248,7 +1309,9 @@ function Recipe:stepInput(process, record, machine, now)
                         spec,
                         itemTargets,
                         fluidTargets,
-                        element.slot,
+                        --- 用户第 2 项：只有**物品**元素才用"槽位序号"；流体元素从不指定槽位
+                        --- （流程编辑器里流体元素已经不再提供该输入框）。
+                        (element.kind == "item") and element.slot or nil,
                         short,
                         "in:" .. tostring(process.name) .. "\1" .. tostring(key),
                         --- 给机器送料要快：从存储容器优先抽数量最多的那几堆（1.6.11）
@@ -1299,6 +1362,18 @@ function Recipe:stepInput(process, record, machine, now)
         end
     end
     if index > #inputs then
+        --- turtle_crafter（用户第 3 项）：材料全部到位后先让海龟合成一次，再进入抽产物阶段。
+        --- craft 指令是"发出去就不管"的（合成器不回报状态），所以这里只看"有没有空闲合成器"：
+        --- 没有就停在本相位、下个 tick 再试 —— 免得流程以为已经合成过而直接去抽空气。
+        if self.Store.isTurtleCrafter(machine) then
+            local status = self:requestMachineCraft(process, record, machine)
+            if status ~= "sent" then
+                record.wait = { kind = "craft", machine = machine.name }
+                record.lastError = "\\u7B49\\u5F85\\u6D77\\u9F9F\\u5408\\u6210\\u5668\\u7A7A\\u95F2"
+                self.Cache:markDirty()
+                return
+            end
+        end
         record.phase = "output"
         record.index = 1
         record.outProgress = {}
@@ -1308,6 +1383,32 @@ function Recipe:stepInput(process, record, machine, now)
         record.index = index
         self.Cache:markDirty()
     end
+end
+
+--- 请这台机器的海龟合成（turtle_crafter）：返回 "sent" = 指令已发出 / "idle" = 没有空闲合成器。
+--- 合成链路由 IFMMaster 挂上（setCraftProvider）；没挂时（纯引擎测试）直接放行，不阻塞流程。
+function Recipe:requestMachineCraft(process, record, machine)
+    if type(self.craftProvider) ~= "function" then
+        return "sent"
+    end
+    local ok, status = pcall(self.craftProvider, {
+        machine = machine.name,
+        crafter = machine.name,                 -- 虚拟机器的名字就是海龟的网络外设名
+        process = process.name,
+        batch = record.batch,
+        key = table.concat({ tostring(process.name), tostring(record.batch or 0),
+            tostring(record.startedAt or 0), tostring(machine.name) }, "|"),
+    })
+    if not ok then
+        self.log("Process %s: craft request failed: %s", tostring(process.name), tostring(status))
+        return "idle"
+    end
+    return status
+end
+
+--- 合成链路（IFMMaster 挂 `Transfer:requestCraft`）：function(spec) -> "sent" / "idle"
+function Recipe:setCraftProvider(provider)
+    self.craftProvider = provider
 end
 
 --- 进入输出阶段前记录目标产量与基线
@@ -1387,7 +1488,10 @@ function Recipe:stepOutput(process, record, machine, now)
                 index = index + 1
             else
                 local moved, reason = self:transferOut(spec, machine, maxAmount - collected,
-                    "out:" .. tostring(process.name) .. "\1" .. tostring(key))
+                    "out:" .. tostring(process.name) .. "\1" .. tostring(key),
+                    --- 用户第 2/3 项：抽取按**内容快照**决策；只有物品元素才用"槽位序号"（限定），
+                    --- 流体从不指定槽位（流程编辑器里流体元素不再提供该输入框）。
+                    { fromSlot = (element.kind == "item") and element.slot or nil })
                 if reason == "pending" then
                     -- 产物抽取已交给 IFMWorker：本 tick 不推进（下个 tick 继续等同一个任务）；
                     -- 已经回报的那部分照样记账（否则会重复抽取，见材料输入那一段的说明）。
@@ -1409,8 +1513,8 @@ function Recipe:stepOutput(process, record, machine, now)
                     if leftover <= 0 and (collected >= minAmount or gained >= minAmount) then
                         index = index + 1
                     elseif leftover > 0 then
-                        -- 产物确实在机器输出容器里，但搬不到存储容器
-                        -- （输出容器不支持被抽取 / 目标已满 / 不在同一有线网络 / 槽位不符 / 同一个外设）
+                        -- 产物确实在机器输出容器里（这一支必然读过它），但搬不到存储容器：
+                        -- 原因只打印真实返回值，不列举"槽位不符"这类读才能知道的猜测
                         record.index = index
                         local outText = "\\u673A\\u5668 " .. tostring(machine.name) .. " \\u7684\\u8F93\\u51FA\\u5BB9\\u5668\\u91CC\\u8FD8\\u6709 "
                             .. tostring(element.id) .. "\\uFF0C\\u4F46\\u642C\\u4E0D\\u5230\\u5B58\\u50A8\\u5BB9\\u5668\\uFF1A" .. tostring(reason or "\\u672A\\u80FD\\u642C\\u8FD0\\u4EFB\\u4F55\\u7269\\u54C1")
@@ -1425,12 +1529,21 @@ function Recipe:stepOutput(process, record, machine, now)
                         end
                         return
                     else
-                        -- 机器尚未产出足够产物：下个 tick 重试（顺便把“等机器产出”写进卡片，5 秒最多一次）
+                        -- 机器尚未产出足够产物：下个 tick 重试（顺便把"等机器产出"写进卡片，5 秒最多一次）。
+                        -- 不可读的输出容器（interaction / output）我们**没看里面** —— 所以只说"等抽取量够了"，
+                        -- 绝不写"输出容器里还没有该产物"（那是读一眼才知道的判断，写了就是撒谎）。
                         record.index = index
                         if leftover <= 0 and (record.lastError == nil or now - (record.lastStallAt or 0) >= 5000) then
                             record.lastStallAt = now
-                            record.lastError = "\\u7B49\\u5F85\\u673A\\u5668 " .. tostring(machine.name) .. " \\u4EA7\\u51FA "
-                                .. tostring(element.id) .. "\\uFF08\\u8F93\\u51FA\\u5BB9\\u5668\\u91CC\\u8FD8\\u6CA1\\u6709\\u8BE5\\u4EA7\\u7269\\uFF09"
+                            local prefix = "\\u7B49\\u5F85\\u673A\\u5668 " .. tostring(machine.name) .. " \\u4EA7\\u51FA "
+                                .. tostring(element.id)
+                            local note
+                            if self:machineOutputsBlind(spec, machine) then
+                                note = "\\uFF08\\u8F93\\u51FA\\u5BB9\\u5668\\u6309\\u8BBE\\u8BA1\\u4E0D\\u8BFB\\uFF0C\\u53EA\\u6309\\u62BD\\u53D6\\u91CF\\u5224\\u5B9A\\uFF09"
+                            else
+                                note = "\\uFF08\\u8F93\\u51FA\\u5BB9\\u5668\\u91CC\\u8FD8\\u6CA1\\u6709\\u8BE5\\u4EA7\\u7269\\uFF09"
+                            end
+                            record.lastError = prefix .. note
                             self.log("Process %s waiting for output %s from machine %s",
                                 process.name, tostring(element.id), tostring(machine.name))
                         end
@@ -1534,16 +1647,16 @@ end
 --- 推进单个流程（每个 tick 调用一次，绝不阻塞）
 function Recipe:stepProcess(process, now)
     local record = self:record(process.name)
-    -- 抽象模板（含虚操作元素）：永远不推进（也绝不允许被下单/当作上游）。
-    -- 用户可能把一个正在跑的流程改成模板：这里把它冻结，避免拿虚操作当真实材料去搬运。
-    if self:isTemplate(process) then
-        if record.state ~= "missing" or record.lastError ~= TEMPLATE_FROZEN then
+    -- 抽象流程（含 abstract 操作）：永远不推进（也绝不允许被下单/当作上游）。
+    -- 用户可能把一个正在跑的流程改成抽象流程：这里把它冻结，避免拿 abstract 当真实材料去搬运。
+    if self:isAbstract(process) then
+        if record.state ~= "missing" or record.lastError ~= ABSTRACT_FROZEN then
             record.state = "missing"
             record.wait = nil
             record.batch = 0
-            record.lastError = TEMPLATE_FROZEN
+            record.lastError = ABSTRACT_FROZEN
             self.Cache:markDirty()
-            self.log("Process %s is an abstract template (virtual element), not runnable", tostring(process.name))
+            self.log("Process %s is an abstract process (element id 'abstract'), not runnable", tostring(process.name))
         end
         return
     end
@@ -1731,6 +1844,12 @@ function Recipe:addDelivery(entry)
             if entry.processName and not existing.processName then
                 existing.processName = entry.processName
             end
+            --- 用户第 5 项（"发送中的数量变成了两倍"）：合并本身是刻意的（同一目标容器 + 同一资源的
+            --- 多次发送并成一条，避免点两次就排两条），但以前完全无声 —— 网页上只看到一条 762 的
+            --- 记录，没人知道那是两次 381 并起来的。现在明确记一行（终端 + 网页控制台都能看到）。
+            self.log("Delivery %s extended by %s: %s x%s -> %s (total %s)",
+                tostring(existing.id or 0), tostring(extra), tostring(existing.name),
+                tostring(existing.remaining), tostring(existing.container), tostring(existing.total))
             existing.lastError = nil
             self.Cache:markDirty()
             return existing
@@ -1805,6 +1924,18 @@ function Recipe:processDeliveries(now)
                                 tostring(delivery.name), tostring(remaining), tostring(delivery.container))
                         end
                     else
+                        --- 用户第 5 项（"发送中的数量是两倍、却永远发不完"）：存储里没货时要说清"还缺
+                        --- 多少"；如果这个物品**根本没有流程能产出**（例如 Iron Nugget），更要明说
+                        --- "不会自动到货，请补库存或删除此项" —— 以前的"等待库存/上游产出"会让人一直
+                        --- 等一个永远不会发生的生产。这里只改这条发货记录的错误文案（reason 由
+                        --- transferIn 给出，非 nil 时它更具体，仍然优先）。
+                        if #self:producers(delivery.kind, delivery.name) == 0 then
+                            reason = "\\u5B58\\u50A8\\u5BB9\\u5668\\u4E2D\\u6682\\u65F6\\u6CA1\\u6709 " ..
+                                tostring(delivery.name) ..
+                                "\\uFF08\\u8FD8\\u7F3A " .. tostring(remaining) ..
+                                "\\uFF09\\uFF0C\\u4E14\\u6CA1\\u6709\\u6D41\\u7A0B\\u80FD\\u4EA7\\u51FA\\u5B83 \\u2192 " ..
+                                "\\u4E0D\\u4F1A\\u81EA\\u52A8\\u5230\\u8D27\\uFF0C\\u8BF7\\u8865\\u5E93\\u5B58\\u6216\\u5220\\u9664\\u6B64\\u9879"
+                        end
                         self:markDeliveryError(delivery, reason or ("\\u5B58\\u50A8\\u5BB9\\u5668\\u4E2D\\u6682\\u65F6\\u6CA1\\u6709 " .. tostring(delivery.name)
                             .. "\\uFF0C\\u7B49\\u5F85\\u5E93\\u5B58/\\u4E0A\\u6E38\\u4EA7\\u51FA"))
                     end
@@ -1908,11 +2039,130 @@ function Recipe:advanceCompactPlan(job, now)
     return true
 end
 
+--- 设置自动整理的空槽位阈值（用户第 4 项，网页设置里的输入框）：0 ~ 1，超出就夹到边界。
+--- 阈值改了要允许"马上重算一遍"：否则下面那条"输入没变就短路"会一直挡着，用户改完看不到效果。
+function Recipe:setCompactFreeRatio(value)
+    local ratio = tonumber(value)
+    if not ratio or ratio < 0 then
+        ratio = 0
+    elseif ratio > 1 then
+        ratio = 1
+    end
+    if self.compactFreeRatio ~= ratio then
+        self.compactFreeRatio = ratio
+        self.compactPlanRevision = nil
+        self.log("Auto compact free-slot threshold: %.2f (compaction runs below it)", ratio)
+    end
+    return ratio
+end
+
+--- 存储容器的空槽位比例（0 ~ 1）：总槽位数还不知道时返回 nil（调用方按"先不整理"处理）。
+--- 数据来自 Containers:capacityStats（已占用槽位 / 总槽位数，带 TTL 缓存，不额外读外设）。
+function Recipe:storageFreeRatio()
+    local stats = self.Containers and self.Containers.capacityStats
+        and self.Containers:capacityStats() or nil
+    if not stats then
+        return nil
+    end
+    local total = tonumber(stats.totalSlots) or 0
+    if total <= 0 then
+        return nil
+    end
+    local used = tonumber(stats.slots) or 0
+    if used > total then
+        used = total
+    elseif used < 0 then
+        used = 0
+    end
+    return (total - used) / total
+end
+
+--- ===== 自动整理（1.8.0，用户第 4/5 项）=====
+--- 不再有"手动点整理"：调度器每轮检查一次，**compact 队列为空**时就算一遍搬运计划，
+--- 算完把**所有**搬运任务一次性排进 compact 队列（每个任务一个 tick 一步，多台 worker/本机协程并行执行）。
+--- 计划本身仍是分批算的（每 tick 一小步，见 advanceCompactPlan），不会卡住主循环。
+--- 计划的输入是**当前槽位扫描快照**（容器内容）+ 物品详情字典里的"槽位堆叠上限"（由 stackScan
+--- 队列补齐）；还没扫到堆叠上限的物品在规划时直接跳过（见 Containers:compactPlanPass）。
+--- 没有冷却：队列一空就算（用户要求）。
+function Recipe:autoCompactStep(now)
+    now = now or os.epoch("utc")
+    local job = self.compact
+    if not job then
+        --- 用户第 4 项：存储容器空槽位还够（比例 ≥ 阈值）就**不整理** —— 有地方放东西就没必要搬；
+        --- 总槽位数未知（外设还没扫到 size()）时同样先不整理，等知道容量再说。
+        local freeRatio = self:storageFreeRatio()
+        if freeRatio == nil or freeRatio >= (self.compactFreeRatio or 0.10) then
+            return 0
+        end
+        --- 没有冷却（队列一空就算），但"输入没变、上一轮又什么都没排出来"时不重复算：
+        --- 计划的输入 = 容器快照（换代次数）+ 已知的堆叠上限数量（见 Containers:planInputRevision）。
+        local revision = self.Containers.planInputRevision and self.Containers:planInputRevision() or nil
+        if revision ~= nil and revision == self.compactPlanRevision and (self.compactPlanQueued or 0) == 0 then
+            return 0
+        end
+        self.compactPlanRevision = revision
+        self:startCompact("storage")
+        job = self.compact
+    end
+    if job.state == "planning" then
+        self:advanceCompactPlan(job, now)
+        return 0
+    end
+    local plan = job.plan or {}
+    local queued, skipped, rejected = 0, job.skipped or 0, 0
+    for _, move in ipairs(plan) do
+        --- 复核源槽位里还是不是当初计划的那一堆（同名 + 同 NBT；整理期间流程可能也在搬东西）
+        local current = move.name and self.Containers:stackAt(move.fromContainer, move.fromSlot) or nil
+        if current and (current.name ~= move.name or tostring(current.nbt or "") ~= tostring(move.nbt or "")) then
+            skipped = skipped + 1
+        else
+            --- 提交成一条搬运任务（进 compact 队列）。返回 "pending" = 已经排进队列（正常路径）
+            local _, reason = self.Containers:pushItem(move.fromContainer, move.fromSlot, move.amount,
+                move.toContainer, move.toSlot, nil, "compact")
+            if reason == "pending" then
+                queued = queued + 1
+            else
+                rejected = rejected + 1
+            end
+        end
+    end
+    self.compact = nil
+    self.compactLastFinishAt = now
+    self.compactPlanQueued = queued
+    self.compactPlanStats = { total = #plan, queued = queued, skipped = skipped, rejected = rejected,
+        skippedUnknown = job.skippedUnknown or 0, at = now }
+    self.Cache:markDirty()
+    self.log("Auto compact: %d/%d move task(s) queued into the compact queue (%d skipped, %d rejected)",
+        queued, #plan, skipped, rejected)
+    return queued
+end
+
 --- 整理进度（网页显示用；没有整理任务时返回 nil）
 function Recipe:compactStatus()
     local job = self.compact
     if not job then
-        return nil
+        --- 计划已经生成成搬运任务（在 compact 队列里跑）：显示上一次生成了多少条
+        --- （只在生成后 30 秒内显示，之后进度条自己隐藏）
+        local stats = self.compactPlanStats
+        if not stats or (os.epoch("utc") - (stats.at or 0)) > 30000 then
+            return nil
+        end
+        return {
+            planning = false,
+            generated = true,
+            total = stats.total or 0,
+            queued = stats.queued or 0,
+            skipped = stats.skipped or 0,
+            rejected = stats.rejected or 0,
+            at = stats.at,
+            --- 执行侧的进度由主控用 compact 队列的统计补上（见 buildStatus）
+            done = 0,
+            pending = stats.queued or 0,
+            moved = 0,
+            items = 0,
+            kinds = 0,
+            failed = 0,
+        }
     end
     if job.state == "planning" then
         -- 计划还在算（分批进行）：网页显示“正在计算搬运计划（扫描容器 3/19）”
@@ -1948,67 +2198,10 @@ function Recipe:compactStatus()
 end
 
 --- 推进整理任务（每次 tick 调用）：算计划阶段每 tick 走一小步，执行阶段最多搬 compactOpsPerTick 次
+--- 兼容入口（诊断 / 旧调用方）：1.8.0 起整理没有"手动启动"，搬运任务也由调度器的 compact 队列执行。
+--- 这里只推进"自动整理"：计划算完 → 一次性生成所有搬运任务（见 autoCompactStep）。
 function Recipe:stepCompact(now)
-    local job = self.compact
-    if not job then
-        return
-    end
-    if job.state == "planning" then
-        -- 计划还没算完：这一 tick 只推进一小步（预算内），绝不阻塞主循环
-        self:advanceCompactPlan(job, now)
-        return
-    end
-    if not job.plan or #job.plan == 0 then
-        -- 计划为空（本来就不需要搬东西）：直接结束，别留在状态里
-        self.compact = nil
-        self.log("Storage compact finished: nothing to move")
-        self.Cache:markDirty()
-        return
-    end
-    local budget = self.compactOpsPerTick or 3
-    while job.index <= #job.plan and budget > 0 do
-        local move = job.plan[job.index]
-        job.index = job.index + 1
-        budget = budget - 1
-        -- 复核源槽位里还是不是当初计划的那一堆（同名 + 同 NBT；整理期间流程可能同时在搬运物品）
-        local current = move.name and self.Containers:stackAt(move.fromContainer, move.fromSlot) or nil
-        if current and (current.name ~= move.name or tostring(current.nbt or "") ~= tostring(move.nbt or "")) then
-            job.skipped = (job.skipped or 0) + 1
-        else
-            local moved, reason = self.Containers:pushItem(
-                move.fromContainer, move.fromSlot, move.amount, move.toContainer, move.toSlot,
-                nil, "compact")
-            if reason == "pending" then
-                -- 已交给 IFMWorker：这次先不算进度，下个 tick 用同一个任务键继续等
-                job.index = job.index - 1
-                return
-            end
-            moved = tonumber(moved) or 0
-            if moved > 0 then
-                job.moved = (job.moved or 0) + moved
-                self.Containers:invalidate()
-            else
-                job.failed = (job.failed or 0) + 1
-                -- 只记前几条失败原因，避免刷屏（网页控制台里能看到，用来定位“0 个物品被搬运”）
-                if (job.loggedFailures or 0) < 5 then
-                    job.loggedFailures = (job.loggedFailures or 0) + 1
-                    self.log("Storage compact move failed: %s#%s -> %s#%s x%d (%s)",
-                        tostring(move.fromContainer), tostring(move.fromSlot),
-                        tostring(move.toContainer), tostring(move.toSlot),
-                        tonumber(move.amount) or 0, tostring(reason or "unknown"))
-                end
-            end
-        end
-    end
-    if job.index > #job.plan then
-        self.compact = nil
-        self.log("Storage compact finished: %d move(s), merged %s item(s), %s failed, %s skipped",
-            job.total or 0, tostring(job.moved or 0), tostring(job.failed or 0), tostring(job.skipped or 0))
-    elseif job.total and job.total > 0 and (now or 0) - (job.lastReportAt or 0) >= 5000 then
-        job.lastReportAt = now
-        self.log("Storage compact running: %d/%d move(s), merged %s item(s)",
-            job.index - 1, job.total, tostring(job.moved or 0))
-    end
+    return self:autoCompactStep(now)
 end
 
 --- 空闲判定：没有排队批次、没有上游请求、也没有等待中的步骤 ⇒ 这个流程完全没事可做。
@@ -2052,8 +2245,8 @@ function Recipe:maintain(now)
     end
     --- 在飞搬运的记忆（见在飞搬运的记忆一节）：清掉过期的（worker 早已超时的那些）
     self:sweepPendingMoves(now)
-    --- 输入容器：扫一遍并把里面的东西搬进存储容器（用户第 13 项要求）
-    self:drainInputContainers(now)
+    --- 输入容器：不再每轮扫一遍 —— 1.8.0 起由 inputScan 队列扫描成功后触发入库任务生成
+    --- （见 IFMMaster 的 afterScan → drainInputContainers(now, container)）。
     -- 本轮的细分计数（慢步骤明细用）：真正读了几次外设（缓存命中不算）
     self.tickStats = {
         steps = 0, active = 0, processes = #self.Store:list("processes"), reads = 0, readMs = 0,
@@ -2350,18 +2543,34 @@ end
 --- 每个调度轮次看一遍输入容器的快照（扫描由 inputScan 队列负责），有货就提交入库任务
 --- （进 inventoryIn 队列；重复提交由 Containers.moveInflight 去重），pending 时下轮继续。
 
-function Recipe:drainInputContainers(now)
+function Recipe:drainInputContainers(now, onlyPeripheral)
     now = now or os.epoch("utc")
     self.inputDrain = self.inputDrain or { items = 0, fluids = 0, lastAt = 0, lastLogAt = 0 }
     local state = self.inputDrain
-    --- 1.7.0：不再有"每 INPUT_DRAIN_INTERVAL 毫秒扫一轮"的硬间隔 —— 每个调度轮次都会看一遍
-    --- 输入容器的快照（扫描由 inputScan 队列负责），有货就提交入库任务（重复提交会被
-    --- moveInflight 去重），因此"投料 → 入库"的延迟只取决于队列轮转。
+    --- 1.7.0：不再有"每 INPUT_DRAIN_INTERVAL 毫秒扫一轮"的硬间隔 —— 输入容器的内容由
+    --- inputScan 队列扫（扫描成功时才调用本函数，见 IFMMaster 的 afterScan），有货就提交入库任务
+    --- （重复提交会被 moveInflight 去重），因此"投料 → 入库"的延迟只取决于队列轮转。
     state.lastAt = now
     local sources = {
         item = self.Containers:byRole("input", "item"),
         fluid = self.Containers:byRole("input", "fluid"),
     }
+    --- onlyPeripheral（1.8.0）：只处理刚刚扫到的那个输入容器（扫描成功触发的入库任务）。
+    --- byRole 返回的是**容器名**，所以容器名与外设名都对一下。
+    if onlyPeripheral then
+        local function keepOnly(list, kind)
+            local out = {}
+            for _, name in ipairs(list) do
+                if name == onlyPeripheral or
+                    self.Containers:peripheralOf(name, kind) == onlyPeripheral then
+                    out[#out + 1] = name
+                end
+            end
+            return out
+        end
+        sources.item = keepOnly(sources.item, "item")
+        sources.fluid = keepOnly(sources.fluid, "fluid")
+    end
     if #sources.item == 0 and #sources.fluid == 0 then
         return 0
     end
@@ -2490,7 +2699,7 @@ end
 function Recipe:producers(kind, name)
     local out = {}
     for _, process in ipairs(self.Store:list("processes")) do
-        if not self:isTemplate(process) then
+        if not self:isAbstract(process) then
             for _, output in ipairs(process.outputs or {}) do
                 if self:outputMatchesInput(output, { kind = kind, id = name }) then
                     out[#out + 1] = process.name
@@ -2504,9 +2713,11 @@ end
 
 --- 只被“抽象模板”（含虚操作）产出的资源：返回那个模板的名字 —— 下单时用它给出具体原因，
 --- 而不是笼统地说“没有可以产出该资源的流程”（模板本来就不能合成）。
-function Recipe:templateProducer(kind, name)
+--- 只被抽象流程"产出"的资源（含 abstract 操作的流程）：用它给出更准确的错误提示
+--- （"抽象流程不能用于合成"，而不是笼统的"没有流程能产出"）
+function Recipe:abstractProducer(kind, name)
     for _, process in ipairs(self.Store:list("processes")) do
-        if self:isTemplate(process) then
+        if self:isAbstract(process) then
             for _, output in ipairs(process.outputs or {}) do
                 if self:outputMatchesInput(output, { kind = kind, id = name }) then
                     return process.name
@@ -2564,9 +2775,9 @@ function Recipe:startResource(kind, name, count, processName)
         processName = best
     end
     if not processName then
-        -- 只有抽象模板（含虚操作）能产出它：直接说清为什么不能合成，比“没有流程”好定位
-        if self:templateProducer(kind, name) then
-            return false, TEMPLATE_MESSAGE
+        -- 只有抽象流程（含 abstract 操作）能产出它：直接说清为什么不能合成，比"没有流程"好定位
+        if self:abstractProducer(kind, name) then
+            return false, ABSTRACT_MESSAGE
         end
         return false, "\\u6CA1\\u6709\\u53EF\\u4EE5\\u4EA7\\u51FA\\u8BE5\\u8D44\\u6E90\\u7684\\u6D41\\u7A0B"
     end
@@ -2594,9 +2805,9 @@ function Recipe:start(processName, count)
     if not process then
         return false, "\\u6D41\\u7A0B " .. tostring(processName) .. " \\u4E0D\\u5B58\\u5728"
     end
-    if self:isTemplate(process) then
-        -- 抽象模板只用于“流程设置复制”：它的虚操作不对应任何真实资源
-        return false, TEMPLATE_MESSAGE
+    if self:isAbstract(process) then
+        -- 抽象流程只用于"流程设置复制"：它的 abstract 操作不对应任何真实资源
+        return false, ABSTRACT_MESSAGE
     end
     count = math.max(1, math.floor(tonumber(count) or 1))
     local record = self:record(processName)
@@ -2619,8 +2830,8 @@ function Recipe:setUserCount(processName, count)
     if not process then
         return false, "\\u6D41\\u7A0B " .. tostring(processName) .. " \\u4E0D\\u5B58\\u5728"
     end
-    if self:isTemplate(process) then
-        return false, TEMPLATE_MESSAGE
+    if self:isAbstract(process) then
+        return false, ABSTRACT_MESSAGE
     end
     count = math.max(0, math.floor(tonumber(count) or 0))
     local record = self:record(processName)

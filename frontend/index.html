@@ -1,12 +1,19 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-ifm-build="210">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!-- index.html 本身不带版本号（不能像 web/*.js 那样加 ?v=），而它引用的 JS 都带版本号：
+     如果浏览器把旧的 index.html 缓存下来，就会出现"新 JS 找不到旧页面里的元素"这种半更新状态。
+     注意：本文件是 UTF-8；不要用 PowerShell 的 Get-Content/Set-Content 改写它（会把中文变成乱码、
+     还会吃掉引号与 '<'，导致元素被解析器吞掉）。要改就改 data-ifm-build 与 ?v=，并同步 web/ifm-app.js 的 IFM_APP_BUILD。 -->
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>IFM - 集成工厂管理终端</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.5.2/css/all.min.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
-<link rel="stylesheet" href="web/ifm.css?v=181">
+<link rel="stylesheet" href="web/ifm.css?v=210">
 </head>
 <body>
 <div id="loginOverlay">
@@ -33,11 +40,9 @@
         <span class="muted" id="versionLabel"></span>
         <span class="muted" id="tagInfo"></span>
         <span class="muted" id="transferInfo"></span>
+        <span class="muted" id="dispatchInfo" data-i18n-title="dispatchHint"></span>
         <span class="muted" id="pendingInfo"></span>
         <span class="header-spacer"></span>
-        <button class="btn-pixel" id="refreshBtn" title="重新拉取全部数据（不清空图标缓存；Shift+点击才清空）"><i class="fa fa-refresh"></i></button>
-        <button class="btn-pixel" id="saveBtn" title="立即写盘 config.json / cache.json"><i class="fa fa-floppy-o"></i></button>
-        <button class="btn-pixel" id="rescanBtn" title="重新扫描外设"><i class="fa fa-search"></i></button>
         <button class="btn-pixel" id="diagnoseBtn" title="诊断：结果输出到浏览器控制台（服务端同时 print 到终端）"><i class="fa fa-stethoscope"></i></button>
         <button class="btn-pixel" id="langBtn" title="中英切换"><i class="fa fa-language"></i> <span id="langLabel">中</span></button>
         <button class="btn-pixel" id="translateBtn" title="物品名翻译"><i class="fa fa-translate"></i> <span id="translateLabel"></span></button>
@@ -69,7 +74,6 @@
                 <button class="btn-pixel search-clear" id="resourceSearchClear" type="button" data-i18n-title="searchClear" style="display:none" title="清空搜索"><i class="fa fa-times"></i></button>
             </span>
             <button class="btn-pixel" id="resourceSortBtn" title="切换排序"><i class="fa fa-sort-alpha-asc"></i></button>
-            <button class="btn-pixel" id="compactBtn" data-i18n-title="compactHint" title="把同种物品（同名同 NBT）的散堆合并到数量最多的那堆"><i class="fa fa-compress"></i> <span data-i18n="compact">整理</span></button>
         </header>
         <div class="capacity-box" id="capacityBars"></div>
         <div class="capacity-box" id="compactProgress" style="display:none"></div>
@@ -92,7 +96,9 @@
                 <div id="sendGrid" class="resource-grid"></div>
             </div>
             <div class="delivery-column">
-                <div class="delivery-head"><i class="fa fa-truck"></i> <span data-i18n="deliveries">发送中</span></div>
+                <div class="delivery-head"><i class="fa fa-truck"></i> <span data-i18n="deliveries">发送中</span>
+                    <button class="btn-pixel danger delivery-clear" id="clearDeliveriesBtn" type="button"><i class="fa fa-trash"></i></button>
+                </div>
                 <div id="deliveryGrid" class="resource-grid"></div>
             </div>
         </div>
@@ -103,11 +109,16 @@
             <h2><i class="fa fa-server"></i> <span data-i18n="workerPanel">从节点</span></h2>
             <span class="spacer"></span>
             <span class="muted" id="workerHint"></span>
+            <!-- 用户第 4 项：从节点总负载条（只统计从节点；主控本机那 32 个槽位不计入，见 ifm-workers.js） -->
+            <span class="worker-load-wrap">
+                <span class="progress worker-load total" id="workerLoadBar"><span class="bar"></span></span>
+                <span class="muted" id="workerLoadText"></span>
+            </span>
         </header>
         <div id="workerList"></div>
     </section>
 
-    <section class="panel">
+    <section class="panel peripheral-panel">
         <header>
             <h2><i class="fa fa-microchip"></i> <span data-i18n="peripherals">外设与定义</span></h2>
             <span class="spacer"></span>
@@ -116,9 +127,10 @@
                 <button class="btn-pixel search-clear" id="peripheralSearchClear" type="button" data-i18n-title="searchClear" style="display:none" title="清空搜索"><i class="fa fa-times"></i></button>
             </span>
             <button class="btn-pixel" id="peripheralSortBtn" data-i18n-title="peripheralSortTitle" title="切换排序：外设名（默认）/ 方块名 / 定义数量"><i class="fa fa-sort-alpha-asc"></i> <span id="peripheralSortLabel">外设名</span></button>
+            <span class="muted" id="peripheralSelHint"></span>
             <button class="btn-pixel" id="addMachineTypeBtn"><i class="fa fa-plus"></i> <span data-i18n="machineType">机器类型</span></button>
         </header>
-        <!-- 顺序（用户要求）：缺失外设 → 机器类型卡片 → 存储容器卡片 → 输入容器卡片 → 未分配功能的外设方块卡片 -->
+        <!-- 顺序：缺失外设 → 机器类型卡片 → 存储容器卡片 → 输入容器卡片 → 未分配功能的外设方块卡片 -->
         <div id="missingList" class="peripheral-section"></div>
         <!-- 机器类型卡片（层级：机器类型 → 机器 → 输入/输出/信号 → 外设卡片） -->
         <div id="machineTypeList" class="machine-type-list"></div>
@@ -126,6 +138,8 @@
         <div id="storageList" class="machine-type-list"></div>
         <!-- 输入容器卡片（1.6.10）：人工/上游放料的中转箱，role=input —— 里面的东西会被定期搬进存储容器 -->
         <div id="inputList" class="machine-type-list"></div>
+        <!-- 输出容器卡片（1.8.0）：role=output —— 拖外设进来会弹出容器定义弹窗（角色已填好，名称等用户填） -->
+        <div id="outputList" class="machine-type-list"></div>
         <!-- 只显示“还有未分配功能”的方块卡片（布局：按内容宽度紧凑换行，见 ifm.css 的 #peripheralList） -->
         <div id="peripheralList"></div>
     </section>
@@ -232,23 +246,38 @@
 </div>
 
 <div id="toastArea"></div>
+<!-- 外设卡片右键框选时的虚线框（用户第 6 项）：脚本只改它的位置与尺寸 -->
+<div id="selectMarquee"></div>
 
 <!-- 物品名翻译模块（Bergamot wasm，懒加载；开关状态存在 localStorage） -->
 <!-- 本地资源都带 ?v=<前端版本号>：改了 JS/CSS 之后浏览器不会再拿旧缓存（否则会出现“代码改了网页没变”） -->
-<script src="web/ifm-translate.js?v=181"></script>
+<script src="web/ifm-translate.js?v=210"></script>
 <!-- 中文拼音搜索（任务 7）：pinyinlite 是体积较大的拼音词典，按需加载；
      文件不存在时前端会静默降级（搜索框自动退回“中英文关键词”匹配） -->
 <script charset="UTF-8" src="dist/pinyinlite_full.min.js"></script>
 
-<script src="web/ifm-core.js?v=181"></script>
-<script src="web/ifm-meta.js?v=181"></script>
-<script src="web/ifm-net.js?v=181"></script>
-<script src="web/ifm-resources.js?v=181"></script>
-<script src="web/ifm-processes.js?v=181"></script>
-<script src="web/ifm-editor.js?v=181"></script>
-<script src="web/ifm-picker.js?v=181"></script>
-<script src="web/ifm-workers.js?v=181"></script>
-<script src="web/ifm-app.js?v=181"></script>
+<script src="web/ifm-core.js?v=210"></script>
+<script src="web/ifm-meta.js?v=210"></script>
+<script src="web/ifm-net.js?v=210"></script>
+<script src="web/ifm-resources.js?v=210"></script>
+<script src="web/ifm-processes.js?v=210"></script>
+<script src="web/ifm-editor.js?v=210"></script>
+<script src="web/ifm-picker.js?v=210"></script>
+<script src="web/ifm-workers.js?v=210"></script>
+<script src="web/ifm-app.js?v=210"></script>
+<script>
+// 启动自检（静态兜底，不依赖任何 web/*.js）：如果本地脚本完全没加载成功 —— 比如
+// index.html 被单独部署、web/ 没跟着复制，或者某个 <script> 被 HTML 注释吃掉 ——
+// 登录框上会直接给出提示。不然用户只会看到"点了连接没反应"，完全不知道发生了什么。
+window.setTimeout(function () {
+    if (typeof window.ifmServerLog === 'function') return;   // ifm-net.js 已执行
+    var node = document.getElementById('loginError');
+    if (node && !node.textContent) {
+        node.textContent = 'IFM scripts did not load - deploy the whole web/ folder next to index.html ' +
+            '(open the browser console / network tab for 404s)';
+    }
+}, 2000);
+</script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
 </body>

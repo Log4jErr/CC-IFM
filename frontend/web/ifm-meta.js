@@ -5,7 +5,7 @@
 
 // ===================== 图标 =====================
     // 显示顺序：API 图片 → 名称兜底（中文前 4 字 / 英文各单词首字母，CDN 挂了也能看到东西）。
-    // 重要：图片**不以 fetch 成功为前提** —— 页面用 file:// 打开或接口没给 CORS 头时 fetch 会失败，
+    // 重要：图片不以 fetch 成功为前提 —— 页面用 file:// 打开或接口没给 CORS 头时 fetch 会失败，
     // 此时若还等元信息就会“所有图标都不显示”，所以查不到元信息时直接乐观地请求图片地址
     // （<img> 不受 CORS 限制），图片真 404 时再由 onerror 换成字形。
     const metaHints = { network: false, missing: false };   // 每类提示一次
@@ -37,6 +37,7 @@
         if (kind === 'filter') return 'fa-filter';
         if (kind === 'placeholder') return 'fa-thumb-tack';
         if (kind === 'virtual') return 'fa-cog';
+        if (kind === 'abstract') return 'fa-cog';
         return 'fa-cube';
     }
 
@@ -74,7 +75,7 @@
 
     function faGlyphHtml(kind, name) {
         const text = iconFallbackText(iconLabelOf(kind, name));
-        // 不再写 title：图标上的**注册名原生提示**会与自定义悬停详情（.icon-tooltip）重复出现
+        // 不再写 title：图标上的注册名原生提示会与自定义悬停详情（.icon-tooltip）重复出现
         // （用户第 2 项要求：移除多余的注册名提示）
         return '<span class="icon-text" data-fallback-len="' + text.length + '">' + escapeHtml(text) + '</span>';
     }
@@ -86,7 +87,7 @@
         return meta ? 'ready' : 'unknown';
     }
 
-    // 图标 <img> 本体（不含外层 span）：**所有**渲染路径（资源网格主图标 / 库存弹窗 / 编辑器元素行 /
+    // 图标 <img> 本体（不含外层 span）：所有渲染路径（资源网格主图标 / 库存弹窗 / 编辑器元素行 /
     // 流程图节点 / 外设方块卡）都从这里出图，优先级固定为
     //   ① icon-exports 本地导出图（离线可用、与游戏里一致；与界面语言无关）
     //   ② blocksitems 接口图标
@@ -95,11 +96,20 @@
     // 以前第 ① 层只接在 plainIconImg 那一条路上，资源网格的主图标走的是 iconHtml → iconUrl（接口），
     // 于是 laowu:cat_fur 这类“接口没收录的模组”的本地导出图（laowu__cat_fur.png）根本没被引用。
     // exportedFile：调用方已经查过导出文件名时可以传进来（'' / null = 确定没有，不再重查）。
+    // 索引还在加载（既没成功、也没失败）时，**先不要去请求 blocksitems 的图标**：
+    // 用户看到的现象就是"明明 icon-exports 里有图，却刷了一大堆接口图标请求"。
+    // 先画一个 1×1 占位图，等索引就绪后界面会整体重画（见 loadIconExports 的重画），那时才是真实图标。
+    const ICON_LAZY_PLACEHOLDER = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+    function iconExportPending() {
+        return !iconExportIndex && !iconExportUnavailable && !!iconExportLoadingLang;
+    }
+
     function iconImgTagHtml(kind, name, extraAttrs, exportedFile) {
         const file = (exportedFile === undefined) ? iconExportFile(kind, name) : exportedFile;
-        const src = file ? iconExportUrl(file) : iconUrl(kind, name);
+        const pending = !file && iconExportPending();
+        const src = file ? iconExportUrl(file) : (pending ? ICON_LAZY_PLACEHOLDER : iconUrl(kind, name));
         return '<img src="' + src + '" alt="" data-icon-key="' + escapeHtml(resourceKey(kind, name)) +
-            '" data-icon-tier="' + (file ? 'export' : 'api') + '"' + (extraAttrs || '') +
+            '" data-icon-tier="' + (file ? 'export' : (pending ? 'lazy' : 'api')) + '"' + (extraAttrs || '') +
             ' onerror="window.ifmIconFallback(this, \'' + kind + '\')">';
     }
 
@@ -133,21 +143,29 @@
         const holder = img.parentNode;
         if (!holder) return;
         const tier = img.getAttribute('data-icon-tier') || '';
-        // 第 ① 层（icon-exports 本地图片）打不开：退到第 ② 层（blocksitems 接口）再试一次，
-        // 别直接掉到名称兜底（本地导出可能缺这一条，但接口有）
+        // 第 ① 层（icon-exports 本地图片）打不开：先试同一注册名下的另一张导出图（NBT 变体），
+        // 全都打不开才退到第 ② 层（blocksitems 接口），别直接掉到名称兜底
+        // （本地导出可能缺这一条，但接口有）。
         if (tier === 'export') {
             const key = img.getAttribute('data-icon-key') || '';
             const parts1 = splitKey(key);
-            const failedFile = String(img.getAttribute('src') || '')
-                .replace(ICON_EXPORTS_BASE, '').replace(/%23/g, '#').replace(/%3F/g, '?');
+            const failedFile = iconExportFileFromUrl(img.getAttribute('src'));
             const resourceKind = kind || parts1[0] || 'item';
             const resourceName = parts1[1] || '';
             const listed = iconExportListedFile(resourceKind, resourceName);
-            console.info('[IFM] icon-exports 图片加载失败：' + decodeURIComponent(failedFile) +
+            iconExportMarkFailed(failedFile);
+            // 同一个注册名下还有别的变体可用（图标文件在，只是 NBT 不一样）就换那一张：
+            // 这样“注册名相同、NBT 不同”的物品依然用本地导出图，不会回退到 blocksitems
+            const nextFile = iconExportFile(resourceKind, resourceName);
+            console.info('[IFM] icon-exports 图片加载失败：' + failedFile +
                 (listed ? '（元数据里登记了这张图，但该文件不在 icon-exports/ 里：导出可能不完整）'
                     : '（元数据里没有这条，用约定名猜的）') +
-                ' → 退回 blocksitems 接口：' + resourceKind + ':' + resourceName);
-            iconExportMarkFailed(failedFile);
+                (nextFile ? ' → 改用同一注册名的另一张导出图：' + nextFile
+                    : ' → 退回 blocksitems 接口：' + resourceKind + ':' + resourceName));
+            if (nextFile) {
+                img.setAttribute('src', iconExportUrl(nextFile));     // tier 仍是 export
+                return;
+            }
             img.setAttribute('data-icon-tier', 'api');
             img.setAttribute('src', iconUrl(resourceKind, resourceName));
             return;
@@ -207,7 +225,7 @@
 
     function fetchMeta(kind, name) {
         const key = resourceKey(kind, name);
-        // 用 lookup 接口（/api/v1/{items|blocks}/lookup/{full_id}）：**资源不存在时它照样返回 200**
+        // 用 lookup 接口（/api/v1/{items|blocks}/lookup/{full_id}）：资源不存在时它照样返回 200
         // （`{ found = false, data = null }`），不像 /items/{full_id} 那样报 404，
         // 所以控制台不会再刷 “item not found / OpaqueResponseBlocking”。
         return fetch(API_BASE + '/' + metaEndpoint(kind) + '/lookup/' + encodeURIComponent(name))
@@ -246,7 +264,7 @@
                 }
             })
             .catch(function (err) {
-                // 网络中断 / 限流 / 5xx 等临时失败：**不**写进缓存，过一会再试
+                // 网络中断 / 限流 / 5xx 等临时失败：不写进缓存，过一会再试
                 // （否则一次抖动就会让图标永久变成缺省图标）
                 metaRetryAt.set(key, Date.now() + META_RETRY_MS);
                 if (!metaHints.network) {
@@ -302,10 +320,10 @@
     // ===================== icon-exports（本地图标导出，任务 8 / 1.6.13）=====================
     // 三层优先级：① icon-exports（本地导出的图片 + 元数据）→ ② blocksitems 接口 → ③ Bergamot 翻译/名称字形兜底。
     //
-    // 元数据按**语言**分文件：icon-exports-metadata/<lang>.json（例如 zh.json）。
-    //   * **图标**：始终优先用 icon-exports（与语言无关）。当前语言的文件不存在时，会借其它语言
+    // 元数据按语言分文件：icon-exports-metadata/<lang>.json（例如 zh.json）。
+    //   * 图标：始终优先用 icon-exports（与语言无关）。当前语言的文件不存在时，会借其它语言
     //     的那份来建“图标索引”（只借图片，不借名字）。
-    //   * **物品名称**：只有当**当前语言**的元数据文件存在时才用（用户第 1 项要求）。
+    //   * 物品名称：只有当当前语言的元数据文件存在时才用（用户第 1 项要求）。
     //   * 切换界面语言时会自动重新加载对应语言的文件（重画时发现语言不一致就会重载）。
     // 懒加载：元数据单文件好几 MB / 近 2 万条，开局同步解析会明显拖慢首屏；
     // 页面起来之后后台抓一次、建索引，抓完重画一次（那之前先用接口图标）。
@@ -328,6 +346,20 @@
         const name = String(file || '');
         return ICON_EXPORTS_BASE +
             encodeURI(name).replace(/#/g, '%23').replace(/\?/g, '%3F');
+    }
+
+    /// 从 <img src="icon-exports/....png"> 还原出元数据里的原始文件名。
+    /// 用途：`iconExportFailedFiles` 的键是原始文件名，而 URL 是编码过的 ——
+    /// 以前只把 %23/%3F 还原，`{ } [ ]` 仍然是 %7B/%7D/%5B/%5D，于是“刚 404 过的图”对不上，
+    /// 每次重画都会再请求一次必然 404 的图片（带 components 的长文件名 v 变体全是这种）。
+    function iconExportFileFromUrl(src) {
+        const encoded = String(src || '').replace(ICON_EXPORTS_BASE, '');
+        try {
+            return decodeURIComponent(encoded);
+        } catch (err) {
+            // 不是合法的转义序列（极端情况）：按原样返回，至少不会抛异常
+            return encoded;
+        }
     }
 
     /// 索引键：统一小写（导出工具的大小写不一定和游戏里一致，实测有 id 大小写不匹配的先例）
@@ -356,8 +388,8 @@
         return [first].concat(ICON_EXPORT_LANGS.filter(function (code) { return code !== first; }));
     }
 
-    // 导出的物品名只在**当前语言**下使用（名字与语言相关）；乱码（含 U+FFFD）一律不用
-    // 导出物品名：只用**当前语言**那份元数据里的名字（见 iconExportName 的语言检查）。
+    // 导出的物品名只在当前语言下使用（名字与语言相关）；乱码（含 U+FFFD）一律不用
+    // 导出物品名：只用当前语言那份元数据里的名字（见 iconExportName 的语言检查）。
     // 以前要求“必须含中文”才采用，结果 en.json 的名字和没汉化的模组名全被丢掉、
     // 只能退回注册名去下划线 —— 现在只挡乱码（U+FFFD）。
     function iconExportUsableName(text) {
@@ -366,21 +398,130 @@
         return value;
     }
 
-    // components（NBT）比较用的键：**键顺序无关**，否则游戏侧 { "a":1, "b":2 } 与导出侧
+    // components（NBT）比较用的键：键顺序无关，否则游戏侧 { "a":1, "b":2 } 与导出侧
     // { "b":2, "a":1 } 会被当成两个不同的变体，NBT 物品就永远匹配不上它的专属图标。
+    // 注意排序必须递归：以前只排顶层键，嵌套对象（minecraft:custom_data 里的字段就是嵌套的）
+    // 仍按原顺序进字符串，同一份 NBT 只要嵌套键顺序不同就匹配不上（于是随便挑了别的变体）。
+    // 数组顺序保留（数组是有序的，打乱就改变了语义）。
+    function iconExportCanonical(value) {
+        if (Array.isArray(value)) {
+            return value.map(iconExportCanonical);
+        }
+        if (value && typeof value === 'object') {
+            const sorted = {};
+            Object.keys(value).sort().forEach(function (key) { sorted[key] = iconExportCanonical(value[key]); });
+            return sorted;
+        }
+        return value;
+    }
+
     function iconExportComponentsKey(components) {
         if (!components || typeof components !== 'object') return '';
         try {
-            const sorted = {};
-            Object.keys(components).sort().forEach(function (key) { sorted[key] = components[key]; });
-            return JSON.stringify(sorted);
+            return JSON.stringify(iconExportCanonical(components));
         } catch (err) {
             return '';
         }
     }
 
+    /// 一份 components 的“形状”：把嵌套结构摊平成
+    ///   keys   = 键路径（'a.b'，不含值）
+    ///   leaves = 键路径 + 值（'a.b=1'）
+    /// 只用于给“NBT 最接近”的变体排序，不参与“完全一致”的判定（那由 components 键负责）。
+    function iconExportComponentShape(components) {
+        const shape = { keys: [], leaves: [] };
+        const walk = function (node, prefix) {
+            if (Array.isArray(node)) {
+                if (node.length === 0) { shape.keys.push(prefix); shape.leaves.push(prefix); return; }
+                node.forEach(function (item, index) { walk(item, prefix + '[' + index + ']'); });
+                return;
+            }
+            if (node && typeof node === 'object') {
+                const names = Object.keys(node);
+                if (names.length === 0) { shape.keys.push(prefix); shape.leaves.push(prefix); return; }
+                names.forEach(function (name) { walk(node[name], prefix + '.' + name); });
+                return;
+            }
+            shape.keys.push(prefix);
+            shape.leaves.push(prefix + '=' + String(node));
+        };
+        if (!components || typeof components !== 'object') return shape;
+        try {
+            walk(iconExportCanonical(components), '');
+        } catch (err) {
+            return { keys: [], leaves: [] };
+        }
+        return shape;
+    }
+
+    /// 两份 NBT 有多像（0~1）：键与值都相同的叶子占比为主，只有键相同（值不一样）的占比为辅 ——
+    /// 同一种物品的若干变体往往只差少数叶子（耐久、颜色、槽位数…），
+    /// 这样“只差一点点”的那条会排在前面；两条完全一样时得 1（等于完全一致）。
+    function iconExportSimilarity(wanted, candidate) {
+        if (!wanted || !candidate || wanted.leaves.length === 0 || candidate.leaves.length === 0) return 0;
+        const candidateLeaves = new Set(candidate.leaves);
+        const candidateKeys = new Set(candidate.keys);
+        let sameLeaves = 0;
+        let sameKeys = 0;
+        wanted.leaves.forEach(function (leaf) { if (candidateLeaves.has(leaf)) sameLeaves += 1; });
+        wanted.keys.forEach(function (key) { if (candidateKeys.has(key)) sameKeys += 1; });
+        return (sameLeaves + 0.5 * sameKeys) / (wanted.leaves.length * 1.5);
+    }
+
+    /// 变体优先级：先在同一个注册名下面挑“NBT 最接近”的那条变体：
+    ///   ① components 完全一致（递归比较、键顺序无关）→ 就是它；
+    ///   ② 没有完全一致的：按 NBT 相似度（见 iconExportSimilarity）从高到低；
+    ///   ③ 调用方根本不知道物品的 NBT（拿不到 components）：按元数据里的登记顺序。
+    /// 换句话说：只要 item-metadata（icon-exports-metadata/<lang>.json）里有这个注册名，
+    /// 就一定用它的图标 —— 即使 NBT 不同也不会回退到 blocksitems。
+    function iconExportOrderedVariants(record, wantedKey) {
+        const list = record.variants.slice();
+        if (!wantedKey || list.length <= 1) return list;
+        let exact = -1;
+        for (let i = 0; i < list.length; i += 1) {
+            if (list[i].components === wantedKey) { exact = i; break; }
+        }
+        if (exact === 0) return list;
+        if (exact > 0) {
+            list.unshift(list.splice(exact, 1)[0]);
+            return list;
+        }
+        // 没有完全一致的：按“最接近”排序（每条变体的形状只算一次，重画时不用重算）
+        const wantedShape = iconExportComponentShape(JSON.parse(wantedKey));
+        const scored = list.map(function (variant, index) {
+            if (!variant.shape) variant.shape = iconExportComponentShape(JSON.parse(variant.components));
+            return { variant: variant, index: index,
+                score: iconExportSimilarity(wantedShape, variant.shape) };
+        });
+        scored.sort(function (a, b) { return (b.score - a.score) || (a.index - b.index); });
+        return scored.map(function (item) { return item.variant; });
+    }
+
+    /// 一个注册名下的导出图片候选（按优先级）：NBT 变体（最接近的在前）→ 无 components 的那条
+    function iconExportCandidateFiles(record, wantedKey) {
+        const files = [];
+        const push = function (file) {
+            if (file && files.indexOf(file) < 0) files.push(file);
+        };
+        if (wantedKey) {
+            // 知道物品的 NBT：变体（完全一致或最接近）优先，通用图标垫底
+            iconExportOrderedVariants(record, wantedKey).forEach(function (variant) { push(variant.file); });
+            push(record.plain);
+        } else {
+            // 不知道 NBT（资源网格只有注册名）：先通用图标，再按登记顺序挑一条变体 ——
+            // 反正都是同一个注册名的物品，比回退到 blocksitems 准。
+            push(record.plain);
+            iconExportOrderedVariants(record, '').forEach(function (variant) { push(variant.file); });
+        }
+        return files;
+    }
+
     function buildIconExportIndex(meta, metaLang) {
         const index = new Map();
+        // 路径 → 注册名（用于把不带命名空间的外设名还原成方块 id，见 blockIdCandidates）：
+        //   basin → ['create:basin'] / chest → ['minecraft:chest']
+        // 只有唯一命中时才用它（多个模组都有同名方块时宁可不猜，免得挂错图标）。
+        const byPath = new Map();
         meta.forEach(function (entry) {
             if (!entry || !entry.id || !entry.image_file) return;
             const kind = entry.type === 'fluid' ? 'fluid' : 'item';
@@ -395,9 +536,24 @@
             const components = iconExportComponentsKey(entry.components);
             if (components) record.variants.push({ components: components, file: entry.image_file });
             else if (!record.plain) record.plain = entry.image_file;
+            if (kind === 'item') {
+                const path = String(entry.id).split(':').pop().toLowerCase();
+                const ids = byPath.get(path);
+                if (!ids) byPath.set(path, [String(entry.id)]);
+                else if (ids.indexOf(String(entry.id)) < 0) ids.push(String(entry.id));
+            }
         });
         index.lang = metaLang;      // 记住这份索引来自哪门语言（名字是否可用要看它）
+        index.byPath = byPath;
         return index;
+    }
+
+    /// 本地导出里路径与给定名字相同、且只命中一个命名空间时的注册名（否则返回 ''）：
+    /// CC:T 报出的外设名可能不带命名空间（basin_0），靠它把命名空间找回来（create:basin）。
+    function iconExportUniqueIdByPath(path) {
+        if (!ensureIconExports() || !iconExportIndex.byPath) return '';
+        const ids = iconExportIndex.byPath.get(String(path || '').toLowerCase());
+        return (ids && ids.length === 1) ? ids[0] : '';
     }
 
     function loadIconExports() {
@@ -486,33 +642,31 @@
         return record || null;
     }
 
-    /// 元数据里**登记**的图片文件名（诊断用：区分“元数据漏了这条”与“磁盘上缺这张图”）
+    /// 元数据里登记的图片文件名（诊断用：区分“元数据漏了这条”与“磁盘上缺这张图”）
     function iconExportListedFile(kind, name) {
         const record = iconExportEntry(kind, name);
         if (!record) return null;
         return record.plain || (record.variants.length > 0 ? record.variants[0].file : null);
     }
 
-    /// 导出的图标文件名（**与语言无关**，始终优先用；没有就返回 null，调用方退回接口图标）
-    function iconExportFile(kind, name, nbt) {
+    /// 导出的图标文件名（与语言无关，始终优先用；没有就返回 null，调用方退回接口图标）
+    /// components（可选）：调用方知道的物品 NBT（components 表）。给了就按“完全一致 → 最接近”
+    /// 在该注册名的变体里挑；给的不是表（例如 CC:T 只给得出 NBT 哈希字符串）就等同没给 ——
+    /// 仍然用同一个注册名那一条的图标，不会因为 NBT 不同而回退到 blocksitems。
+    function iconExportFile(kind, name, components) {
         const record = iconExportEntry(kind, name);
         if (record) {
-            const wanted = nbt ? iconExportComponentsKey(nbt) : '';
-            let file = '';
-            if (wanted) {
-                for (let i = 0; i < record.variants.length; i += 1) {
-                    if (record.variants[i].components === wanted) {
-                        file = record.variants[i].file;
-                        break;
-                    }
-                }
+            const wanted = iconExportComponentsKey(components);
+            const files = iconExportCandidateFiles(record, wanted);
+            // 已经 404 过的导出图跳过、试下一个候选（同名物品的其他变体），而不是直接掉到接口层：
+            // 元数据登记了、磁盘上却没导出（导出不完整）时会有这种情况，见 run_icon_tests.js 的统计。
+            // 否则每次重画都会再请求一次必然 404 的图片，等 onerror 才退回接口图标 ——
+            // 界面看起来就是“图标一直闪不出来”。
+            for (let i = 0; i < files.length; i += 1) {
+                if (!iconExportFailedFiles.has(String(files[i]).toLowerCase())) return files[i];
             }
-            if (!file && record.plain) file = record.plain;
-            if (!file && record.variants.length > 0) file = record.variants[0].file;
-            // 已经 404 过的导出图不再返回（元数据登记了、磁盘上却没导出：导出不完整时会有这种情况，
-            // 见 run_icon_tests.js 的统计）。否则每次重画都会再请求一次必然 404 的图片，
-            // 等 onerror 才退回接口图标 —— 界面看起来就是“图标一直闪不出来”。
-            if (file && !iconExportFailedFiles.has(String(file).toLowerCase())) return file;
+            // 这个注册名的导出图全都加载不了（本地确实没有可用图片）：允许去猜“约定名”，
+            // 猜不到就返回 null 由调用方退到接口层（那是最后一层，不是“因为 NBT 不同”才退的）。
         }
         // 元数据里没有这个物品（导出工具漏登记 / 元数据比图片旧）：按约定名猜一个 ——
         // 图片真的存在就直接用（图标始终优先 icon-exports）；不存在就 404 一次并退回接口图标。
@@ -524,7 +678,7 @@
         return null;
     }
 
-    /// 导出的物品名：**只在当前语言的元数据文件存在时**才给（否则返回 ''，交给 blocksitems / 翻译层）
+    /// 导出的物品名：只在当前语言的元数据文件存在时才给（否则返回 ''，交给 blocksitems / 翻译层）
     function iconExportName(kind, name, nbt) {
         const record = iconExportEntry(kind, name);
         if (!record) return '';
@@ -532,7 +686,7 @@
         return record.name || '';
     }
 
-    // 导出图片 404 时别反复请求（但**不**影响接口图标：那是另一层）
+    // 导出图片 404 时别反复请求（但不影响接口图标：那是另一层）
     function iconExportMarkFailed(file) {
         if (file) iconExportFailedFiles.add(String(file).toLowerCase());
     }

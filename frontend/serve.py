@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# IFM :: frontend/serve.py —— 本地静态服务器（**1.5.0 抢救后重写版**）
+# IFM :: frontend/serve.py —— 本地静态服务器（1.5.0 抢救后重写版）
 #
 # 用途：在 PC 上把 frontend/ 目录用 HTTP 提供出来，浏览器打开 index.html 即可用网页操作 IFM。
 #   python serve.py                 # 默认端口 8000

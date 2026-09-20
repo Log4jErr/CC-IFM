@@ -291,8 +291,8 @@
     }
 
     // ===================== 输入候选（自动补全，1.6.10）=====================
-    // 需求（用户第 16 项）：输入物品 / 流体 / 过滤器 / 标签…时，根据**已有的资源**给出候选，
-    // 候选以列表形式排在输入框**上方或下方**（取决于输入框在屏幕中的位置），并且支持：
+    // 需求（用户第 16 项）：输入物品 / 流体 / 过滤器 / 标签…时，根据已有的资源给出候选，
+    // 候选以列表形式排在输入框上方或下方（取决于输入框在屏幕中的位置），并且支持：
     //   ↑ / ↓ 选择候选项 · Tab 用候选补全输入框 · Enter 采用候选项 · Esc 关闭 · 鼠标点击采用
     // 原生 <datalist> 做不到“列表随位置上下翻转 + Tab 补全 + 自定义样式”，所以这里自己画一个浮层。
     const AC_LIMIT = 12;
@@ -526,7 +526,7 @@
     const OP_VALUES = ['gt', 'ge', 'eq', 'le', 'lt'];
     // 比较符号直接显示数学符号（gt/ge/eq/le/lt 对用户没有意义）
     const OP_LABELS = { gt: '>', ge: '≥', eq: '=', le: '≤', lt: '<' };
-    const ELEMENT_KINDS = ['item', 'fluid', 'filter', 'placeholder', 'virtual', 'waitSignal', 'emitSignal', 'emitPulse', 'waitTime'];
+    const ELEMENT_KINDS = ['item', 'fluid', 'filter', 'placeholder', 'waitSignal', 'emitSignal', 'emitPulse', 'waitTime'];
     const RULE_TYPES = [
         'item_include', 'item_exclude', 'fluid_include', 'fluid_exclude',
         'itemTag_include', 'itemTag_exclude', 'fluidTag_include', 'fluidTag_exclude',
@@ -571,9 +571,20 @@
         });
     }
 
+    /// 机器类型显示名（与 ifm-processes.js 里的同名助手一致）：预设类型本地化，自定义类型原样。
+    /// 注意：这两个脚本共享全局作用域，所以这里的 const 名字必须与那边不同（重复声明会直接报错）。
+    const EDITOR_MACHINE_TYPE_LABEL_KEYS = { turtle_crafter: 'machineTypeTurtleCrafter' };
+    function machineTypeLabel(name) {
+        const key = EDITOR_MACHINE_TYPE_LABEL_KEYS[String(name)];
+        if (!key) return String(name);
+        const text = t(key);
+        return (text && text !== key) ? text : String(name);
+    }
+
     function machineTypeOptions() {
         return byName(Array.from(stores.machineTypes.values())).map(function (item) {
-            return { value: item.name, label: item.name };
+            const label = machineTypeLabel(item.name);
+            return { value: item.name, label: label === item.name ? item.name : (label + ' (' + item.name + ')') };
         });
     }
 
@@ -795,7 +806,7 @@
         return '';
     }
 
-    // 当前编辑的容器需不需要名称：**只有输出容器需要**（机器按名字引用它、发送也要选它）；
+    // 当前编辑的容器需不需要名称：只有输出容器需要（机器按名字引用它、发送也要选它）；
     // 存储 / 交互容器都用外设名作定义名，不显示也不接受名称输入
     function isNamedContainerRole() {
         const role = readValue('fldRole') || (editorState.data && editorState.data.role) || 'storage';
@@ -895,31 +906,25 @@
     function elementKindLabel(kind) {
         const labels = {
             item: t('item'), fluid: t('fluid'), filter: t('filterKind'), placeholder: t('placeholder'),
-            virtual: t('virtual'),
             waitSignal: t('waitSignal'), emitSignal: t('emitSignal'), emitPulse: t('emitPulse'), waitTime: t('waitTime')
         };
         return labels[kind] || String(kind || '');
     }
 
-    // ===================== 流程设置复制 / 抽象模板 =====================
-    // 流程里只要有一个“虚操作”元素，它就是**抽象模板**：不能合成（服务端也会拒绝下单），
-    // 只用来把整套输入/输出设置复制到别的流程里（见 ifm-picker.js 的复制下拉框）。
-    function processHasVirtual(process) {
-        if (!process) return false;
-        return asArray(process.inputs).concat(asArray(process.outputs)).some(function (element) {
-            return element && element.kind === 'virtual';
-        });
-    }
+    // ===================== 流程设置复制 / 抽象流程（用户第 3 项）=====================
+    // 「抽象流程」的判定在 ifm-core.js（processIsAbstract / elementIsAbstract，与后端的
+    // Store.processIsAbstract 同一套语义）：物品/流体元素的注册名 = abstract 即为抽象操作。
+    // 抽象流程不能合成（服务端也会拒绝下单），只用来把整套输入/输出设置复制到别的流程里。
 
-    // 可以复制的来源流程：**只限同一个机器类型**；带虚操作的模板排在最前（用户要求优先显示）
+    // 可以复制的来源流程：只限同一个机器类型；抽象流程排在最前（优先显示）
     function processCopyCandidates(machineType) {
         const type = String(machineType || '');
         if (!type) return [];
         return Array.from(stores.processes.values())
             .filter(function (process) { return String(process.machineType || '') === type; })
             .sort(function (a, b) {
-                const left = processHasVirtual(a) ? 0 : 1;
-                const right = processHasVirtual(b) ? 0 : 1;
+                const left = processIsAbstract(a) ? 0 : 1;
+                const right = processIsAbstract(b) ? 0 : 1;
                 if (left !== right) return left - right;
                 return String(a.name).localeCompare(String(b.name));
             });
@@ -927,7 +932,7 @@
 
     function processCopyLabel(process) {
         const title = processTitleText(process);
-        return (processHasVirtual(process) ? '[' + t('template') + '] ' : '') +
+        return (processIsAbstract(process) ? '[' + t('abstractProcess') + '] ' : '') +
             String(process.name) + (title && title !== process.name ? ' · ' + title : '');
     }
 
@@ -969,11 +974,6 @@
             } else if (kind === 'placeholder') {
                 if (!String(element.name || '').trim() || !String(element.item || '').trim()) {
                     return at + t('processBadPlaceholder');
-                }
-            } else if (kind === 'virtual') {
-                // 虚操作（抽象模板元素）：输入/输出都能放，只要一个名字（复制到别的流程后靠它认出来）
-                if (!String(element.name || '').trim()) {
-                    return at + t('virtualNeedName');
                 }
             } else if (kind === 'waitSignal' || kind === 'emitSignal' || kind === 'emitPulse') {
                 const signalIndex = Number(element.machineSignalIndex || 0);

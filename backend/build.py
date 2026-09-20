@@ -4,26 +4,26 @@
 
 把本目录下的 backend/IFMMaster.lua 与 backend/modules/*.lua 打包成一个独立的 Lua 文件
 （默认 backend/ifm_bundle.lua）。
-产物是一个**纯解压器**：运行时把内嵌的源码写回磁盘的同级 ifm/ 目录（ifm/IFMMaster.lua + ifm/IFMWorker.lua + ifm/modules/*.lua），
-**不会自启服务端**，并在解压完成后**删除自身**；之后手动运行 IFMMaster.lua 启动服务端。
+产物是一个纯解压器：运行时把内嵌的源码写回磁盘的同级 ifm/ 目录（ifm/IFMMaster.lua + ifm/IFMWorker.lua + ifm/modules/*.lua），
+不会自启服务端，并在解压完成后删除自身；之后手动运行 IFMMaster.lua 启动服务端。
 因此既保留了“多文件模块化开发”，又方便整包复制进 CC:Tweaked 计算机后一次性拆包。
 
-注意：产物**不要命名为 IFMMaster.lua**（同名时它会被当作服务端入口保留、不自我删除，
+注意：产物不要命名为 IFMMaster.lua（同名时它会被当作服务端入口保留、不自我删除，
 而且它是解压器而不是服务端本体）。
 
 用法（一条命令完成全部检查与打包；在仓库根或 backend/ 下都能跑）：
-  python backend/build.py                # 输出到 backend/ifm_bundle.lua（**默认剥离注释**）
+  python backend/build.py                # 输出到 backend/ifm_bundle.lua（默认剥离注释）
   cd backend && python build.py          # 等价写法
   python backend/build.py -o dist/ifm_unpack.lua   # 指定输出路径
   python backend/build.py --keep-comments          # 保留源码注释（产物会大一倍以上，一般不要）
   python backend/build.py --fix-ascii              # 发现非 ASCII 时自动转成 \\uXXXX 后继续构建
 
-产物默认**不带注释**：模块里的中文注释是体积大头（UTF-8 三字节一个字），
+产物默认不带注释：模块里的中文注释是体积大头（UTF-8 三字节一个字），
 CC:Tweaked 计算机的磁盘很小（默认 1MB），带注释的产物会直接写不进去（"ifm_bundle: out of space"）。
-剥离是 Lua 感知的（不会误伤字符串与 [[..]] 长字符串），并且剥离后会**再跑一次语法检查**；
+剥离是 Lua 感知的（不会误伤字符串与 [[..]] 长字符串），并且剥离后会再跑一次语法检查；
 产物解压出来的源码因此没有注释 —— 要看注释请直接用仓库里的 backend/ 源码。
 
-构建流程里**强制**包含源码 ASCII 检查（不需要手动跑别的脚本）：
+构建流程里强制包含源码 ASCII 检查（不需要手动跑别的脚本）：
   * 代码部分（包括字符串字面量）只能是 ASCII；出现其他字符直接报错并中止构建。
   * 注释里可以放任意字符（中文说明不受影响）。
   * 字符串里的中文写成 \\uXXXX 字面转义即可，浏览器会还原成中文再显示：
@@ -43,6 +43,9 @@ MAIN_FILE_NAME = "IFMMaster.lua"
 # 分布式工作节点入口（也会打进产物：解压后同一台机器上就能二选一启动；
 # 计算机角色只取决于你启动哪个入口：ifm.lua = 主控，IFMWorker.lua = 工作节点）
 WORKER_FILE_NAME = "IFMWorker.lua"
+# 机械臂合成器入口（IFMCrafter.lua）：也打进产物 —— 机械臂和主控用同一份产物，
+# 角色只由启动哪个入口决定（用户要求：crafter 要一起打包，不再单独分发）。
+CRAFTER_FILE_NAME = "IFMCrafter.lua"
 DEFAULT_OUTPUT = "ifm_bundle.lua"
 
 HEADER = """-- IFM (Integrated Factory Manager) single-file unpacker
@@ -53,9 +56,10 @@ HEADER = """-- IFM (Integrated Factory Manager) single-file unpacker
 --   * creates an "ifm" directory next to this file and writes the embedded sources into it:
 --       ifm/IFMMaster.lua    (server entry - start it yourself afterwards)
 --       ifm/IFMWorker.lua    (worker entry)
+--       ifm/IFMCrafter.lua   (turtle/robot crafter entry)
 --       ifm/modules/*.lua    (modules; identical content is skipped)
 --   * then deletes this bundle file itself
---     (unless this file is named IFMMaster.lua / IFMWorker.lua, in which case it is kept).
+--     (unless this file is named IFMMaster.lua / IFMWorker.lua / IFMCrafter.lua, in which case it is kept).
 --
 -- Usage (CC:Tweaked computer):
 --   ifm_bundle                     (run this file once)
@@ -67,6 +71,60 @@ HEADER = """-- IFM (Integrated Factory Manager) single-file unpacker
 def read_text(path):
     with open(path, "r", encoding="utf-8") as handle:
         return handle.read()
+
+
+def bump_build_stamp(base_dir):
+    """把网页构建戳（data-ifm-build / 所有 ?v= / IFM_APP_BUILD）统一 +1。
+
+    用户要求：构建时前后端版本号要一起改 —— 这三处数字必须一致，手动改最容易漏一处
+    （漏了浏览器就继续用缓存的旧 JS，改了前端也看不到）。DOM 冒烟测试会校验它们一致。
+    """
+    repo = os.path.dirname(os.path.abspath(base_dir))
+    index_path = os.path.join(repo, "frontend", "index.html")
+    app_path = os.path.join(repo, "frontend", "web", "ifm-app.js")
+    index = read_text(index_path)
+    match = re.search(r'data-ifm-build="(\d+)"', index)
+    if not match:
+        raise SystemExit("找不到 data-ifm-build：%s" % index_path)
+    current = int(match.group(1))
+    nxt = current + 1
+    index = re.sub(r'data-ifm-build="\d+"', 'data-ifm-build="%d"' % nxt, index)
+    index = re.sub(r"\?v=\d+", "?v=%d" % nxt, index)
+    with open(index_path, "w", encoding="utf-8", newline="") as handle:
+        handle.write(index)
+    app = read_text(app_path)
+    app = re.sub(r"IFM_APP_BUILD = '\d+'", "IFM_APP_BUILD = '%d'" % nxt, app)
+    with open(app_path, "w", encoding="utf-8", newline="") as handle:
+        handle.write(app)
+    print("网页构建戳：%d -> %d（data-ifm-build / 全部 ?v= / IFM_APP_BUILD 已同步）" % (current, nxt))
+    return nxt
+
+
+def set_version(base_dir, version):
+    """把版本号写到所有**必须一致**的地方（用户要求：构建时前后端版本号一起改）。
+
+    三处：modules/transfer.lua 的 Transfer.VERSION（master / worker / crafter 共用）、
+    IFMMaster.lua 的字面量（加载顺序原因不能引用模块）、web/ifm-core.js 的 IFM_CLIENT_VERSION。
+    写完后 build 会核对前两处（不一致直接中止），网页连上时也会比对客户端版本。
+    """
+    repo = os.path.dirname(os.path.abspath(base_dir))
+    edits = [
+        (os.path.join(base_dir, "modules", "transfer.lua"),
+         r'(Transfer\.VERSION = ")[^"]+(")', r"\g<1>%s\g<2>" % version),
+        (os.path.join(base_dir, "IFMMaster.lua"),
+         r'(local IFM_VERSION = ")[^"]+(")', r"\g<1>%s\g<2>" % version),
+        (os.path.join(repo, "frontend", "web", "ifm-core.js"),
+         r"(IFM_CLIENT_VERSION = ')[^']+(')", r"\g<1>%s\g<2>" % version),
+    ]
+    for path, pattern, replacement in edits:
+        content = read_text(path)
+        updated, count = re.subn(pattern, replacement, content)
+        if count != 1:
+            raise SystemExit("版本号写入失败（%s，匹配 %d 次）" % (path, count))
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(updated)
+        print("版本号：%s -> %s" % (os.path.relpath(path, repo), version))
+    return version
 
 
 def collect_files(base_dir):
@@ -91,12 +149,14 @@ def collect_files(base_dir):
 
 
 def collect_extra_entries(base_dir):
-    """除模块与主入口之外，还要一起打进产物的**独立入口文件**（解压后即可就地启动）。
-    目前是 IFMWorker.lua：worker 计算机与主控计算机用的是同一份产物，角色只由启动的入口决定。"""
+    """除模块与主入口之外，还要一起打进产物的独立入口文件（解压后即可就地启动）。
+    目前是 IFMWorker.lua 与 IFMCrafter.lua：worker 计算机、机械臂（海龟）与主控计算机
+    用的是同一份产物，角色只由启动的入口决定。"""
     out = []
-    worker_path = os.path.join(base_dir, WORKER_FILE_NAME)
-    if os.path.isfile(worker_path):
-        out.append((WORKER_FILE_NAME, read_text(worker_path)))
+    for name in (WORKER_FILE_NAME, CRAFTER_FILE_NAME):
+        path = os.path.join(base_dir, name)
+        if os.path.isfile(path):
+            out.append((name, read_text(path)))
     return out
 
 
@@ -127,7 +187,7 @@ end
 local __ifm_unpack = function()
     local program = (shell and shell.getRunningProgram and shell.getRunningProgram()) or "{main}"
     --- `wget run <url>` 时“正在运行的程序”在磁盘上并不存在（甚至可能是个 URL 字符串）：
-    --- 这时就解包到 **shell 的当前目录**；本地运行则用产物自己所在目录，不拿不存在的路径去 fs.getDir
+    --- 这时就解包到 shell 的当前目录；本地运行则用产物自己所在目录，不拿不存在的路径去 fs.getDir
     local bundleDir
     if fs.exists(program) then
         bundleDir = fs.getDir(program)
@@ -145,7 +205,21 @@ local __ifm_unpack = function()
         fs.makeDir(baseDir)
         print("[IFM] created directory: " .. baseDir)
     end
-    local programPath = __ifm_normalizePath(program)
+    --- 先删掉自己再解压（CC:T 的磁盘很小）：产物本身有几百 KB，和"解压出来的 18 个文件"同时存在
+    --- 很容易超出磁盘容量（运行时报 out of space 而半途而废）。源码此刻已全部读进内存，
+    --- 删掉磁盘上的产物文件不影响这次解压 —— 只是不能再"重跑一次解压"了（重新下载即可）。
+    --- 注意：本产物被命名为 IFMMaster.lua / IFMWorker.lua / IFMCrafter.lua 时不删（它是入口本体）。
+    local isEntryName = (programPath == "IFMMaster.lua" or programPath == "IFMWorker.lua"
+        or programPath == "IFMCrafter.lua")
+    if fs.exists(program) and not isEntryName then
+        local removed, removeErr = pcall(fs.delete, program)
+        if removed then
+            print("[IFM] unpacker deleted first (frees disk space before unpacking): " .. program)
+        else
+            print("[IFM] note: could not delete the unpacker now (" .. tostring(removeErr) ..
+                ") - unpacking anyway")
+        end
+    end
     local created, updated, unchanged, skipped = 0, 0, 0, 0
     for relative, content in pairs(__IFM_FILES) do
         local path = fs.combine(baseDir, relative)
@@ -213,16 +287,18 @@ end
 local __ifm_self = (shell and shell.getRunningProgram and shell.getRunningProgram()) or nil
 local __ifm_entry = __ifm_normalizePath(fs.combine(__ifm_base, "{main}"))
 local __ifm_worker = __ifm_normalizePath(fs.combine(__ifm_base, "{worker}"))
+local __ifm_crafter = __ifm_normalizePath(fs.combine(__ifm_base, "{crafter}"))
 if __ifm_self == nil then
     print("[IFM] warning: cannot locate this file, please delete it manually")
 elseif not fs.exists(__ifm_self) then
     -- `wget run <url>` / `pastebin run ...` 这类“直接从 URL 跑”的情况：磁盘上根本没有这个文件，
     -- 没有东西可删（也不要打印“删不掉”的警告）。（1.6.13）
-    print("[IFM] this bundle was run from a URL (no file on disk): nothing to delete")
+    print("[IFM] nothing to delete now (run from a URL, or already removed before unpacking)")
 elseif __ifm_normalizePath(__ifm_self) == __ifm_entry
-    or __ifm_normalizePath(__ifm_self) == __ifm_worker then
-    -- 本产物被命名为 ifm.lua / IFMWorker.lua：它就是入口文件本身，不能删除自己
-    print("[IFM] this file is named {main} or {worker}, keeping it (it is an entry point, not the unpacker)")
+    or __ifm_normalizePath(__ifm_self) == __ifm_worker
+    or __ifm_normalizePath(__ifm_self) == __ifm_crafter then
+    -- 本产物被命名为入口文件名（IFMMaster.lua / IFMWorker.lua / IFMCrafter.lua）：它就是入口本体
+    print("[IFM] this file is named {main} / {worker} / {crafter}, keeping it (it is an entry point)")
 else
     local okDelete, deleteErr = pcall(fs.delete, __ifm_self)
     if okDelete then
@@ -450,7 +526,7 @@ LUAPARSE_ENV = [None]           # 探测成功时用的环境（带 NODE_PATH）
 
 def luaparse_env(base_dir):
     """构造“能 require 到 luaparse”的环境变量：优先仓库里的 backend/node_modules，
-    其次是上一层与 npm 全局目录。**必须把它同时交给探测与实际检查**：
+    其次是上一层与 npm 全局目录。必须把它同时交给探测与实际检查：
     检查脚本写在临时目录里（%TEMP%），Node 只按脚本所在目录向上找 node_modules，
     看不到 backend/node_modules —— 以前只有探测带了这个环境，于是“探测通过、检查却
     报 Cannot find module 'luaparse'”，构建莫名其妙中止（错误还在 stderr 里被吞掉）。"""
@@ -527,6 +603,125 @@ def run_lua_syntax_check(files, base_dir=None):
     return files
 
 
+# ===== 文件级 local 用在声明之前（运行时读到的是 nil 全局）=====
+# 现场（用户报的真实故障）：`local stackScanStats = {...}` 原本写在文件 1400 行，
+# 而 700 行的快照函数里先用了它 —— Lua 的 local 只从声明那行起生效，于是 700 行读到的是
+# 一个不存在的全局（nil），快照推送整个抛错，网页上机器定义与外设信息全部消失。
+# 这类错误 luaparse 查不出来（语法完全合法），只在运行时炸，所以在这里静态拦一道。
+#
+# 规则（刻意保守，宁可漏报也不要误报把构建卡住）：
+#   * 只看**顶格**的 local 声明（`^local ...` / `^local function ...`）= 文件级状态；
+#   * 名字如果在文件里任何位置当过**函数参数**或**for 循环变量**，就整体跳过
+#     （那些在别的函数里同名，正则分辨不出作用域，跳过最安全）；
+#   * 剩下的名字若在声明行之前就被当成表/函数用（name. / name[ / name( / name:），
+#     就是真 bug —— Lua 会读到一个 nil 全局。
+LOCAL_LIST_DECL = re.compile(r"^local\s+([A-Za-z_][A-Za-z_0-9]*(?:\s*,\s*[A-Za-z_][A-Za-z_0-9]*)*)\s*(?:=|$)",
+                             re.MULTILINE)
+LOCAL_FUNC_DECL = re.compile(r"^local\s+function\s+([A-Za-z_][A-Za-z_0-9]*)", re.MULTILINE)
+FUNCTION_PARAMS = re.compile(r"\bfunction\b[^(\n]*\(([^)]*)\)")
+FOR_VARIABLES = re.compile(r"^\s*for\s+(.+?)\s+(?:in\b|=)")
+IDENTIFIER_ONLY = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*$")
+
+
+def collect_bound_names(content):
+    """文件里出现过的函数参数名 / for 循环变量名（含 `for _, x in` 这种）。"""
+    bound = set()
+    code = STRING_LITERAL.sub('""', content)
+    for match in FUNCTION_PARAMS.finditer(code):
+        for name in match.group(1).split(","):
+            name = name.strip()
+            if IDENTIFIER_ONLY.match(name):
+                bound.add(name)
+    for match in FOR_VARIABLES.finditer(code):
+        for name in match.group(1).split(","):
+            name = name.strip()
+            if IDENTIFIER_ONLY.match(name):
+                bound.add(name)
+    return bound
+
+
+def run_local_order_check(files):
+    """检查“顶格 local 在声明之前就被当成表/函数使用”（Lua 会当成全局，运行时是 nil）。"""
+    problems = []
+    for rel, content in files:
+        lines = content.splitlines()
+        bound = collect_bound_names(content)
+        declarations = {}
+        for index, line in enumerate(lines, 1):
+            code = STRING_LITERAL.sub('""', line).split("--")[0]
+            match = LOCAL_FUNC_DECL.match(code)
+            if match:
+                declarations.setdefault(match.group(1), index)
+            match = LOCAL_LIST_DECL.match(code)
+            if match:
+                for name in match.group(1).split(","):
+                    name = name.strip()
+                    if name and name not in declarations:
+                        declarations[name] = index
+        for name, first in declarations.items():
+            if name in bound:
+                continue
+            pattern = re.compile(r"(?<![A-Za-z0-9_.:])%s\s*[:.\[(]" % re.escape(name))
+            for index, line in enumerate(lines, 1):
+                if index >= first:
+                    break
+                code = STRING_LITERAL.sub('""', line).split("--")[0]
+                if pattern.search(code):
+                    problems.append("  %s:%d  先用后声明：`%s`（它到第 %d 行才 local）"
+                                    % (rel, index, name, first))
+                    break
+    if problems:
+        raise SystemExit(
+            "构建中止：文件级局部变量在声明之前就被使用（Lua 会把它当全局，运行时是 nil：\n"
+            "attempt to index global 'x' (a nil value)）。\n"
+            "修法：把这个 local 声明挪到第一次使用之前（一般放在文件上方的状态区）：\n"
+            + "\n".join(problems))
+    print("定义顺序检查：通过（%d 个 Lua 文件，没有“先用后声明”的文件级局部变量）" % len(files))
+    return files
+
+
+def run_local_order_check(files):
+    """检查“局部变量在声明之前被当成表/函数使用”。
+
+    只关心文件里**确实存在 local 声明**的名字：它们一旦出现在声明行之前，
+    Lua 会把那处当成全局变量（nil），运行时报 attempt to index/call global 'x'。
+    """
+    problems = []
+    for rel, content in files:
+        lines = content.splitlines()
+        declarations = {}
+        for index, line in enumerate(lines, 1):
+            code = STRING_LITERAL.sub('""', line).split("--")[0]
+            match = LOCAL_FUNC_DECL.match(code)
+            if match:
+                declarations.setdefault(match.group(1), []).append(index)
+            match = LOCAL_LIST_DECL.match(code)
+            if match:
+                for name in match.group(1).split(","):
+                    name = name.strip()
+                    if name:
+                        declarations.setdefault(name, []).append(index)
+        for name, numbers in declarations.items():
+            first = numbers[0]
+            pattern = re.compile(r"(?<![A-Za-z0-9_.:])%s\s*[:.\[(]" % re.escape(name))
+            for index, line in enumerate(lines, 1):
+                if index >= first:
+                    break
+                code = STRING_LITERAL.sub('""', line).split("--")[0]
+                if pattern.search(code):
+                    problems.append("  %s:%d  先用后声明：`%s`（它到第 %d 行才 local）"
+                                    % (rel, index, name, first))
+                    break
+    if problems:
+        raise SystemExit(
+            "构建中止：局部变量在声明之前就被使用（Lua 会把它当全局，运行时是 nil：\n"
+            "attempt to index global 'x' (a nil value)）。\n"
+            "修法：把这个 local 声明挪到第一次使用之前（一般放在文件上方的状态区）：\n"
+            + "\n".join(problems))
+    print("定义顺序检查：通过（%d 个 Lua 文件，没有“先用后声明”的局部变量）" % len(files))
+    return files
+
+
 def run_reserved_word_check(files):
     """检查有没有把 Lua 保留字当字段名/表键（这是 Lua 5.1 语法错误，只有 load 时才报）。"""
     problems = []
@@ -547,7 +742,7 @@ def run_reserved_word_check(files):
 
 
 def run_tools_check(base_dir):
-    """检查 tools/*.lua（netsync / netserver / crafter 这些**单独运行**的脚本）。
+    """检查 tools/*.lua（netsync / netserver / crafter 这些单独运行的脚本）。
 
     它们不参与打包，但同样要守规矩（用户第 4 项要求）：
       * 代码与字符串只允许 ASCII —— 脚本把提示 print 到 CC 终端，终端字形没有中日韩字符，
@@ -634,22 +829,26 @@ def build_bundle(base_dir, output_path, keep_comments=False, fix_ascii=False):
     files = list(modules) + [main_entry] + extras
     # 构建流程内强制做 ASCII 检查（必要时可自动修正并继续）
     files = run_ascii_check(files, fix_ascii)
+    # 检查“局部变量先用后声明”（运行时是 nil 全局，会让整包快照推送失败）
+    files = run_local_order_check(files)
     # 再检查“保留字当字段名/表键”（Lua 5.1 语法错误，只有 load 时才暴露）
     files = run_reserved_word_check(files)
     # 最后检查“实例字段有没有把类方法遮蔽掉”（运行时报 attempt to call method 'x'）
     files = run_method_shadow_check(files)
     # Lua 语法检查（方法调用参数 / 块结构 / 字符串收尾）：本机没有 lua 可执行文件，这里是轻量替代
     files = run_lua_syntax_check(files)
-    # tools/ 下的脚本是**单独运行**的（不进 bundle），但也要过 ASCII 与语法检查：
+    # tools/ 下的脚本是单独运行的（不进 bundle），但也要过 ASCII 与语法检查：
     # 它们直接 print 到 CC 终端，字符串里的非 ASCII 会变成乱码（用户第 4 项要求）。
     run_tools_check(base_dir)
     raw_size = sum(len(content.encode("utf-8")) for _, content in files)
     extra_count = len(extras)
     if not keep_comments:
-        # **默认剥离全部注释**（所有内嵌文件，包括 IFMWorker.lua）：中文注释是产物体积的大头，
+        # 默认剥离全部注释（所有内嵌文件，包括 IFMWorker.lua）：中文注释是产物体积的大头，
         # CC:T 磁盘放不下就会报 “ifm_bundle: out of space”。注释只影响可读性，不影响运行。
         files = [(rel, strip_comments(content)) for rel, content in files]
-        # 剥离后的源码必须仍然是**合法 Lua**（防止剥离器误伤字符串 / 长字符串）：再过一遍语法检查
+        # 再删掉每行行首缩进（Lua 不在乎缩进，但光缩进就有几十 KB —— 小磁盘上不值得）
+        files = [(rel, strip_line_indentation(content)) for rel, content in files]
+        # 剥离后的源码必须仍然是合法 Lua（防止剥离器误伤字符串 / 长字符串）：再过一遍语法检查
         files = run_lua_syntax_check(files)
     # 报告用：按顺序切回「模块 / 主入口 / 额外入口」
     modules = files[:len(files) - 1 - extra_count]
@@ -668,6 +867,7 @@ def build_bundle(base_dir, output_path, keep_comments=False, fix_ascii=False):
             module_dir=MODULE_DIR_NAME,
             main=MAIN_FILE_NAME,
             worker=WORKER_FILE_NAME,
+            crafter=CRAFTER_FILE_NAME,
             entries=render_entries(files),
         ),
     ]
@@ -681,8 +881,51 @@ def build_bundle(base_dir, output_path, keep_comments=False, fix_ascii=False):
     return files, len(bundle), raw_size, stripped_size
 
 
+def strip_line_indentation(content):
+    """删掉每行**行首**的空白（行尾空白留给 strip_comments 处理），字符串里的内容一字不动。
+
+    为什么：Lua 不在乎缩进，而深度缩进的模块每行要花 4~12 个空格 —— 18 个文件加起来是
+    几十 KB，在 CC:T 的小磁盘上（默认 1MB，还要放 config.json / cache.json）非常不值得。
+    换行符保留（行号不变，报错行号仍然对得上源码），只丢缩进。
+
+    安全性：与 strip_comments 一样是 Lua 感知的 —— [[...]] 长字符串/长注释整段原样复制，
+    '...' / "..." 短字符串也原样复制（里面的前导空格有语义）。剥离后构建会再跑一遍 luaparse，
+    一旦误伤字符串会立刻报错中止。
+    """
+    out = []
+    index = 0
+    size = len(content)
+    at_line_start = True
+    while index < size:
+        match = LONG_BRACKET.match(content, index)
+        if match:
+            end = long_bracket_end(content, index, match.group(1))
+            out.append(content[index:end])
+            at_line_start = content[end - 1:end] == "\n"
+            index = end
+            continue
+        char = content[index]
+        if char == "\n":
+            out.append(char)
+            at_line_start = True
+            index += 1
+            continue
+        if at_line_start and (char == " " or char == "\t"):
+            index += 1                          # 行首缩进直接丢掉
+            continue
+        at_line_start = False
+        if char in "\"'":
+            end = scan_short_string(content, index)
+            out.append(content[index:end])
+            index = end
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
 def strip_comments(content):
-    """删掉 Lua 源码里**所有**注释（行注释 `--` 与块注释 `--[[ ]]`），保留其余内容与行数。
+    """删掉 Lua 源码里所有注释（行注释 `--` 与块注释 `--[[ ]]`），保留其余内容与行数。
 
     为什么要这么做：模块里有大量中文注释（UTF-8 三个字节一个字），一起打进产物会让产物
     体积翻倍 —— CC:Tweaked 计算机的磁盘很小（默认 1MB），产物会直接写不进去
@@ -691,7 +934,7 @@ def strip_comments(content):
 
     正确处理（绝不会误伤代码）：
       * 短字符串 '...' / "..."（含 \\ 转义）；
-      * 长字符串 [[...]] / [=[...]=]：Lua 里这是**代码**，原样保留；
+      * 长字符串 [[...]] / [=[...]=]：Lua 里这是代码，原样保留；
       * 整行注释与行尾注释；
       * 块注释里的换行保留 —— 行号基本不变，产物里的报错仍然对得上源码；
       * 注释删掉后行尾留下的空白也一并清掉（产物更小），但绝不会动字符串内部。
@@ -791,16 +1034,25 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="IFM 单文件构建脚本")
     parser.add_argument("-o", "--out", default=None, help="输出文件路径（默认与脚本同级的 %s）" % DEFAULT_OUTPUT)
     parser.add_argument("--keep-comments", "--minify-comments-off", dest="keep_comments", action="store_true",
-                        help="保留源码注释（默认**会**全部剥离：产物要能塞进 CC:T 的小磁盘）")
+                        help="保留源码注释（默认会全部剥离：产物要能塞进 CC:T 的小磁盘）")
     parser.add_argument("--fix-ascii", action="store_true",
                         help="发现非 ASCII 的代码/字符串时自动转成 \\uXXXX 再继续构建（默认报错中止）")
+    parser.add_argument("--version", default=None, metavar="X.Y.Z",
+                        help="把版本号写到所有必须一致的地方（transfer.lua / IFMMaster.lua / web/ifm-core.js）")
+    parser.add_argument("--bump", action="store_true",
+                        help="网页构建戳 +1（data-ifm-build / 全部 ?v= / IFM_APP_BUILD 三处同步）")
     args = parser.parse_args(argv)
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
+    if args.version:
+        set_version(base_dir, args.version)
+    if args.bump:
+        bump_build_stamp(base_dir)
     output_path = args.out or os.path.join(base_dir, DEFAULT_OUTPUT)
-    if os.path.basename(output_path).lower() in (MAIN_FILE_NAME, WORKER_FILE_NAME.lower()):
-        print("警告：产物与 %s / %s 同名，运行时会被保留（不自我删除）；它本身不是入口本体，建议换个名字。" %
-              (MAIN_FILE_NAME, WORKER_FILE_NAME))
+    if os.path.basename(output_path).lower() in (MAIN_FILE_NAME.lower(), WORKER_FILE_NAME.lower(),
+                                                 CRAFTER_FILE_NAME.lower()):
+        print("警告：产物与 %s / %s / %s 同名，运行时会被保留（不自我删除）；它本身不是入口本体，建议换个名字。" %
+              (MAIN_FILE_NAME, WORKER_FILE_NAME, CRAFTER_FILE_NAME))
     files, size, raw_size, stripped_size = build_bundle(base_dir, output_path, args.keep_comments, args.fix_ascii)
     print("已生成单文件产物：%s" % output_path)
     print("内嵌文件 %d 个（含主入口）：" % len(files))
@@ -811,10 +1063,12 @@ def main(argv=None):
         print("注释剥离：源码 %d 字节 -> %d 字节（省下 %d 字节，%.0f%%）" %
               (raw_size, stripped_size, saved, (saved * 100.0 / raw_size) if raw_size else 0))
     print("产物总计 %d 字节（CC:T 默认磁盘 1MB，%s）" %
-          (size, "放得下" if size < 1000000 else "**可能放不下**：请检查是否有超大文件或改用 --out 分卷"))
-    print("提示：产物只解压、不自启：运行后会在**同级创建 ifm/ 目录**，把 IFMMaster.lua / IFMWorker.lua 与 "
-      "modules/*.lua 写进去，并删除产物自身；")
+          (size, "放得下" if size < 1000000 else "可能放不下：请检查是否有超大文件或改用 --out 分卷"))
+    print("提示：产物只解压、不自启：运行后会在同级创建 ifm/ 目录，把 IFMMaster.lua / IFMWorker.lua / "
+      "IFMCrafter.lua 与 modules/*.lua 写进去，并删除产物自身；")
     print("      然后手动运行 ifm/%s [--room <房间号>] [--relay <中转地址前缀>] [--random-room] 启动服务端。" % MAIN_FILE_NAME)
+    print("      其它计算机（worker / 机械臂）用同一份产物解压后，启动 ifm/%s 或 ifm/%s 即可。"
+          % (WORKER_FILE_NAME, CRAFTER_FILE_NAME))
     return 0
 
 

@@ -68,14 +68,22 @@ function Peripherals:scan()
     self.inventory = {}
     self.fluid = {}
     self.redstone = {}
+    self.turtle = {}
     self.other = {}
     self.wrapped = {}
     for _, name in ipairs(listNames()) do
         local isInventory = hasType(name, "inventory")
         local isFluid = hasType(name, "fluid_storage")
         local isRelay = hasType(name, "redstone_relay")
+        --- 机械臂（海龟）外设：**不是** inventory 外设（用户第 2 项：海龟方块没有 inventory），
+        --- 但它的物品栏可以作为 pushItems / pullItems 的目标 —— 只允许当"交互容器"用
+        --- （见 Containers:supports 与 roles=interaction）；存储/输出容器必须是真 inventory。
+        local isTurtle = hasType(name, "turtle")
         if isInventory then
             self.inventory[name] = true
+        end
+        if isTurtle then
+            self.turtle[name] = true
         end
         if isFluid then
             self.fluid[name] = true
@@ -83,7 +91,7 @@ function Peripherals:scan()
         if isRelay then
             self.redstone[name] = true
         end
-        if not isInventory and not isFluid and not isRelay then
+        if not isInventory and not isTurtle and not isFluid and not isRelay then
             self.other[name] = true
         end
     end
@@ -109,8 +117,22 @@ function Peripherals:isFluid(name)
     return self.fluid[name] == true
 end
 
+--- 机械臂（海龟）外设：它不是 inventory 外设，但物品栏可以作为 pushItems/pullItems 的目标。
+--- 主控用它做两件事：把 turtle_crafter 的容器指向它（用户第 5 项）、
+--- 以及和"正在跑的合成器"上报的网络名对照（用户第 2 项）。
+function Peripherals:isTurtle(name)
+    return self.turtle[name] == true
+end
+
+--- 当前看到的全部机械臂外设名（按名称排序）
+function Peripherals:turtleNames()
+    return self:names("turtle")
+end
+
 function Peripherals:exists(name)
+    --- 机械臂（海龟）也算"存在"：它不是 inventory 外设，但物品栏可以当交互容器用（用户第 2 项）
     return self.inventory[name] == true or self.fluid[name] == true or self.redstone[name] == true
+        or self.turtle[name] == true
 end
 
 --- 包装（带缓存）

@@ -1,7 +1,7 @@
 -- IFM :: modules/modems.lua
 -- modem 发现与包装：主控（modules/transfer.lua 调度 IFMWorker）与 worker（IFMWorker.lua）共用。
 --
--- 为什么单独成模块：这两边以前各写了一份（约 60 行几乎逐行相同）。worker 跑在**别的计算机**上，
+-- 为什么单独成模块：这两边以前各写了一份（约 60 行几乎逐行相同）。worker 跑在别的计算机上，
 -- 出问题最难查，任何一处修正（有线优先、多类型外设、wrap 参数的兼容）都要保证两边一致。
 --
 -- 关键约定：peripheral.find 的返回值在不同 CC:T 版本 / 分支里不完全一样
@@ -45,7 +45,7 @@ function Modems.isWiredModem(modem)
     return ok and wireless == false
 end
 
---- 找一个 modem，**有线优先**；一个都没有时返回 nil, nil
+--- 找一个 modem，有线优先；一个都没有时返回 nil, nil
 function Modems.find()
     local wireless, wirelessName = nil, nil
     local first, second = peripheral.find("modem")

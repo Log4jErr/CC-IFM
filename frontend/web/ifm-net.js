@@ -9,8 +9,18 @@
     function serverLog(line) {
         serverLogLines.push(line);
         while (serverLogLines.length > 500) serverLogLines.shift();
-        if (window.console && console.log) {
-            console.log(line);
+        if (!window.console || !console.log) return;
+        // 用户第 2 项：日志分级上色 —— 后端在行首加了 [warn] / [error] 标记
+        //（见 modules/util.lua 的 LOG_TAGS / classify），网页这边据此换颜色与打印通道。
+        const text = String(line);
+        const match = /^\[[^\]]*\]\s*\[(warn|error)\]\s/.exec(text);
+        const level = match ? match[1] : 'info';
+        if (level === 'error') {
+            (console.error || console.log).call(console, '%c' + text, 'color:#ff6b6b');
+        } else if (level === 'warn') {
+            (console.warn || console.log).call(console, '%c' + text, 'color:#e0b050');
+        } else {
+            console.log(text);
         }
     }
     window.ifmServerLog = function () { return serverLogLines.slice(); };
@@ -35,6 +45,10 @@
     // 已发出、还没收到响应的请求数：按钮点下去就能看到“请求中 N”，不必等结果
     let pendingCount = 0;
 
+    // 本连接在房间里的 uid（中继在自己的 join 帧里给）：用来丢掉"中继回声回来的自己发的帧"。
+    // 每次连接都是新的 uid，断开时清空（见 handleIncoming / socket.onclose）。
+    let myUid = null;
+
     function updatePendingInfo() {
         const node = el('pendingInfo');
         if (!node) return;
@@ -48,7 +62,7 @@
                 return;
             }
             const id = ++requestSeq;
-            // 注意顺序：请求关联 id 与 action **必须最后写入**，否则 payload 里同名的字段
+            // 注意顺序：请求关联 id 与 action 必须最后写入，否则 payload 里同名的字段
             // （例如 delete_delivery 的 { id = 发货 id }）会把关联 id 覆盖掉 ——
             // 响应确实回来了，但网页按错误的 id 找不到等待中的请求，只能干等 30 秒超时
             //（用户实测：“request delete_delivery got no response in 30s”就是这么来的）。
@@ -88,6 +102,19 @@
         } catch (err) {
             return;
         }
+        // 发送者身份必须在解包 data.message **之前**取：解包之后这一层就没了。
+        // 中继的房间广播是"发给所有人（包含发送者自己）"，所以我们会收到自己刚发出的帧 ——
+        // 必须按 uid 丢掉，否则它会被当成服务端数据：自己发出的请求回声与本请求 id 相同，
+        // 谁先到谁被下面的 pendingRequests 认领（回声带的是请求体、没有 result）⇒
+        // 表现为"点了没反应 / 结果不刷新"。（服务端也做同样的过滤，见 protocol.lua 的 isOwnFrame。）
+        const frameType = data && data.type;
+        const fromUid = data && data.uid != null ? String(data.uid) : null;
+        if (frameType === 'join' && data.self) {
+            myUid = fromUid;
+        } else if (frameType === 'leave' && fromUid && fromUid === myUid) {
+            myUid = null;
+        }
+        if (fromUid && myUid && fromUid === myUid) return;
         if (data.message && typeof data.message === 'object') {
             data = data.message;
         } else if (typeof data.message === 'string') {
@@ -96,6 +123,9 @@
         // 传输层里的名称字段是 ASCII 转义形式：只把这些字段还原成真正的字符
         data = decodeFrameFromServer(data);
         if (data.type === 'join' || data.type === 'leave') return;
+        // 服务端的应用层保活（没人看网页时防止中继因"空闲"踢连接）：静默忽略。
+        // 它不代表服务端有状态变化 —— 不需要刷新看门狗，也不需要重画界面。
+        if (data.type === 'keepalive') return;
         // 带 action 的帧只可能来自 IFM 服务端：收到它才把状态切成“已连接”（同时刷新看门狗时间）
         if (data.action) markServerSeen();
         // 服务端日志：没有任何文件写入，全部由服务端推送到这里，直接在浏览器控制台打印
@@ -118,7 +148,7 @@
             return;
         }
         if (data.action === 'full_sync_start') {
-            // 全量同步开始：**先不清空**本地数据（清空会让所有列表瞬间变空 → 整页闪一下）。
+            // 全量同步开始：先不清空本地数据（清空会让所有列表瞬间变空 → 整页闪一下）。
             // 服务端只要房间里有客户端加入/重连就会广播一次全量，清空式处理会让“闪一下”反复发生。
             beginFullSync();
             return;
@@ -169,7 +199,7 @@
 
     // ===================== 全量同步（无闪） =====================
     // 服务端全量 = full_sync_start → 分批 incremental_update → full_sync_end。
-    // 这里在 start..end 之间把数据先收进缓冲，end（或超时兜底）时**整体替换**并只重画一次：
+    // 这里在 start..end 之间把数据先收进缓冲，end（或超时兜底）时整体替换并只重画一次：
     // 页面不会再出现“列表先变空、再填回来”的闪烁，中途发失败也不会把界面清空。
     let fullSyncBuffer = null;      // { changes: { [category]: [...] }, timer }
     // 1.6.12：发送队列的乐观占位不再按“服务端推送时间”猜退休时机，
@@ -340,6 +370,7 @@
             if (!isCurrent()) return;
             const wasConnected = connected;
             connected = false;
+            myUid = null;               // 这条连接的房间 uid 作废（重连会拿到新的）
             if (heartbeatTimer) {
                 clearInterval(heartbeatTimer);
                 heartbeatTimer = null;
@@ -450,6 +481,7 @@
         renderCompactProgress();
         renderVersionLabel();
         renderTransferInfo();
+    renderDispatchInfo();
     }
 
     // 资源浏览的容量信息：已存储物品总数 / 可存储物品总数、已占用槽位数 / 总槽位数（进度条）
@@ -502,33 +534,18 @@
         });
     }
 
-    // 「整理」进行中：按钮禁用并让图标转起来，避免重复点击
-    function setCompactButtonBusy(busy) {
-        setButtonBusyById('compactBtn', busy);
-    }
-
-    // 存储整理进度（服务端 status.compact）：进度条 + 已合并物品数，整理期间一直显示。
-    // 计划是分批算的（见 ifm/recipe.lua 的 startCompact）：planning 阶段显示“正在计算搬运计划（扫描容器 3/19）” ——
-    // 这样点「整理」之后立刻就有反应，而不是等服务端算完计划（十几秒里界面像没反应、浏览器还会判定掉线）。
+    // 存储整理进度（服务端 status.compact）：1.8.0 起整理是自动的（compact 队列为空时服务端就会
+    // 重新算一遍计划并把搬运任务排进队列），所以这里只显示进度，没有「整理」按钮了。
     function renderCompactProgress() {
         const node = el('compactProgress');
         if (!node) return;
-        let job = status ? status.compact : null;
-        if (job) {
-            compactOptimistic = null;
-        } else if (compactOptimistic && statusUpdatedAt < compactOptimistic.at) {
-            // 服务端还没回传新的状态：先用本地占位，界面不会看起来“点了没反应”
-            job = compactOptimistic;
-        } else {
-            compactOptimistic = null;
-        }
+        const job = status ? status.compact : null;
         if (!job) {
             node.style.display = 'none';
             node.innerHTML = '';
-            setCompactButtonBusy(false);
             return;
         }
-        if (job.planning || !job.total) {
+        if (job.planning) {
             // 计划还在算：显示已扫描容器数 / 已探测种类数（没有进度条，因为总步数还不知道）
             const scanned = job.containersTotal
                 ? t('compactPlanningContainers', { done: job.containersDone || 0, total: job.containersTotal })
@@ -542,22 +559,18 @@
                 '<span class="capacity-label">' + escapeHtml(t('compactPlanning')) + '</span>' +
                 '<span class="capacity-label">' + escapeHtml(detail) + '</span>' +
                 '</div>';
-            setCompactButtonBusy(true);
             return;
         }
-        const total = job.total;
-        const done = Math.max(0, Math.min(total, job.done || 0));
-        const percent = Math.round(done / total * 100);
-        const mergedText = job.items
-            ? t('compactMergedOf', { moved: fmtCount(job.moved || 0), items: fmtCount(job.items) })
-            : t('compactMerged', { n: fmtCount(job.moved || 0) });
+        // 计划已经生成成搬运任务：显示生成了多少条、队列里还剩多少（执行由 compact 队列负责）
         node.style.display = '';
         node.innerHTML = '<div class="capacity-row">' +
-            '<span class="capacity-label">' + escapeHtml(t('compactRunning', { done: done, total: total })) + '</span>' +
-            '<div class="progress"><div class="bar warn" style="width:' + percent + '%"></div></div>' +
-            '<span class="capacity-label">' + escapeHtml(mergedText) + '</span>' +
+            '<span class="capacity-label">' + escapeHtml(t('compactAuto')) + '</span>' +
+            '<span class="capacity-label">' + escapeHtml(t('compactQueue', {
+                queued: fmtCount(job.queued || job.total || 0),
+                pending: fmtCount(job.pendingMoves || 0),
+                done: fmtCount(job.movesDone || 0)
+            })) + '</span>' +
             '</div>';
-        setCompactButtonBusy(true);
     }
 
 

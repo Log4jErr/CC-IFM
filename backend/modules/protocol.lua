@@ -102,11 +102,33 @@ end
 --- 见 index.html 的 OUTBOUND_TEXT_PATHS / CATEGORY_TEXT_PATHS / RESPONSE_TEXT_PATHS；
 --- 服务端只做原样收发与存储（转义后的文本只是普通 ASCII 字符串）。
 
+--- 日志分级兼容（用户第 2 项）：调用点用 self.log.warn / self.log.error 表达级别，
+--- 而老的调用方 / 测试桩传进来的可能只是一个普通函数 —— 这里给它补上两个子入口。
+local function levelLogger(fn)
+    if type(fn) == "table" and fn.warn ~= nil and fn.error ~= nil then
+        return fn                                  -- 已经是分级日志（Util.makeLogger 的产物）
+    end
+    local base
+    if type(fn) == "function" then
+        base = fn
+    elseif type(fn) == "table" then
+        base = fn.info or function() end
+    else
+        base = function() end
+    end
+    return setmetatable({
+        warn = function(...) return base(...) end,
+        error = function(...) return base(...) end,
+    }, {
+        __call = function(_, ...) return base(...) end,
+    })
+end
+
 function Protocol.new(opts)
     opts = opts or {}
     local self = setmetatable({}, Protocol)
     self.Util = opts.Util
-    self.log = opts.log or function() end
+    self.log = levelLogger(opts.log)
     self.url = opts.url
     self.collect = opts.collect
     self.onRequest = opts.onRequest
@@ -193,8 +215,13 @@ function Protocol.new(opts)
         --- / staleCloses=重复或无效的关闭事件 / reconnects=主动重连次数
         closes = 0, ownCloses = 0, staleCloses = 0, reconnects = 0,
         byAction = {},
+        --- 出站帧的最后一次 JSON 字节数（send 里更新；按类别记账用它，见 sendCategoryChanges）
+        lastSendBytes = 0,
         since = os.epoch("utc"),
     }
+    --- 用户第 3 项：按**类别**的发送记账（incremental_update 的流量成分到底是哪个类别）
+    --- { [category] = { frames, bytes, max, items } }：只累积，诊断里按字节数排序展示
+    self.categoryStats = {}
     return self
 end
 
@@ -210,12 +237,32 @@ local function statBucket(stats, prefix, action)
 end
 
 --- 收到一条新日志：标记待推送（真正的发送在 update / 客户端接入时进行）
+--- 用户第 1 项：`sendLog == false` 时完全不推送（日志仍留在服务端终端与内存里）。
 function Protocol:onLog(text, seq)
-    self.logPending = true
+    self.logPending = self.sendLog ~= false
+end
+
+--- 设置里的"给网页发日志"开关（默认开）。关掉时把待推送标记也清掉，避免空转。
+function Protocol:setSendLog(enabled)
+    local value = enabled ~= false
+    if self.sendLog == value then
+        return false
+    end
+    self.sendLog = value
+    if not value then
+        self.logPending = false
+    end
+    self.log("Web console log push %s (setting)", value and "ENABLED" or "DISABLED")
+    return true
 end
 
 --- 把还没发过的服务端日志推给浏览器（浏览器会在控制台打印）
+--- 用户第 1 项：设置里可以关掉"给网页发日志" —— 关掉后这里直接清掉待推送标记（不产生任何 WS 流量）。
 function Protocol:flushLogs()
+    if self.sendLog == false then
+        self.logPending = false
+        return
+    end
     if not self.connected or not self.ws or not self.Util or not self.clientActive then
         return
     end
@@ -290,6 +337,11 @@ function Protocol:onSocketOpened(handle)
         self.log("Extra websocket handle closed (a live connection already exists)")
         return false
     end
+    --- 新连接建立：清掉"已经提示过发送失败"的标记（下一次失败要能再看到那条日志）
+    self.sendFailedLogged = false
+    --- 同样重置回声提示：新连接会拿到新的房间 uid，提示要能再出现一次（见 handleMessage）
+    self.selfEchoLogged = false
+    self.unknownEchoWarned = false
     self.ws = handle
     self.connected = true
     self.connectedAt = os.epoch("utc")
@@ -316,14 +368,14 @@ function Protocol:send(message)
         self.stats.dropped = self.stats.dropped + 1
         if not self.dropLogged then
             self.dropLogged = true
-            self.log("Message dropped: websocket not connected (action=%s)", tostring(message and message.action))
+            self.log.warn("Message dropped: websocket not connected (action=%s)", tostring(message and message.action))
         end
         return false
     end
     local ok, json = pcall(textutils.serializeJSON, message, { allow_repetitions = true })
     if not ok then
         self.stats.encodeFailed = self.stats.encodeFailed + 1
-        self.log("JSON encode failed: %s", tostring(json))
+        self.log.error("JSON encode failed: %s", tostring(json))
         return false
     end
     -- 注意：1.5.0 起中继永远由主控自己连接（IFMWorker 不再代连），所以这里没有“转发给 worker”的分支
@@ -334,11 +386,26 @@ function Protocol:send(message)
     end)
     if not sent then
         self.stats.failed = self.stats.failed + 1
-        self.log("Send failed: %s", tostring(err))
+        --- 同一条连接里只提示一次（连发失败会刷屏）；新连接建立时会重新允许提示
+        if not self.sendFailedLogged then
+            self.sendFailedLogged = true
+            self.log.error("Send failed: %s", tostring(err))
+        end
+        --- 写失败 = 这条连接已经死了（中继关掉它、"attempt to use a closed file"）。
+        --- 这里必须把句柄丢掉：否则后面每次推送都会在同一个死句柄上再失败一次
+        --- （用户现场：控制台里一连串 "attempt to use a closed file"），
+        --- 而且 closeAcks 会认领它迟到的关闭事件，不会把新连接一起判死。
         self.connected = false
+        self.closedAt = os.epoch("utc")
+        self.lastCloseReason = "send failed: " .. tostring(err)
+        self:closeSocket()
+        --- 立刻重连（不等 reconnectInterval）：主控不在线时网页会一直等不到数据，
+        --- 15 秒后客户端开始"重连"、60 秒后整个界面收起回登录页（底部面板也跟着消失再出现）。
+        self.lastReconnect = 0
         return false
     end
     self:noteSent(message, #json)
+    self.lastSendBytes = #json
     return true
 end
 
@@ -383,10 +450,33 @@ function Protocol:closeSocket()
     end)
 end
 
+--- 删除项延迟确认（用户第 2 项）：某一轮快照里"少了"不代表真的没了 ——
+--- 外设重扫、worker 扫不到、容器换代都会造成一次性的空缺。以前立刻下发 _deleted，
+--- 网页上就会出现"大批资源凭空消失、几秒后又回来"。现在要连续缺失这么久才发墓碑。
+local TOMBSTONE_DELAY_MS = 3000
+
+--- 这些类别的删除是**确定**的（条目是主控自己删掉的，不是扫描抖动）：不做延迟确认，立刻下发。
+--- 例如发送队列（用户第 1 项）：物品真的搬完之后，网页上的「发送中」不该再挂几秒。
+local IMMEDIATE_TOMBSTONES = { deliveries = true }
+
+--- 请求"下一次推送时立刻下发删除"（跳过 TOMBSTONE_DELAY_MS 的延迟确认）。
+--- 容器外设被移除 / 容器定义被删时调用它：这种"少了"同样是确定的，
+--- 网页上那些"之前读到的物品"应当立即消失（用户第 3 项）。只用一次，用完自动失效。
+function Protocol:expediteDeletions()
+    self.expediteTombstones = true
+end
+
 --- 计算某个类别的增量（needFullSync 时退化为全量）
-function Protocol:diffCategory(category, newList)
+--- expedite = true：本轮所有"消失的条目"立刻下发墓碑（不等 TOMBSTONE_DELAY_MS）
+function Protocol:diffCategory(category, newList, expedite)
     local fields = KEY_FIELDS[category]
     local changes = {}
+    local now = os.epoch("utc")
+    local pending = self.tombstoneAt or {}
+    self.tombstoneAt = pending
+    if expedite ~= true then
+        expedite = IMMEDIATE_TOMBSTONES[category] == true
+    end
     if self.needFullSync or type(self.snapshot[category]) ~= "table" then
         for _, item in ipairs(newList) do
             changes[#changes + 1] = item
@@ -402,6 +492,7 @@ function Protocol:diffCategory(category, newList)
     for _, item in ipairs(newList) do
         local itemKey = keyOf(category, item)
         seen[itemKey] = true
+        pending[category .. "\1" .. itemKey] = nil          -- 这一轮又出现了：撤销待删除标记
         local previous = previousMap[itemKey]
         if previous == nil or not valuesEqual(previous, item) then
             changes[#changes + 1] = item
@@ -409,11 +500,24 @@ function Protocol:diffCategory(category, newList)
     end
     for itemKey, previous in pairs(previousMap) do
         if not seen[itemKey] then
-            local tombstone = { _deleted = true }
-            for _, field in ipairs(fields or {}) do
-                tombstone[field] = previous[field]
+            local markKey = category .. "\1" .. itemKey
+            local since = pending[markKey]
+            local due = expedite
+            if not due then
+                if not since then
+                    pending[markKey] = now                  -- 第一次缺：只记时间，不发墓碑
+                elseif now - since >= TOMBSTONE_DELAY_MS then
+                    due = true
+                end
             end
-            changes[#changes + 1] = tombstone
+            if due then
+                pending[markKey] = nil
+                local tombstone = { _deleted = true }
+                for _, field in ipairs(fields or {}) do
+                    tombstone[field] = previous[field]
+                end
+                changes[#changes + 1] = tombstone
+            end
         end
     end
     self.snapshot[category] = newList
@@ -425,6 +529,13 @@ function Protocol:sendCategoryChanges(category, changes)
     if #changes == 0 then
         return true
     end
+    --- 用户第 3 项：发送流量按**类别**记账（incremental_update 里到底是哪个类别在吃流量）。
+    --- 只统计每个 chunk 的实际 JSON 字节数（send 会把它记在 self.lastSendBytes 上）。
+    local entry = self.categoryStats[category]
+    if not entry then
+        entry = { frames = 0, bytes = 0, max = 0, items = 0 }
+        self.categoryStats[category] = entry
+    end
     local start = 1
     while start <= #changes do
         local finish = math.min(start + self.maxChunk - 1, #changes)
@@ -432,6 +543,7 @@ function Protocol:sendCategoryChanges(category, changes)
         for i = start, finish do
             chunk[#chunk + 1] = changes[i]
         end
+        self.lastSendBytes = 0
         local ok = self:send({
             action = "incremental_update",
             count = #chunk,
@@ -439,6 +551,13 @@ function Protocol:sendCategoryChanges(category, changes)
         })
         if not ok then
             return false
+        end
+        local bytes = tonumber(self.lastSendBytes) or 0
+        entry.frames = entry.frames + 1
+        entry.items = entry.items + #chunk
+        entry.bytes = entry.bytes + bytes
+        if bytes > entry.max then
+            entry.max = bytes
         end
         start = finish + 1
     end
@@ -488,6 +607,9 @@ function Protocol:pushUpdates(force)
         end
     end
     local needFullSync = self.needFullSync
+    --- 本轮要不要"立刻下发删除"（见 expediteDeletions）：只用一次
+    local expediteDeletions = self.expediteTombstones == true
+    self.expediteTombstones = false
     if needFullSync then
         self.stats.fullSyncs = self.stats.fullSyncs + 1
         self:send({ action = "full_sync_start", categories = categories })
@@ -496,7 +618,7 @@ function Protocol:pushUpdates(force)
     for _, category in ipairs(CATEGORY_ORDER) do
         local list = collected[category]
         if list ~= nil then
-            local changes = self:diffCategory(category, list)
+            local changes = self:diffCategory(category, list, expediteDeletions)
             self.stats.changedItems = self.stats.changedItems + #changes
             if not self:sendCategoryChanges(category, changes) then
                 success = false
@@ -611,11 +733,62 @@ function Protocol:update(now)
     end
 end
 
+--- ===== 中继回声过滤（应用层问题，不是传输问题）=====
+--- itty 房间广播是"发给房间里所有人"，**包含发送者自己** —— 所以我们每发出一帧，
+--- 稍后都会原样再收到一次。这些帧带着 action，如果按普通客户端请求处理，就会：
+---   ① 打一行 `request: <action>` 日志（用户现场就是刷屏的 request: full_sync_start / log）；
+---   ② 走完 handleRequest 后**回一条响应**进房间；
+---   ③ 网页那边 `handleIncoming` 先按 action 分派（才轮到 id 配对），于是把这条响应
+---      当成真的 `full_sync_start` / `full_sync_end` → 随机开始/结束一次"全量缓冲" →
+---      对缓冲里的类别 `store.clear()` 再只放回有变化的条目 → worker 卡片/列表"消失又出现"。
+---   ④ 浏览器自己发出的请求同样会被回声：回声与真响应 id 相同，谁先到谁被认领
+---      （回声带着请求体、没有 result）→ 有些操作看着"点了没反应"。
+--- 处理方式：按**发送者 uid** 丢掉自己的帧 —— 与 IFMWorker 丢掉自己的 modem 包同一个道理
+--- （IFMWorker.lua：`message.from == computerId` 就 return）。不新增任何自定义协议字段：
+--- uid 是中继自己给的（`join` 事件里的 uid 也被我们用来自记 selfUid）。
+function Protocol.senderUidOf(frame)
+    if type(frame) ~= "table" or frame.uid == nil then
+        return nil
+    end
+    return tostring(frame.uid)
+end
+
+--- 这一帧是不是我们自己发出的（中继回声回自己）：发送者 uid == 本连接在房间里的 uid
+function Protocol:isOwnFrame(frame)
+    local uid = Protocol.senderUidOf(frame)
+    if uid == nil or self.selfUid == nil then
+        return false
+    end
+    return uid == tostring(self.selfUid)
+end
+
+--- 只可能由服务端（我们）发出的 action：网页端从不发这些。
+--- 万一收到的这类帧**没被** isOwnFrame 认出来（uid 字段对不上 / 还没收到自己的 join），
+--- 必须留一行带帧字段名的日志 —— 否则同一个 bug 会以"网页莫名清空列表"的形式悄悄回来。
+local SERVER_ONLY_ACTIONS = {
+    full_sync_start = true,
+    full_sync_end = true,
+    incremental_update = true,
+    keepalive = true,
+    log = true,
+}
+
 --- 处理收到的 WebSocket 文本消息
 function Protocol:handleMessage(raw)
     local ok, data = pcall(textutils.unserializeJSON, raw)
     if not ok or type(data) ~= "table" then
-        self.log("Received unparseable message")
+        self.log.error("Received unparseable message")
+        return
+    end
+    --- 自己的回声：直接丢掉（连统计都不进 recv 分桶，免得把"我们发了多少"算成"收到了多少"）。
+    --- 每连接只提示一次：不能刷屏，但也绝不静默 —— 它会解释"为什么 request: 日志变少了"。
+    if self:isOwnFrame(data) then
+        self.stats.recvSelf = (self.stats.recvSelf or 0) + 1
+        if not self.selfEchoLogged then
+            self.selfEchoLogged = true
+            self.log.warn("Ignoring the relay's echo of our own frames (uid=%s): they are our own messages",
+                tostring(self.selfUid))
+        end
         return
     end
     local payload = data
@@ -628,6 +801,18 @@ function Protocol:handleMessage(raw)
                 payload = inner
             end
         end
+    end
+    --- 兜底自检（见 SERVER_ONLY_ACTIONS 的说明）：一次连接最多一条
+    if payload.action and SERVER_ONLY_ACTIONS[payload.action] and not self.unknownEchoWarned then
+        self.unknownEchoWarned = true
+        local fields = {}
+        for key in pairs(data) do
+            fields[#fields + 1] = tostring(key)
+        end
+        table.sort(fields)
+        self.log.warn("Received a server-only action (%s) that we could not recognise as our own echo" ..
+            " (selfUid=%s, frame fields: %s): check the relay's sender uid field",
+            tostring(payload.action), tostring(self.selfUid), table.concat(fields, ","))
     end
     --- 统计收到的消息（按 action 汇总；字节数是中继里的原始 JSON 长度）
     local stats = self.stats
@@ -704,7 +889,7 @@ function Protocol:handleMessage(raw)
     local elapsed = os.epoch("utc") - startedAt
     if not okRequest then
         response.result = { error = "\\u6267\\u884C\\u9519\\u8BEF\\uFF1A" .. tostring(result) }
-        self.log("Action %s failed after %dms: %s", tostring(payload.action), elapsed, tostring(result))
+        self.log.error("Action %s failed after %dms: %s", tostring(payload.action), elapsed, tostring(result))
     else
         response.result = result
         if elapsed >= 1000 then
@@ -847,6 +1032,25 @@ function Protocol:statsSummary()
         return a.key < b.key
     end)
     local since = stats.since or os.epoch("utc")
+    --- 用户第 3 项：incremental_update 的流量成分（按类别，字节数降序）——
+    --- "6MB 到底是谁发的"这个问题就是靠这一段回答的。
+    local categories = {}
+    for key, entry in pairs(self.categoryStats or {}) do
+        categories[#categories + 1] = {
+            key = key,
+            frames = entry.frames or 0,
+            items = entry.items or 0,
+            bytes = entry.bytes or 0,
+            max = entry.max or 0,
+            average = (entry.frames or 0) > 0 and math.floor((entry.bytes or 0) / entry.frames) or 0,
+        }
+    end
+    table.sort(categories, function(a, b)
+        if a.bytes ~= b.bytes then
+            return a.bytes > b.bytes
+        end
+        return tostring(a.key) < tostring(b.key)
+    end)
     return {
         lastPushCost = self.lastPushCost or 0,
         updateInterval = self.updateInterval,
@@ -856,6 +1060,8 @@ function Protocol:statsSummary()
         sentMessages = stats.sentMessages,
         sentBytes = stats.sentBytes,
         sentMax = stats.sentMax,
+        --- 按类别的发送明细（字节数降序）：incremental_update 的流量成分
+        categories = categories,
         recvMessages = stats.recvMessages,
         recvBytes = stats.recvBytes,
         recvMax = stats.recvMax,

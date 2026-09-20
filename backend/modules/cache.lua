@@ -128,7 +128,7 @@ function Cache:flush()
 end
 
 --- 取（或创建）流程运行记录
---- 注意：脏标记一律走 self:markDirty()（它转发到 modules/jsonfile.lua）；直接写 self.dirty 是**无效**的。
+--- 注意：脏标记一律走 self:markDirty()（它转发到 modules/jsonfile.lua）；直接写 self.dirty 是无效的。
 function Cache:proc(name)
     local record = self.data.processes[name]
     if not record then
@@ -220,7 +220,7 @@ end
 
 --- 只保留「当前存储里还有的」物品标签：NBT 变体无限多（工具耐久 / 附魔 / 自定义数据各不相同），
 --- 临时流转的物品如果把标签留在缓存里，cache.json 会被越写越大（CC:T 磁盘很小），
---- 而且这些标签对界面与过滤规则毫无用处（它们只对**当前存在**的资源求值）。
+--- 而且这些标签对界面与过滤规则毫无用处（它们只对当前存在的资源求值）。
 --- present = { [物品名] = true }，由调用方在扫描容器时顺手收集；不在里面的条目一律删掉。
 --- 返回被删掉的条数（调用方据此决定要不要打日志）。
 function Cache:pruneTags(present)

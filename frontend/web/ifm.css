@@ -206,6 +206,34 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 }
 .chip.ok { border-color: var(--good); }
 .chip.missing { border-color: var(--bad); }
+/* 外设卡片的批量选择（用户第 6 项 / 本轮第 3 项）：
+   .selected    = 已被选中（Ctrl+点击 / 右键框选）
+   .marquee-hit = 正在被框选框住（松开鼠标后才真正选中）
+   命中目标是**外设芯片**：方块卡片里的未分配功能芯片、机器卡片里的位置芯片都能选。 */
+.card-block.selected { border-color: var(--accent); background: rgba(120, 190, 255, .08); }
+.card-block.selected > .peripheral-card-head { border-bottom-color: var(--accent); }
+.chip.selected { border-color: var(--accent); background: rgba(120, 190, 255, .08); }
+.marquee-hit { outline: 2px dashed var(--accent); outline-offset: 1px; }
+/* worker 卡片的负载条（本轮第 5 项）：细一点，别抢了文字的位置 */
+.progress.worker-load { height: 8px; margin-top: 3px; max-width: 300px; }
+/* 用户第 4 项：从节点总负载条（在「从节点」面板标题右侧）—— 只统计从节点的负载与槽位总和，
+   主控本机那 32 个槽位不计入（它压根不在 stores.workers 里，见 Transfer:localStatus）。 */
+.worker-load-wrap { display: inline-flex; align-items: center; gap: 6px; margin-left: 8px; }
+.progress.worker-load.total { width: 160px; margin-top: 0; }
+/* 面板标题里的进度条用的是 <span>（标题行是 flex，塞 <div> 会打断布局）——
+   inline 元素不吃 height，所以这里显式给它 inline-block */
+.worker-load-wrap .progress { display: inline-block; vertical-align: middle; }
+.worker-load-wrap .progress > .bar { display: block; }
+.peripheral-card-head { cursor: grab; }
+.peripheral-card-head:active { cursor: grabbing; }
+#selectMarquee {
+    position: fixed;
+    z-index: 80;
+    display: none;
+    border: 1px dashed var(--accent);
+    background: rgba(120, 190, 255, .16);
+    pointer-events: none;
+}
 /* ===== 外设与定义：容器类型用颜色区分（见 web/ifm-processes.js 的 peripheralFunctionRows） ===== */
 /* 物品容器 = 蓝色、流体容器 = 青色、信号 = 琥珀色：左侧的类型标签与右侧的定义芯片同色，一眼分清 */
 :root {
@@ -238,12 +266,12 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 .progress > .bar { height: 100%; background: var(--good); width: 0; }
 .progress > .bar.warn { background: var(--warn); }
 .progress > .bar.bad { background: var(--bad); }
-/* 外设与定义：方块卡片既**贴合内部芯片**的大小（一个方块只有 1~2 个芯片时不要被撑宽），
-   又要**紧凑排列** —— 所以用 flex 换行，而不是等宽网格列。
+/* 外设与定义：方块卡片既贴合内部芯片的大小（一个方块只有 1~2 个芯片时不要被撑宽），
+   又要紧凑排列 —— 所以用 flex 换行，而不是等宽网格列。
    * 以前这里用 .row-3 的 repeat(auto-fill, minmax(250px, 1fr))：列宽先按 250px 均分好
      （宽屏 5~6 列），卡片再 width:fit-content 缩到内容大小，于是每张卡片右边都空着大半列，
      一行也永远只排得下 5~6 张 —— 看着就是“横向很松、一行只有 6 个”（用户反馈）。
-   * flex + flex-wrap 按卡片**真实宽度**塞满每一行（同样宽度的卡片能挤进更多张），间距固定 10px；
+   * flex + flex-wrap 按卡片真实宽度塞满每一行（同样宽度的卡片能挤进更多张），间距固定 10px；
      宽度取内容需要的最大值、上限 100%（长芯片行不撑破面板），与上面的机器类型卡片（.machine-type-list）
      同一套做法。align-items:flex-start 让同排更高的卡片不把别的卡片拉长。 */
 #peripheralList {
@@ -323,6 +351,14 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 .info-row .info-value.bad { color: var(--bad); }
 #diagnoseOutput { color: var(--text); max-height: 60vh; overflow: auto; }
 .editor-row { display: grid; grid-template-columns: 130px 1fr; gap: 8px; align-items: center; margin-bottom: 8px; }
+/* 调度权重面板（1.8.0）：每行的文本 / 滑条 / 数字框是同一个 Grid 的直接子项（见 renderSettings） */
+#settingsBody .settings-label { font-size: 12px; color: var(--text-dim); white-space: nowrap; }
+#settingsBody .settings-label.warn { color: var(--bad); font-weight: 600; }
+#settingsBody .warn-icon { color: var(--bad); margin-left: 4px; }
+#settingsBody input[type="range"] { width: 100%; margin: 0; }
+#settingsBody input[type="number"] { width: 72px; margin: 0; }
+/* 登录框的错误信息：红色（用户第 3 项） */
+#loginError { color: var(--bad); font-weight: 600; }
 .editor-row > label { font-size: 12px; color: var(--text-dim); }
 .editor-block { border: 2px solid var(--border); padding: 8px; margin-bottom: 10px; background: var(--panel-bg-2); }
 .editor-block > h4 { font-size: 13px; margin: 0 0 8px 0; display: flex; align-items: center; gap: 8px; }
@@ -341,13 +377,17 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 .rule-row { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
 .rule-row select { max-width: 160px; }
 .rule-row input[type="text"] { flex: 1 1 150px; }
-/* 机器定义渲染在机器类型卡片内部（min() 保证窄容器里也不会撑破） */
-.machine-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(210px, 100%), 1fr)); gap: 8px; }
+/* 机器定义渲染在机器类型卡片内部：**左右排列、流式换行**（用户第 2 项）。
+   以前是 auto-fill 网格，但机器类型卡片本身是 width: max-content —— 网格的 max-content 只有一列宽，
+   于是里面的机器卡片实际被竖着叠起来。改成 flex 换行：每张按 210px 起排，一行放不下就换行。 */
+.machine-list { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px; }
 .machine-card {
     background: var(--panel-bg);
     border: 2px solid var(--border);
     padding: 6px;
     cursor: pointer;
+    /* 用户第 2 项：左右排列（0 增长 = 卡片保持等宽、不拉伸），放不下就换行 */
+    flex: 0 1 210px;
     min-width: 0;
 }
 .machine-card:hover { border-color: var(--accent); }
@@ -573,11 +613,11 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     gap: 10px;
     align-items: flex-start;
     margin-top: 10px;
-    /* 与**下方**的方块卡片（#peripheralList）之间也要留出间距：
+    /* 与下方的方块卡片（#peripheralList）之间也要留出间距：
        卡片自己 margin:0（见下条规则），不加这一行两块卡片会贴在一起（1.6.10 修） */
     margin-bottom: 12px;
 }
-/* 宽度取内容需要的最大值，但不超过容器宽度（用户要求：不要总占满整行） */
+/* 宽度取内容需要的最大值，但不超过容器宽度（不要总占满整行） */
 .machine-type-list > .card-block {
     flex: 0 1 auto;
     width: max-content;
@@ -586,7 +626,33 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     margin: 0;
 }
 
-/* 机器卡片内的位置卡片：**纵向**排列（用户要求），这样每个位置更宽、外设名能显示完整 */
+/* 用户第 2/3 项（外设与定义）：存储 / 输入 / 输出容器卡片以前各自是一个块级列表 ——
+   每个列表独占一行，输入卡片与输出卡片之间被"强制换行"，卡片右侧还留下大片死区
+   （那块空白既不能右键框选，也白占地方）。
+   现在改成：面板自己就是一个 flex 流，5 个列表用 display:contents 退化成"透明容器"，
+   它们的卡片直接成为面板的 flex 项 → 所有卡片在同一行里紧凑换行，没有强制换行、没有死区。
+   注意：不加 wrapper 元素（run_dom_smoke.js 的"结构漂移"检查比对每个 id 的祖先链，
+   包一层 div 会让 storageList/inputList/outputList/machineTypeList 全部被判漂移）。 */
+/* 用 class（.peripheral-panel）标记面板而不是 id：加 id 会让面板里每个元素的"祖先链"都变一次，
+   run_dom_smoke.js 的"结构漂移"检查会把它当成"元素搬家"直接判 FAIL。 */
+.panel.peripheral-panel {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: flex-start;
+}
+/* 标题行与"缺失外设"提示仍然各占一整行 */
+.panel.peripheral-panel > header,
+.panel.peripheral-panel > .peripheral-section {
+    flex: 0 0 100%;
+}
+.panel.peripheral-panel > .machine-type-list,
+.panel.peripheral-panel > #peripheralList {
+    display: contents;
+}
+/* 列表本身不再产生盒子 → 原来的 margin-top/margin-bottom 也不再需要（间距由面板的 gap 负责） */
+
+/* 机器卡片内的位置卡片：纵向排列，这样每个位置更宽、外设名能显示完整 */
 .machine-slots {
     display: flex;
     flex-direction: column;
@@ -613,6 +679,8 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 .machine-slot .slot-empty { font-size: 11px; }
 /* 位置里的外设卡片：不许超出位置卡片宽度；名字尽量显示完整（放不下才换行） */
 .pc-chip { cursor: grab; min-width: 0; max-width: 100%; }
+/* 只读机器（海龟合成器）里的外设卡片：不可拖、没有删除按钮（用户第 3 项）—— 光标不再是"可抓" */
+.pc-chip.chip-readonly { cursor: default; }
 .pc-chip .chip-text {
     max-width: none;
     min-width: 0;
@@ -654,15 +722,20 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 .peripheral-section { margin-bottom: 0; }
 .peripheral-section .card-block { margin-bottom: 10px; }
 /* 拖拽反馈（1.6.7）：
-   * 光标停在**可拖拽的芯片**上时边框高亮 —— 只有芯片能拖（方块卡片整张不可拖，见 ifm-processes.js）；
-   * 拖拽过程中，所有**能接收**当前芯片的位置 / 存储卡片边框高亮（.drop-ok），
+   * 光标停在可拖拽的芯片上时边框高亮 —— 只有芯片能拖（方块卡片整张不可拖，见 ifm-processes.js）；
+   * 拖拽过程中，所有能接收当前芯片的位置 / 存储卡片边框高亮（.drop-ok），
      光标正上方那个再加强（.drop-active）；
-   * 方块卡片（.card-block）与机器类型卡片**不再**因为鼠标悬停而点亮 —— 整张卡片亮起来
+   * 方块卡片（.card-block）与机器类型卡片不再因为鼠标悬停而点亮 —— 整张卡片亮起来
      会让人误以为卡片本身可以拖（旧的 .card-block:hover 规则已删除）。 */
 .chip[draggable="true"] { transition: border-color .12s ease, background .12s ease; }
 .chip[draggable="true"]:hover { border-color: var(--accent); }
 .machine-slot.drop-ok { border-color: var(--accent-2); border-style: dashed; }
 .machine-slot.drop-active { border-color: var(--accent); border-style: solid; background: rgba(120, 170, 255, .18); }
+/* 用户第 3 项：机器里指向"外设已经不存在"的卡片（以及它所在的位置框）标红 ——
+   这些定义还挂在机器的输入/输出列表里，但背后的外设已经不在了（服务端 missing 列表给出）。 */
+.chip.pc-chip.chip-missing { border-color: var(--bad); }
+.chip.pc-chip.chip-missing .chip-text { color: var(--bad); }
+.machine-slot.slot-missing { border-color: var(--bad); border-style: dashed; }
 .card-block.storage-card.drop-ok { border-color: var(--accent-2); border-style: dashed; }
 .card-block.storage-card.drop-active {
     border-color: var(--accent);
@@ -674,8 +747,22 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 /* ===== 底部发送面板：「待发送」（左，先进先出）+「发送中」（右，最新提交的排最前） ===== */
 .delivery-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .delivery-column { min-width: 0; }
-.delivery-head { font-size: 11px; color: var(--text-dim); margin-bottom: 4px; }
+.delivery-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+}
+/* 用户第 6 项：「发送中」栏也要有一个"全部删除"，放在这一栏的标题行右侧（与「待发送」那个成对） */
+.delivery-head .delivery-clear { margin-left: auto; padding: 0 6px; }
+/* 用户第 5 项：发送中的数量显示成"剩余/总共"，总共用更小的字（合并进来的量一眼能看出来） */
+.delivery-total { font-size: 9px; color: var(--text-dim); }
 .delivery-item.pending { opacity: .65; border-style: dashed; }
+/* 用户第 5 项：这条发送卡住了（服务端 lastError 非空）→ 红边 + 左上角感叹号（悬停看原因） */
+.delivery-item.error { border-color: var(--bad); }
+.delivery-error-mark { right: auto; left: 3px; }
 /* 点「发送」时飞向「发送中」的副本（FLIP 动画） */
 .send-ghost {
     position: fixed;
