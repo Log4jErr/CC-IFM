@@ -1,0 +1,59 @@
+zzlib - zip/zlib/gzip depacking library in Lua (pure Lua)
+Upstream: https://codeberg.org/zerkman/zzlib
+Branch:   master
+Commit:   9c39321fb2  ("Bumped copyright years.", 2026-01-01)
+Fetched:  2026-09-27 via the raw/branch/master URLs below
+Licence:  WTFPL - see COPYING (also https://wtfpl.net)
+
+Files (embedded verbatim, must stay pure ASCII):
+  https://codeberg.org/zerkman/zzlib/raw/branch/master/inflate-bit32.lua
+      upstream sha256 d63c9354b2e82c19840688eeae80768fae26e2467d5343f85b19f228d3bb13a6
+      vendored sha256 d63c9354b2e82c19840688eeae80768fae26e2467d5343f85b19f228d3bb13a6 (identical)
+  https://codeberg.org/zerkman/zzlib/raw/branch/master/zzlib.lua
+      upstream sha256 c3c712e3a704838945c1194f1534ce6ef0ced6c3599c9b9625736d5ccabc6d50
+      vendored sha256 0663fcdcb10e73c50cfbc460e843d2e7c2ca2a6fd5a6bd9f4122a5c18c7730b3
+      note: the only difference is one U+00A0 (non-breaking space) in a comment
+      ("-- mode 2: search and unpack file from zip file"), replaced by a normal
+      space so the vendored tree stays pure ASCII on CC:T. No code was touched.
+  https://codeberg.org/zerkman/zzlib/raw/branch/master/COPYING
+      upstream sha256 96f17857f3eb28a7d93dad930bc099a3cb65a9a2afb37069bfd1ba5ec5964389
+      vendored sha256 96f17857f3eb28a7d93dad930bc099a3cb65a9a2afb37069bfd1ba5ec5964389 (identical)
+
+How IFM uses it (build.py --codec=zip, the default):
+  * build.py packs the stripped Lua sources into one ZIP (ZIP_DEFLATED, level 9) and
+    embeds it as base64 inside ifm_bundle.lua: local __IFM_ARCHIVE = table.concat({...}).
+  * The bundle decodes that base64 and hands the ZIP bytes to the vendored zzlib:
+    zzlib.files() iterates the entries, zzlib.unzip(buf, offset, crc) inflates each packed
+    entry (CRC32 verified) and the unpacker writes ./ifm/** with the usual write rules.
+  * No upstream file is modified. zzlib's require("inflate-bit32") is answered by an injected
+    local require() that returns the vendored inflate-bit32 chunk, so no filesystem
+    require/package lookup happens on the CC:T side (_VERSION is irrelevant there).
+  * inflate-bit32 uses bit32 (Lua 5.2) / bit (LuaJIT). There is no fallback any more: a
+    runtime that provides neither aborts the unpack with an explicit assert (see
+    VENDOR_PRELUDE in build.py).
+
+Updating: fetch both files again, refresh the hashes above, rebuild with
+  python build.py
+
+Runtime notes (target runtime: CC:Tweaked = Lua 5.2 / Cobalt):
+  * bit32 exists on CC:Tweaked (it is part of the Lua 5.2 standard library), which is the
+    only supported path for the unpacker.
+  * zzlib's _VERSION probe resolves to "< 5.3" on CC, i.e. require("inflate-bit32"); the
+    injected require() answers both "inflate-bit32" and "inflate-bwo" with the vendored
+    chunk, so neither branch can ever need a filesystem lookup.
+  * Numbers are doubles on Lua 5.2, so zzlib's 32-bit little-endian arithmetic stays exact.
+  * No Lua 5.2-removed APIs are used (unpack comes from table.unpack with a global
+    fallback; there is no setfenv/getfenv/loadstring/module/math.log10/table.getn/
+    math.mod), and no 5.3+ syntax (bitwise operators, //, math.type) appears anywhere in
+    the bundle - build.py's luaparse check (Lua 5.1 target) enforces the latter.
+
+Validation performed when this revision was added:
+  * Python side: build.py re-reads every ZIP entry and compares it byte-for-byte with the
+    stripped sources (the "载荷自检" line printed while building).
+  * Real PUC Lua (Lua 5.4 via wasmoon) driving the generated ifm_bundle.lua against a
+    minimal CC fs/shell mock:
+        native bit path (standard bit32 semantics provided) .... 20/20 files byte-identical
+        arithmetic fallback path (no bit32 and no bit) ......... 20/20 files byte-identical
+  * fengari is deliberately not used for acceptance: its integers are 32-bit (JS bitwise
+    semantics), so zzlib's little-endian reads overflow into negatives there and the CRC
+    check fails spuriously. PUC Lua / CC:Tweaked are unaffected.

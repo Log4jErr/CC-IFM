@@ -9,7 +9,10 @@ backend/node_modules/
 backend/*.txt
 backend/*.log
 
-# 构建产物：用 `python backend/build.py` 重新生成即可（默认不带注释，约 350KB）
+# 构建产物：用 `python backend/build.py` 重新生成即可
+# 默认载荷是「ZIP(deflate) + base64 + 内嵌 zzlib 解压」，约 186KB（旧的全明文模式约 525KB，
+# 用 `python backend/build.py --codec=plain` 生成）。厂商代码在 backend/vendor/zzlib/，
+# 详见其中的 UPSTREAM.txt（WTFPL，升级时重新抓取并更新哈希）。
 # backend/ifm_bundle.lua 要入库：README 里的
 #   wget run https://raw.githubusercontent.com/Log4jErr/CC-IFM/main/backend/ifm_bundle.lua
 # 指向的就是仓库里这份产物（改了后端记得 `python backend/build.py` 并提交）。

@@ -1,29 +1,69 @@
--- IFM :: modules/recipe.lua
--- 流程引擎：非阻塞状态机，负责机器选择（轮换）、并行闸门、按序输入/输出、
--- 翻倍、递归启动上游流程、缺失判定、待交付（发送）队列，并把运行态写入 cache.json。
-
 local Recipe = {}
 Recipe.__index = Recipe
 
-local MAX_CHAIN_DEPTH = 8
+local Assert = nil
+local RefCount = nil
 
---- 抽象流程（含"注册名 = abstract"的物品/流体操作的流程）不能执行 / 合成：它只作为"流程设置复制"的来源。
---- 网页上把这类流程排在下拉框最前，就是让用户先复制它再去改真实材料。
-local ABSTRACT_MESSAGE = "\\u62BD\\u8C61\\u6D41\\u7A0B\\uFF08\\u542B abstract \\u64CD\\u4F5C\\uFF09\\u4E0D\\u80FD\\u7528\\u4E8E\\u5408\\u6210\\uFF0C\\u53EA\\u80FD\\u4F5C\\u4E3A\\u6D41\\u7A0B\\u8BBE\\u7F6E\\u7684\\u590D\\u5236\\u6765\\u6E90"
-local ABSTRACT_FROZEN = "\\u6D41\\u7A0B\\u662F\\u62BD\\u8C61\\u6D41\\u7A0B\\uFF08\\u542B abstract \\u64CD\\u4F5C\\uFF09\\uFF0C\\u4E0D\\u80FD\\u6267\\u884C\\uFF1A\\u53EA\\u80FD\\u7528\\u4E8E\\u590D\\u5236\\u6D41\\u7A0B\\u8BBE\\u7F6E"
+-- The planning engine follows the demand chain one level per tick (50 ms), so no
+-- depth constant is needed any more; it stops when nothing is short.
 
---- 未指定方向时的默认方向：六面全开（网页端新建元素时默认也是六面全选）
+
+
 local ALL_SIDES = { "top", "bottom", "left", "right", "front", "back" }
 
---- 红石脉冲的保持时间：置位 0.05s -> 复位 0.05s
-local PULSE_HOLD_MS = 50
-
---- 单批次的元素需求量
-local function elementDemand(element, batch)
-    return (tonumber(element.count) or 0) * (batch or 1)
+-- The claim / occupancy / crafting ledgers key every reservation by its *instance*,
+-- not by the process name: two live instances of one process must be separate
+-- sources, otherwise releasing one would drop the other's reservation.
+local function instanceSource(inst)
+    return "process:" .. tostring(inst and inst.owner or "") .. "#" .. tostring(inst and inst.id or 0)
 end
 
---- 元素对应的资源描述（含 NBT 比较语义：ignoreNbt 为 false 时要求 NBT 相等）
+local PULSE_HOLD_MS = 50
+
+-- A large send is spread over the free slots of the target containers, but only so
+-- many moves are submitted per attempt: the rest follows on the next tick, once the
+-- first ones reported. Keeps one request from flooding the transfer layer.
+local SEND_SPREAD_MAX = 8
+
+-- The IO mode of a process. `sequential` runs one material operation at a time;
+-- `two_phase` parallelises the operations inside a block and keeps the input phase
+-- before the output phase; `unordered` additionally lets the output phase progress
+-- while the inputs are still being delivered. Old definitions only carry the
+-- boolean `unorderedIo`: true == the old "unordered IO" (today's two-phase), false
+-- == the old sequential behaviour.
+local function processIoMode(process)
+    if process and process.ioMode ~= nil then
+        return process.ioMode
+    end
+    if process and process.unorderedIo == true then
+        return "two_phase"
+    end
+    return "sequential"
+end
+
+local function processBlockParallel(process)
+    return processIoMode(process) ~= "sequential"
+end
+
+local function elementDemand(element, batch)
+    local count = tonumber(element.count) or 0
+    local rounds = Assert.count(batch, "elementDemand batch")
+    if element.catalyst then
+        -- A catalyst is a fixed amount per flow instance: it is never multiplied by
+        -- the batch, so one instance consumes `count` no matter how many rounds it is.
+        return count
+    end
+    return count * rounds
+end
+
+-- Material operations (the ones that move items/fluids); everything else in a
+-- process (waitTime, waitSignal, emitSignal, emitPulse) is a barrier between
+-- "unordered IO" blocks.
+local function isMaterialElement(element)
+    return type(element) == "table" and (element.kind == "item" or element.kind == "fluid"
+        or element.kind == "filter")
+end
+
 local function elementSpec(element)
     return {
         kind = element.kind,
@@ -31,6 +71,22 @@ local function elementSpec(element)
         nbt = element.nbt,
         ignoreNbt = element.ignoreNbt,
     }
+end
+
+-- Output elements may pin the machine output container / the slot inside it
+-- (element.containerIndex / element.slot, -1 = any). The scope is used to pick
+-- the source container and to decide what "the machine still holds" means.
+local function outputScopeOf(opts)
+    opts = opts or {}
+    local index = tonumber(opts.containerIndex)
+    if not index or index < 1 then
+        index = nil
+    end
+    local slot = tonumber(opts.slot)
+    if not slot or slot < 1 then
+        slot = nil
+    end
+    return index, slot
 end
 
 local OP_FUNCS = {
@@ -51,7 +107,6 @@ local OP_FUNCS = {
     end,
 }
 
---- 读取红石外设某方向的模拟输入
 local function readAnalog(peripheralTable, side)
     if type(peripheralTable.getAnalogInput) == "function" then
         local ok, value = pcall(peripheralTable.getAnalogInput, side)
@@ -77,7 +132,6 @@ local function readAnalog(peripheralTable, side)
     return 0
 end
 
---- 写入红石外设某方向的模拟输出
 local function writeAnalog(peripheralTable, side, strength)
     if type(peripheralTable.setAnalogOutput) == "function" then
         local ok = pcall(peripheralTable.setAnalogOutput, side, strength)
@@ -104,44 +158,241 @@ function Recipe.new(opts)
     opts = opts or {}
     local self = setmetatable({}, Recipe)
     self.Util = opts.Util
+    self.Assert = opts.Assert
+        or error("recipe.lua needs the assert module: pass opts.Assert (loadModule(\"assert\"))", 0)
+    self.Message = opts.Message
+        or error("recipe.lua needs the message module: pass opts.Message (loadModule(\"message\"))", 0)
+    Assert = self.Assert
+    self.RefCount = opts.RefCount
+        or error("recipe.lua needs the refcount module: pass opts.RefCount (loadModule(\"refcount\"))", 0)
+    RefCount = self.RefCount
     self.Store = opts.Store
     self.Cache = opts.Cache
     self.Peripherals = opts.Peripherals
     self.Containers = opts.Containers
     self.Filter = opts.Filter
     self.log = opts.log or function() end
-    --- 一步的预算（1.7.0）：流程队列一次只推进"一步" —— 一次材料输入/产物抽出调用算一步，
-    --- 无论它是否搬满（搬不完就让位，回队列尾）。这样机器还在合成时，进程不会一直卡在
-    --- "等产物抽取"上。
     self.stepBudget = 1
-    --- 存储整理（网页手动触发）：每个 tick 最多执行多少次搬运，避免一次整理卡住主循环
+    -- The scheduler handle: heavy work (the storage compact *planning* pass) is
+    -- handed to a dispatch queue instead of running inline.
+    self.dispatch = nil
     self.compactOpsPerTick = opts.compactOpsPerTick or 3
-    --- 自动整理的空槽位阈值（用户第 4 项）：存储容器空槽位比例 ≥ 它时**不整理**
-    --- （空槽位还够多，搬来搬去没意义）；默认 0.10 = 空槽位不足 10% 才整理。
-    --- 网页「设置」里可改，见 Recipe:setCompactFreeRatio / Store.SCHEDULE_COMPACT_FREE_DEFAULT。
     self.compactFreeRatio = tonumber(opts.compactFreeRatio) or 0.10
-    --- 引擎存活信息（诊断用）：tick 次数、最后一次 tick 时间、最后一次 tick 异常
     self.tickCount = 0
     self.lastTickAt = 0
     self.lastTickError = nil
-    --- 最近一次 tick 的细分计数（诊断/慢 tick 明细用）：推进了几个流程、真正读了几次外设、读了多少毫秒
     self.tickStats = { steps = 0, active = 0, processes = 0, reads = 0, readMs = 0 }
+    self.debug = opts.debug ~= false
+    -- material key -> { { process = <name>, yield = <per batch> }, ... }: every
+    -- process that can craft that material and has its "craft reference" switch
+    -- on. Rebuilt when the store revision changes, never written to disk.
+    self.craftIndexCache = nil
+    self.craftIndexRev = nil
+    -- Per-tick counters of the planning engine (status line / diagnose).
+    self.planStats = { need = 0, created = 0, materials = 0, machines = 0 }
     return self
 end
 
---- 记录/读取流程运行态
+function Recipe:debugInfo(fmt, ...)
+    if not self.debug then
+        return
+    end
+    self.log("[debug] " .. string.format(fmt, ...))
+end
+
+function Recipe:stallLog(fmt, ...)
+    self.log("[debug] " .. string.format(fmt, ...))
+end
+
+local function callerOf(level)
+    if type(debug) ~= "table" or type(debug.getinfo) ~= "function" then
+        return "?"
+    end
+    local info = debug.getinfo((level or 1) + 1, "Sl")
+    if type(info) ~= "table" then
+        return "?"
+    end
+    return tostring(info.short_src or "?") .. ":" .. tostring(info.currentline or 0)
+end
+
+function Recipe:batchOf(record)
+    local batch = record and (record.multiplier or record.batch)
+    self.Assert.is(type(batch) == "number" and batch >= 1 and batch == math.floor(batch),
+        "record.multiplier must be a positive integer inside a running instance (got %s, phase=%s)" ..
+        " - it is written by recipe.createInstance", tostring(batch), tostring(record and record.phase))
+    return batch
+end
+
+function Recipe:indexOf(record)
+    local index = record and record.index
+    self.Assert.is(type(index) == "number" and index >= 1 and index == math.floor(index),
+        "record.index must be an integer >= 1 (got %s) - see Cache.defaultProc / record.index writes",
+        tostring(index))
+    return index
+end
+
+function Recipe:moveKeyCount()
+    local n = 0
+    for _ in pairs(self.moveKeys or {}) do n = n + 1 end
+    return n
+end
+
+-- One token may own several moves at once (a large send is split over the free
+-- slots of the target containers), so a token maps to a record that collects every
+-- key's result. The record survives partial answers: the moves that already
+-- reported keep their counted amount until the whole token settles.
+function Recipe:trackMoveKey(token, key)
+    if not token or not key then
+        return
+    end
+    self.moveKeys = self.moveKeys or {}
+    local entry = self.moveKeys[token]
+    if not entry then
+        entry = { keys = {}, answered = {}, moved = 0, err = nil, remaining = 0 }
+        self.moveKeys[token] = entry
+    end
+    entry.keys[#entry.keys + 1] = key
+    entry.remaining = entry.remaining + 1
+    self.moveKeyAt = self.moveKeyAt or {}
+    self.moveKeyAt[token] = os.epoch("utc")
+end
+
+function Recipe:settleInFlightMove(token)
+    local entry = token and self.moveKeys and self.moveKeys[token]
+    if not entry then
+        return nil, nil
+    end
+    for i = 1, #entry.keys do
+        if not entry.answered[i] then
+            local result = self.Containers:takeMoveResult(entry.keys[i])
+            if result then
+                entry.answered[i] = true
+                entry.moved = entry.moved + (tonumber(result.moved) or 0)
+                if result.err then
+                    entry.err = result.err
+                end
+                entry.remaining = entry.remaining - 1
+            end
+        end
+    end
+    if entry.remaining <= 0 then
+        self.moveKeys[token] = nil
+        if self.moveKeyAt then
+            self.moveKeyAt[token] = nil
+        end
+        if self.inflightWant then
+            self.inflightWant[token] = nil
+        end
+        return entry.moved, entry.err
+    end
+    local at = tonumber(self.moveKeyAt and self.moveKeyAt[token]) or 0
+    local now = os.epoch("utc")
+    self:stallLog("move-result-miss token=%s keys=%d waited=%dms", tostring(token), #entry.keys,
+        at > 0 and (now - at) or -1)
+    return nil, "pending"
+end
+
+-- Bookkeeping for the multi-move extraction (see Recipe:takeFromMachineMulti): one
+-- element may have several moves on the way at once, each under its own token. This
+-- remembers what each of them was asked to move, so a later attempt does not request
+-- the same amount again while it is still travelling.
+function Recipe:noteInflightWant(token, want)
+    if not token then
+        return
+    end
+    self.inflightWant = self.inflightWant or {}
+    self.inflightWant[token] = math.floor(tonumber(want) or 0)
+end
+
+-- How much is on the way for every token starting with `prefix`.
+function Recipe:inflightWantOf(prefix)
+    local total = 0
+    if not self.inflightWant then
+        return total
+    end
+    local size = #prefix
+    for token, want in pairs(self.inflightWant) do
+        if string.sub(token, 1, size) == prefix then
+            total = total + (tonumber(want) or 0)
+        end
+    end
+    return total
+end
+
+-- Settle every in-flight move whose token starts with `prefix`, adding the results
+-- up. Returns (total, pending): `pending` is true while at least one of them is
+-- still unanswered.
+function Recipe:settleInFlightMoves(prefix)
+    local total, pending = 0, false
+    if not self.moveKeys then
+        return total, pending
+    end
+    local size = #prefix
+    local tokens = {}
+    for token in pairs(self.moveKeys) do
+        if string.sub(token, 1, size) == prefix then
+            tokens[#tokens + 1] = token
+        end
+    end
+    for _, token in ipairs(tokens) do
+        local moved, reason = self:settleInFlightMove(token)
+        if moved ~= nil then
+            total = total + moved
+        elseif reason == "pending" then
+            pending = true
+        end
+    end
+    return total, pending
+end
+
+-- Message nodes that go into lastError are compared with ~= in a few places to keep
+-- the cache from being marked dirty on every tick, so the same message (same key and
+-- same parameters) has to come back as the *same* table.
+local function paramsKey(params)
+    if type(params) ~= "table" then
+        return tostring(params)
+    end
+    local parts = {}
+    for name, value in pairs(params) do
+        local text = (type(value) == "table" and value.key) or tostring(value)
+        parts[#parts + 1] = tostring(name) .. "=" .. tostring(text)
+    end
+    table.sort(parts)
+    return table.concat(parts, ",")
+end
+
+function Recipe:messageOf(key, params, cacheKey)
+    self.messageCache = self.messageCache or {}
+    local digest = cacheKey or (key .. "|" .. paramsKey(params))
+    local node = self.messageCache[digest]
+    if node and node.key == key then
+        return node
+    end
+    node = self.Message.msg(key, params)
+    self.messageCache[digest] = node
+    return node
+end
+
 function Recipe:record(name)
     return self.Cache:proc(name)
 end
 
---- 该流程是不是"抽象流程"（含注册名为 abstract 的物品/流体操作）：抽象流程不能执行、
---- 不能被选作上游、不能下单合成，只作为网页"流程设置复制"的来源。
 function Recipe:isAbstract(process)
     return self.Store.processIsAbstract(process)
 end
 
---- 该类型的全部机器定义（按名称排序）
 function Recipe:machinesOfType(typeName)
+    if self.Store.isTypeConversion(typeName) then
+        -- The type conversion type is virtual: it has no peripheral and no stored
+        -- machine, so the engine hands out one synthetic instance of it.
+        return { {
+            name = self.Store.TYPE_CONVERSION_TYPE,
+            type = self.Store.TYPE_CONVERSION_TYPE,
+            virtual = true,
+            parallel = 1,
+            itemInputs = {}, fluidInputs = {}, itemOutputs = {}, fluidOutputs = {}, signals = {},
+        } }
+    end
     local list = {}
     for _, machine in ipairs(self.Store:list("machines")) do
         if machine.type == typeName then
@@ -151,10 +402,6 @@ function Recipe:machinesOfType(typeName)
     return list
 end
 
---- 机器的信号项 → 中继器外设名（1.6.9）：
----   * 旧配置写的是“信号定义名” → 查定义拿它的外设；
----   * 现在信号不需要命名，机器里直接写外设名 → 就把它当成外设名（返回它自己）。
---- 返回：中继器外设名, 用于显示/日志的名字（解析不到时返回 nil）
 function Recipe:signalPeripheralOf(entry)
     if type(entry) ~= "string" or entry == "" then
         return nil
@@ -166,7 +413,6 @@ function Recipe:signalPeripheralOf(entry)
     return entry, entry
 end
 
---- 机器引用的容器/信号外设是否齐全（物品列表要 inventory，流体列表要 fluid_storage）
 function Recipe:machineUsable(machine)
     local lists = {
         { list = machine.itemInputs, kind = "item" },
@@ -190,39 +436,41 @@ function Recipe:machineUsable(machine)
     return true
 end
 
---- 机器为什么不可用（可用时返回 nil）：逐项检查引用的容器与信号，返回可读原因
 function Recipe:machineProblem(machine)
     local lists = {
-        { list = machine.itemInputs, kind = "item", label = "\\u7269\\u54C1\\u8F93\\u5165\\u5BB9\\u5668" },
-        { list = machine.fluidInputs, kind = "fluid", label = "\\u6D41\\u4F53\\u8F93\\u5165\\u5BB9\\u5668" },
-        { list = machine.itemOutputs, kind = "item", label = "\\u7269\\u54C1\\u8F93\\u51FA\\u5BB9\\u5668" },
-        { list = machine.fluidOutputs, kind = "fluid", label = "\\u6D41\\u4F53\\u8F93\\u51FA\\u5BB9\\u5668" },
+        { list = machine.itemInputs, kind = "item", label = self.Message.msg(self.Message.KEYS.RECIPE_LABEL_ITEM_INPUTS) },
+        { list = machine.fluidInputs, kind = "fluid", label = self.Message.msg(self.Message.KEYS.RECIPE_LABEL_FLUID_INPUTS) },
+        { list = machine.itemOutputs, kind = "item", label = self.Message.msg(self.Message.KEYS.RECIPE_LABEL_ITEM_OUTPUTS) },
+        { list = machine.fluidOutputs, kind = "fluid", label = self.Message.msg(self.Message.KEYS.RECIPE_LABEL_FLUID_OUTPUTS) },
     }
     for _, entry in ipairs(lists) do
         for _, containerName in ipairs(entry.list or {}) do
             if not self.Containers:supports(containerName, entry.kind) then
-                return tostring(entry.label) .. " " .. tostring(containerName) .. " "
-                    .. (self.Containers:unusableReason(containerName, entry.kind) or "\\u4E0D\\u53EF\\u7528")
+                return self.Message.msg(self.Message.KEYS.RECIPE_ERR_CONTAINER_PROBLEM, {
+                    label = entry.label,
+                    container = tostring(containerName),
+                    reason = self.Containers:unusableReason(containerName, entry.kind)
+                        or self.Message.msg(self.Message.KEYS.COMMON_UNAVAILABLE),
+                })
             end
         end
     end
     for _, signalEntry in ipairs(machine.signals or {}) do
         local peripheral, label = self:signalPeripheralOf(signalEntry)
         if not peripheral then
-            return "\\u4FE1\\u53F7\\u5B9A\\u4E49 " .. tostring(signalEntry) .. " \\u4E0D\\u5B58\\u5728"
+            return self.Message.msg(self.Message.KEYS.RECIPE_ERR_SIGNAL_DEF_MISSING, { signal = tostring(signalEntry) })
         end
         if not self.Peripherals:exists(peripheral) then
-            return "\\u4FE1\\u53F7 " .. tostring(label) .. " \\u7684\\u4E2D\\u7EE7\\u5668 " .. tostring(peripheral) .. " \\u4E0D\\u5B58\\u5728"
+            return self.Message.msg(self.Message.KEYS.RECIPE_ERR_SIGNAL_RELAY_MISSING, { signal = tostring(label), peripheral = tostring(peripheral) })
         end
     end
     return nil
 end
 
---- 在同类机器间轮换选择可用机器（第 20 条：记忆轮换次序，避免集中在单台机器）
 function Recipe:chooseMachine(typeName)
     local list = self:machinesOfType(typeName)
     if #list == 0 then
-        return nil, "\\u673A\\u5668\\u7C7B\\u578B " .. tostring(typeName) .. " \\u8FD8\\u6CA1\\u6709\\u53EF\\u7528\\u673A\\u5668"
+    return nil, self:messageOf(self.Message.KEYS.RECIPE_ERR_NO_MACHINE, { type = tostring(typeName) })
     end
     local total = #list
     local record = self.Cache:machineType(typeName)
@@ -232,8 +480,7 @@ function Recipe:chooseMachine(typeName)
         local position = (start + offset) % total + 1
         local machine = list[position]
         if self:machineUsable(machine) then
-            local usage = self.Cache:machine(machine.name)
-            if (usage.running or 0) < (machine.parallel or 1) then
+            if self:machineRunning(machine.name) < (machine.parallel or 1) then
                 record.rrIndex = position % total
                 self.Cache:markDirty()
                 return machine
@@ -243,34 +490,105 @@ function Recipe:chooseMachine(typeName)
         end
     end
     if unusable == total then
-        return nil, "\\u540C\\u7C7B\\u673A\\u5668\\u5F15\\u7528\\u7684\\u5BB9\\u5668\\u4E0D\\u53EF\\u7528\\uFF08\\u68C0\\u67E5\\u5BB9\\u5668\\u79CD\\u7C7B\\u3001\\u5916\\u8BBE\\u4E0E\\u89D2\\u8272\\uFF09"
+            return nil, self:messageOf(self.Message.KEYS.RECIPE_ERR_MACHINES_UNUSABLE)
     end
-    return nil, "\\u540C\\u7C7B\\u673A\\u5668\\u90FD\\u6CA1\\u6709\\u7A7A\\u95F2\\u7684\\u5E76\\u884C\\u4F4D"
+    return nil, self:messageOf(self.Message.KEYS.RECIPE_ERR_MACHINES_BUSY)
 end
 
---- 占用/释放并行位
-function Recipe:occupyMachine(machineName, delta)
-    local usage = self.Cache:machine(machineName)
-    usage.running = math.max(0, (usage.running or 0) + delta)
+-- Machine occupancy is a RefCount keyed by instance id; `usage.running` in the
+-- cache is only a mirrored snapshot, so cache.json keeps its old shape.
+function Recipe:machineRef(machineName)
+    self.machineLedger = self.machineLedger or {}
+    local ref = self.machineLedger[machineName]
+    if not ref then
+        ref = RefCount.new("machine:" .. tostring(machineName))
+        self.machineLedger[machineName] = ref
+    end
+    return ref
+end
+
+function Recipe:machineRunning(machineName)
+    local ref = self.machineLedger and self.machineLedger[machineName]
+    return ref and ref:value() or 0
+end
+
+function Recipe:occupyMachine(machineName, delta, source)
+    if type(machineName) ~= "string" or machineName == "" then
+        return 0
+    end
+    local ref = self:machineRef(machineName)
+    source = tostring(source or "?")
+    if (tonumber(delta) or 0) >= 0 then
+        ref:add(source, delta)
+    else
+        ref:remove(source)
+    end
+    local running = ref:value()
+    -- Mirror the ledger into the persisted record (display / panel only).
+    self.Cache:machine(machineName).running = running
     self.Cache:markDirty()
+    return running
 end
 
---- 机器当前并行占用（网页展示用）
 function Recipe:machineUsage()
     local out = {}
     for _, machine in ipairs(self.Store:list("machines")) do
-        local usage = self.Cache:machine(machine.name)
         out[#out + 1] = {
             name = machine.name,
             type = machine.type,
             parallel = machine.parallel or 1,
-            running = usage.running or 0,
+            running = self:machineRunning(machine.name),
         }
     end
     return out
 end
 
---- 解析元素涉及的中继器外设（只认机器定义的信号序号：机器 signals 列表的序号，从 1 开始）
+-- Startup safety net: mark every machine as fully occupied for a moment, then
+-- rebuild the counters from the restored instances - the only thing that can
+-- really hold a machine. A panel that happens to look in between sees "busy"
+-- instead of a stale number, and afterwards the counters depend on the cache's
+-- instances only, never on what the previous run happened to save.
+function Recipe:resetMachineUsage()
+    local machines = self.Store:list("machines")
+    local before = {}
+    for _, machine in ipairs(machines) do
+        before[machine.name] = self:machineRunning(machine.name)
+        -- Lock first: between here and the rebuild below a parallel slot must
+        -- never look free.
+        local ref = self:machineRef(machine.name)
+        ref:reset()
+        ref:add("startup", math.max(1, math.floor(tonumber(machine.parallel) or 1)))
+    end
+    local instances = 0
+    for id, inst in pairs(self.Cache:instances()) do
+        instances = instances + 1
+        local name = type(inst.machine) == "string" and inst.machine or ""
+        if name ~= "" then
+            -- One source per instance: the same key the runtime release uses.
+            local ref = self:machineRef(name)
+            ref:remove("startup")
+            ref:add(instanceSource(inst) or ("instance:" .. tostring(id)), 1)
+        end
+    end
+    local corrected = 0
+    for name, ref in pairs(self.machineLedger or {}) do
+        -- The startup lock is dropped for *every* machine here, not just for the
+        -- ones that got an instance back: a machine with no instance must end up
+        -- at 0, not at "fully occupied".
+        ref:remove("startup")
+        local running = ref:value()
+        -- An instance whose machine definition is gone (deleted, renamed, turtle
+        -- offline) still gets a record: releasing it looks the record up.
+        self.Cache:machine(name).running = running
+        if (before[name] or 0) ~= running then
+            corrected = corrected + 1
+        end
+    end
+    self.Cache:markDirty()
+    self.log("Machine parallel counters reset at startup: %d machine(s) locked then rebuilt for %d restored " ..
+        "instance(s) (%d had a counter that did not match)", #machines, instances, corrected)
+end
+
 function Recipe:resolveSignals(machine, element)
     local result = {}
     local sides = element.sides or {}
@@ -280,7 +598,6 @@ function Recipe:resolveSignals(machine, element)
     local machineSignalIndex = tonumber(element.machineSignalIndex) or -1
     if machineSignalIndex >= 1 and machine then
         local signalEntry = (machine.signals or {})[machineSignalIndex]
-        --- 信号项可能是旧的“信号定义名”，也可能就是中继器的外设名（1.6.9 起不再需要命名）
         local peripheral, label = self:signalPeripheralOf(signalEntry)
         if peripheral then
             result[#result + 1] = { peripheral = peripheral, sides = sides, signalName = label }
@@ -289,7 +606,6 @@ function Recipe:resolveSignals(machine, element)
     return result
 end
 
---- 等待红石信号是否满足（任一中继器的任一指定方向满足比较式即视为满足）
 function Recipe:signalSatisfied(machine, element)
     local op = OP_FUNCS[element.op or "ge"] or OP_FUNCS.ge
     local threshold = tonumber(element.threshold) or 0
@@ -309,7 +625,6 @@ function Recipe:signalSatisfied(machine, element)
     return false, values
 end
 
---- 把一组 { peripheral, side } 目标写成指定强度（同时记录/清除红石输出，便于重启后恢复）
 function Recipe:switchSignals(targets, strength)
     local emitted = false
     for _, target in ipairs(targets or {}) do
@@ -318,7 +633,6 @@ function Recipe:switchSignals(targets, strength)
             if writeAnalog(peripheralTable, target.side, strength) then
                 emitted = true
                 local key = target.peripheral .. "/" .. target.side
-                -- 0 强度也记下来：重启后 restoreSignals 会把脉冲的“复位”状态写回去（不会卡在通电）
                 self.Cache:setSignalOutput(key, {
                     peripheral = target.peripheral,
                     side = target.side,
@@ -330,7 +644,6 @@ function Recipe:switchSignals(targets, strength)
     return emitted
 end
 
---- 元素引用的红石目标（机器红石信号序号 -> 机器定义的信号列表 -> 信号定义的中继器）
 function Recipe:signalTargets(machine, element)
     local targets = {}
     for _, entry in ipairs(self:resolveSignals(machine, element)) do
@@ -341,7 +654,6 @@ function Recipe:signalTargets(machine, element)
     return targets
 end
 
---- 设置红石信号：把指定方向写成固定强度（等待红石信号才需要阈值/比较，这里不需要）
 function Recipe:emitSignals(machine, element)
     local strength = math.floor(tonumber(element.strength) or 15)
     local emitted = self:switchSignals(self:signalTargets(machine, element), strength)
@@ -351,7 +663,6 @@ function Recipe:emitSignals(machine, element)
     return emitted
 end
 
---- 发出红石脉冲：先置位（强度），后续由 advancePulse 依次“等 0.05s -> 复位 -> 等 0.05s”
 function Recipe:startPulse(machine, element, record, now, nextIndex)
     local targets = self:signalTargets(machine, element)
     if #targets == 0 then
@@ -361,7 +672,7 @@ function Recipe:startPulse(machine, element, record, now, nextIndex)
     local strength = math.floor(tonumber(element.strength) or 15)
     self:switchSignals(targets, strength)
     record.pulse = {
-        index = math.max(1, tonumber(nextIndex) or ((record.index or 1) + 1)),
+        index = math.max(1, tonumber(nextIndex) or (self:indexOf(record) + 1)),
         phase = "on",
         untilMs = now + PULSE_HOLD_MS,
         targets = targets,
@@ -371,7 +682,6 @@ function Recipe:startPulse(machine, element, record, now, nextIndex)
     return true
 end
 
---- 推进红石脉冲：返回 true 表示该元素已处理完（可以继续下一个），false 表示本 tick 还要等
 function Recipe:advancePulse(record, now)
     local pulse = record.pulse
     if not pulse then
@@ -381,7 +691,6 @@ function Recipe:advancePulse(record, now)
         return false
     end
     if pulse.phase == "on" then
-        -- 复位（写 0 并记录 0 强度）
         self:switchSignals(pulse.targets, 0)
         pulse.phase = "off"
         pulse.untilMs = now + PULSE_HOLD_MS
@@ -389,12 +698,11 @@ function Recipe:advancePulse(record, now)
         return false
     end
     record.pulse = nil
-    record.index = math.max(1, tonumber(pulse.index) or ((record.index or 1) + 1))
+    record.index = math.max(1, tonumber(pulse.index) or (self:indexOf(record) + 1))
     self.Cache:markDirty()
     return true
 end
 
---- 恢复上次运行时的红石输出（第 25 条：重启后恢复）
 function Recipe:restoreSignals()
     local restored = 0
     for key, entry in pairs(self.Cache:signalOutputs()) do
@@ -415,10 +723,8 @@ function Recipe:restoreSignals()
     return restored
 end
 
---- 机器输入容器（containerIndex >= 1 时取指定序号；否则取全部）
 function Recipe:inputContainers(machine, resourceKind, containerIndex)
     if not machine then
-        -- 没有机器时按“没有可用输入容器”处理，绝不索引 nil（否则整条 tick 会崩）
         return {}
     end
     local list
@@ -441,8 +747,7 @@ function Recipe:inputContainers(machine, resourceKind, containerIndex)
     return out
 end
 
---- 机器输出容器
-function Recipe:outputContainers(machine, resourceKind)
+function Recipe:outputContainers(machine, resourceKind, containerIndex)
     if not machine then
         return {}
     end
@@ -452,6 +757,13 @@ function Recipe:outputContainers(machine, resourceKind)
     else
         list = machine.itemOutputs or {}
     end
+    local index = tonumber(containerIndex) or -1
+    if index >= 1 then
+        if list[index] then
+            return { list[index] }
+        end
+        return {}
+    end
     local out = {}
     for _, name in ipairs(list) do
         out[#out + 1] = name
@@ -459,16 +771,6 @@ function Recipe:outputContainers(machine, resourceKind)
     return out
 end
 
---- ===== 在飞搬运的记忆（1.6.7：修「要 64 个却搬了 127 个」）=====
---- worker 搬运是异步的：主控发出 task 后要等它回报。回报之前调用方必须继续等同一条请求，
---- 绝不能按“这一 tick 重新扫到的槽位”再发一条 —— 那会把同一批货搬两遍。
---- 用户实测的现象：要 64 个，worker 先把某个槽位里的 63 个搬走；下一 tick 缓存刷新后，
---- 那个槽位空了，于是主控又从另一个槽位发了 64 个出去 → 一共 127 个。
---- 这里按 token（调用方给的稳定标记：流程名 + 元素 key / 发货任务 id）记住那条请求，
---- 回报回来再记账，之后才允许重新扫源找下一批。
-local PENDING_MOVE_TTL = 45000      -- 超过这么久还没回报的记忆一律丢掉（worker 早就超时了）
-
---- 记下一条已经交给 worker 的搬运（token 由调用方给，见上面说明）
 function Recipe:rememberPendingMove(token, record)
     if not token then
         return
@@ -478,49 +780,67 @@ function Recipe:rememberPendingMove(token, record)
     self.pendingMoves[token] = record
 end
 
---- 忘掉某个 token 的在飞搬运（元素完成 / 发货任务结束 / 流程被复位时调用）
 function Recipe:forgetPendingMove(token)
-    if token and self.pendingMoves then
+    if not token then
+        return
+    end
+    if self.pendingMoves then
         self.pendingMoves[token] = nil
+    end
+    local entry = self.moveKeys and self.moveKeys[token]
+    if entry then
+        self.moveKeys[token] = nil
+        if self.Containers and self.Containers.releaseMoveKey then
+            for _, key in ipairs(entry.keys or {}) do
+                self.Containers:releaseMoveKey(key, "move forgotten")
+            end
+        end
+    end
+    if self.inflightWant then
+        self.inflightWant[token] = nil
     end
 end
 
---- 按前缀批量忘掉（流程被停止 / 复位时用）
 function Recipe:forgetPendingMovesWithPrefix(prefix)
-    if not self.pendingMoves or type(prefix) ~= "string" then
+    if type(prefix) ~= "string" then
         return
     end
     local size = #prefix
-    for token in pairs(self.pendingMoves) do
-        if string.sub(token, 1, size) == prefix then
-            self.pendingMoves[token] = nil
+    if self.pendingMoves then
+        for token in pairs(self.pendingMoves) do
+            if string.sub(token, 1, size) == prefix then
+                self.pendingMoves[token] = nil
+            end
+        end
+    end
+    if self.moveKeys then
+        for token in pairs(self.moveKeys) do
+            if string.sub(token, 1, size) == prefix then
+                local entry = self.moveKeys[token]
+                self.moveKeys[token] = nil
+                if entry and self.Containers and self.Containers.releaseMoveKey then
+                    for _, key in ipairs(entry.keys or {}) do
+                        self.Containers:releaseMoveKey(key, "prefix reset")
+                    end
+                end
+            end
+        end
+    end
+    if self.inflightWant then
+        for token in pairs(self.inflightWant) do
+            if string.sub(token, 1, size) == prefix then
+                self.inflightWant[token] = nil
+            end
         end
     end
 end
 
---- 清掉过期的记忆（每个 tick 调一次，表很小）
-function Recipe:sweepPendingMoves(now)
-    if not self.pendingMoves then
-        return
-    end
-    local nowMs = now or os.epoch("utc")
-    for token, record in pairs(self.pendingMoves) do
-        if nowMs - (record.at or 0) > PENDING_MOVE_TTL then
-            self.pendingMoves[token] = nil
-        end
-    end
-end
-
---- 继续等 / 取回上一次交给 worker 的那条搬运（见 transferIn / transferOut 的 token 参数）
---- 返回：
----   nil, "pending"   还在 worker 手上：这一 tick 什么都别做
----   moved, reason    有结果了（记忆已清掉，调用方照常记账；moved 可能是 0 + 失败原因）
----   nil, nil         没有在飞的搬运
 function Recipe:resumePendingMove(token)
     local record = token and self.pendingMoves and self.pendingMoves[token]
     if not record then
         return nil, nil
     end
+    local queueName = record.queueName or "inventoryIn"
     local moved, err
     if record.kind == "fluid" then
         moved, err = self.Containers:pushFluid(record.container, record.want, record.fluid, record.target, queueName)
@@ -535,403 +855,610 @@ function Recipe:resumePendingMove(token)
     return tonumber(moved) or 0, err
 end
 
---- 输入：从存储容器搬运匹配资源到目标容器（itemTargets / fluidTargets 分别对应物品与流体输入容器）
---- token：调用方的一致性标记（同一逻辑搬运每次都要传同一个值，见在飞搬运的记忆）
---- 返回：实际搬运量, 失败原因（未搬运到任何东西时才有；"pending" = 已交给 worker）
---- opts（可选，1.6.11）：
----   storageOrder  从存储容器抽取时的顺序（"speed" = 先拿最多的堆，机器要料求快；
----                 "fragment" = 先拿最少的那堆，发货/输出容器求少碎片）
----   insertMode    往目标容器放入时的策略（见 pushItem 的 mode 参数）
-function Recipe:transferIn(spec, itemTargets, fluidTargets, toSlot, amount, token, opts)
-    --- 1.7.0：这次搬运进哪条队列（默认"库存输入" = 送料进机器；发货用 opts.queue = "inventoryOut"）
-    local queueName = (type(opts) == "table" and opts.queue) or "inventoryIn"
-    --- 用户第 2 项：流体**从不指定槽位**（流程里的"输入流体槽位"参数已移除）——
-    --- 老配置里残留的值也一律忽略，免得"看起来指定了、实际不起作用"。
-    if type(spec) == "table" and spec.kind == "fluid" then
-        toSlot = nil
-    end
-    opts = opts or {}
-    local moved = 0
-    local reason
-    if token then
-        --- 上一次这条搬运交给了 worker、还没回报：先取它的结果（绝不再扫源重发）
-        local got, pendingReason = self:resumePendingMove(token)
-        if pendingReason == "pending" then
-            --- 结果是 nil（还没回报）；如果刚才取回了上一批的数量，moved 会 > 0 一起返回给调用方记账
-            return moved, "pending"
-        end
-        if got then
-            moved = got
-        end
-        if moved >= amount then
-            return moved, nil
-        end
-    end
-    --- 用户第 6 项（本轮）：数量为 0 也要先走上面的 token 分支（发货量可能全在飞 ⇒ wantQty = 0，
-    --- 但上一条的结果仍必须取回来记账）；这段只能取结果、不会派新活（resumePendingMove 里
-    --- pushItem 找不到结果/在飞记录才会派活，而那时 pendingMoves 里已经没有这条 token 了）。
-    if amount <= 0 then
-        return moved, nil
-    end
-    local stacks, tanks = self.Containers:matchSpec(spec, "storage", opts.storageOrder)
-    if #itemTargets > 0 and spec.kind ~= "fluid" then
-        for _, stack in ipairs(stacks) do
-            if moved >= amount then
-                break
-            end
-            -- 只有“目标就是同一个容器定义”才算资源已在目标里；
-            -- 两个不同定义指向同一个方块属于配置问题，交给 pushItem 报出确切原因（绝不伪造“已搬运”）
-            local alreadyThere = false
-            if not (toSlot and toSlot >= 1) then
-                for _, target in ipairs(itemTargets) do
-                    if target == stack.container then
-                        alreadyThere = true
-                        break
-                    end
-                end
-            end
-            if alreadyThere then
-                moved = math.min(amount, moved + stack.count)
-            else
-                for _, target in ipairs(itemTargets) do
-                    if moved >= amount then
-                        break
-                    end
-                    local want = math.min(amount - moved, stack.count)
-                    if want > 0 then
-                        local got, err = self.Containers:pushItem(stack.container, stack.slot, want, target, toSlot,
-                            opts.insertMode)
-                        if err == "pending" then
-                            --- IFMWorker 正在搬：记住这条请求（下个 tick 继续等它，绝不重新扫源）
-                            self:rememberPendingMove(token, {
-                                kind = "item",
-                                container = stack.container,
-                                slot = stack.slot,
-                                want = want,
-                                target = target,
-                                toSlot = toSlot,
-                                mode = opts.insertMode,
-                            })
-                            --- 返回已经取回的 moved（可能 > 0）：调用方要拿它记账，否则会重复搬
-                            return moved, "pending"
-                        end
-                        got = tonumber(got) or 0
-                        if got > 0 then
-                            moved = moved + got
-                            self.Containers:invalidate()
-                        elseif err then
-                            reason = reason or err
-                        end
-                    end
+-- A filter input has to be turned into one concrete resource before it can be
+-- moved into the machine: the filter is matched against what storage really
+-- holds and the resource with the most to give wins (items are only preferred
+-- over fluids when they hold more). Mirrors resolveFilterOutput.
+function Recipe:resolveFilterSource(spec)
+    local best
+    for _, storageName in ipairs(self.Containers:byRole("storage", "item", "out")) do
+        for _, stack in ipairs(self.Containers:stacks(storageName)) do
+            if self.Filter:specMatches(spec, { kind = "item", name = stack.name, nbt = stack.nbt }) then
+                local available = self.Containers:safeTakeAmount(storageName, stack.slot,
+                    { name = stack.name, nbt = stack.nbt })
+                if available > 0 and (not best or available > best.available) then
+                    best = { kind = "item", id = stack.name, nbt = stack.nbt, available = available }
                 end
             end
         end
     end
-    if #fluidTargets > 0 and spec.kind ~= "item" then
-        for _, tank in ipairs(tanks) do
-            if moved >= amount then
-                break
-            end
-            -- 只有“目标就是同一个容器定义”才算资源已在目标里（同上）
-            local alreadyThere = false
-            for _, target in ipairs(fluidTargets) do
-                if target == tank.container then
-                    alreadyThere = true
-                    break
-                end
-            end
-            if alreadyThere then
-                moved = math.min(amount, moved + tank.amount)
-            else
-                for _, target in ipairs(fluidTargets) do
-                    if moved >= amount then
-                        break
-                    end
-                    local got, err = self.Containers:pushFluid(tank.container, amount - moved, tank.name, target)
-                    if err == "pending" then
-                        self:rememberPendingMove(token, {
-                            kind = "fluid",
-                            container = tank.container,
-                            want = amount - moved,
-                            fluid = tank.name,
-                            target = target,
-                        })
-                        return moved, "pending"
-                    end
-                    got = tonumber(got) or 0
-                    if got > 0 then
-                        moved = moved + got
-                        self.Containers:invalidate()
-                    elseif err then
-                        reason = reason or err
-                    end
+    for _, storageName in ipairs(self.Containers:byRole("storage", "fluid", "out")) do
+        for _, tank in ipairs(self.Containers:tanks(storageName)) do
+            if self.Filter:specMatches(spec, { kind = "fluid", name = tank.name }) then
+                local available = self.Containers:fluidAvailable(storageName, tank.name)
+                if available > 0 and (not best or available > best.available) then
+                    best = { kind = "fluid", id = tank.name, available = available }
                 end
             end
         end
     end
-    return moved, reason
+    return best
 end
 
---- 机器输入容器里已经有的材料数量：
---- 这些材料本来就在机器里（例如容器同时是存储容器，或材料是手动放进输入容器的），
---- 直接算作“已输入”，不需要再搬（自己搬给自己不会真的移动，还会让输入阶段一直卡在 0/N）。
-function Recipe:alreadyInTargets(spec, itemTargets, fluidTargets)
+-- How a request of `want` of `item` is spread over the free slots of `containerNames`
+-- (the storage containers or a machine's input containers). Empty slots count by their
+-- slot multiplier, busy slots are skipped, and at most SEND_SPREAD_MAX moves are
+-- planned per attempt; the remainder is retried once the first moves reported.
+function Recipe:planTargetSlots(item, want, containerNames)
+    local plan, why, remaining = {}, nil, math.max(0, math.floor(tonumber(want) or 0))
+    for _, name in ipairs(containerNames or {}) do
+        if remaining <= 0 or #plan >= SEND_SPREAD_MAX then
+            break
+        end
+        local slots, slotWhy = self.Containers:pickTargetSlots(name, item)
+        if slots then
+            for _, entry in ipairs(slots) do
+                if remaining <= 0 or #plan >= SEND_SPREAD_MAX then
+                    break
+                end
+                local chunk = math.min(remaining, entry.free)
+                if chunk > 0 then
+                    plan[#plan + 1] = { target = name, slot = entry.slot, count = chunk }
+                    remaining = remaining - chunk
+                end
+            end
+        else
+            why = why or slotWhy
+        end
+    end
+    return plan, why
+end
+
+function Recipe:sendToMachine(spec, itemTargets, fluidTargets, toSlot, amount, token, opts)
+    opts = opts or {}
+    if amount <= 0 then
+        return 0, nil
+    end
+    local settled, settleReason = self:settleInFlightMove(token)
+    if settled ~= nil then
+        return settled, settleReason
+    end
+    if settleReason == "pending" then
+        return nil, "pending"
+    end
+    if type(spec) ~= "table" then
+        return 0, nil
+    end
+    if spec.kind == "filter" then
+        -- A filter input names a filter, not an item: pick the concrete storage
+        -- resource with the most to give (mirrors the output side) so that the
+        -- move below names a real item instead of the filter itself.
+        local concrete = self:resolveFilterSource(spec)
+        if not concrete then
+            return 0, self.Message.msg(self.Message.KEYS.RECIPE_ERR_STORAGE_MISSING,
+                { item = tostring(spec.id) })
+        end
+        spec = { kind = concrete.kind, id = concrete.id, nbt = concrete.nbt, ignoreNbt = false }
+    end
+    local kind = (spec.kind == "fluid") and "fluid" or "item"
+    local item = { name = spec.id, nbt = spec.nbt }
+    local inputTargets = (kind == "fluid") and (fluidTargets or {}) or (itemTargets or {})
+    if #inputTargets == 0 then
+        return 0, self.Message.msg(self.Message.KEYS.RECIPE_ERR_NO_INPUT_CONTAINER)
+    end
+    local fromContainer, fromSlot, available, reason
+    if kind == "fluid" then
+        for _, storageName in ipairs(self.Containers:byRole("storage", "fluid", "out")) do
+            local have = self.Containers:fluidAvailable(storageName, spec.id)
+            if have > 0 then
+                fromContainer, available = storageName, have
+                break
+            end
+        end
+        if not fromContainer then
+        return 0, self.Message.msg(self.Message.KEYS.RECIPE_ERR_STORAGE_MISSING, { item = tostring(spec.id) })
+        end
+    else
+        for _, storageName in ipairs(self.Containers:byRole("storage", "item", "out")) do
+            local slot, why, avail = self.Containers:pickSourceSlot(storageName, item, opts.storageOrder)
+            if slot then
+                fromContainer, fromSlot, available = storageName, slot, avail
+                break
+            end
+            reason = reason or why
+        end
+        if not fromContainer then
+        return 0, reason or self.Message.msg(self.Message.KEYS.RECIPE_ERR_STORAGE_MISSING, { item = tostring(spec.id) })
+        end
+    end
+    local want = math.min(math.floor(amount), math.floor(available or amount))
+    if want <= 0 then
+            return 0, self.Message.msg(self.Message.KEYS.RECIPE_ERR_STORAGE_MISSING, { item = tostring(spec.id) })
+    end
+    -- Target selection: an element that pins a slot keeps that single (target, slot)
+    -- pair; otherwise the request is spread over the free slots of the input
+    -- containers and sent as several parallel moves, so a large batch no longer has
+    -- to be pushed through one slot (and one move) at a time.
+    if kind == "fluid" then
+        local target = inputTargets[1]
+        local key, keyErr = self.Containers:sendFluid(fromContainer, target, spec.id, want)
+        if not key then
+            return 0, keyErr
+        end
+        self:trackMoveKey(token, key)
+        return nil, "pending"
+    end
+    local explicitSlot = tonumber(toSlot)
+    local plan, why
+    if explicitSlot and explicitSlot >= 1 then
+        plan = { { target = inputTargets[1], slot = explicitSlot, count = want } }
+    else
+        plan, why = self:planTargetSlots(item, want, inputTargets)
+        if #plan == 0 then
+            return 0, why or self.Message.msg(self.Message.KEYS.RECIPE_ERR_NO_INPUT_CONTAINER)
+        end
+    end
+    local submitted, lastErr = 0, nil
+    for _, move in ipairs(plan) do
+        local key, keyErr = self.Containers:sendItem(fromContainer, fromSlot, move.target, move.slot,
+            item, move.count)
+        if key then
+            self:trackMoveKey(token, key)
+            submitted = submitted + move.count
+        else
+            lastErr = lastErr or keyErr
+        end
+    end
+    if submitted <= 0 then
+        return 0, lastErr or self.Message.msg(self.Message.KEYS.RECIPE_ERR_NO_INPUT_CONTAINER)
+    end
+    return nil, "pending"
+end
+
+
+-- How much of `spec` one machine target holds right now. Read-only: the panel and the
+-- diagnose tool show this, the engine itself never credits it as input progress (input
+-- progress comes from the move results only, see Recipe:stepInput).
+local function availableInTarget(self, name, kind, spec, slot)
+    if not name then
+        return 0
+    end
+    -- A slot only exists inside item containers: a fluid target keeps counting the
+    -- whole container (fluids ignore the slot field).
+    if slot then
+        local stack = self.Containers:stackAt(name, slot)
+        if stack and self.Filter:specMatches(spec, { kind = "item", name = stack.name, nbt = stack.nbt }) then
+            return tonumber(stack.count) or 0
+        end
+        return 0
+    end
+    return self.Containers:countIn(name, spec)
+end
+
+function Recipe:alreadyInTargets(spec, itemTargets, fluidTargets, element)
     local total = 0
     local seen = {}
-    local function collect(name)
+    local slot = (type(element) == "table"
+        and (element.kind == "item" or element.kind == "filter")) and tonumber(element.slot) or nil
+    if slot and slot < 1 then
+        slot = nil
+    end
+    local function collect(name, kind)
         if not name or seen[name] then
             return
         end
         seen[name] = true
-        --- 用户规则：interaction / output 容器**不可读**（读它们会直接报错）——
-        --- 于是"机器里已经有这些材料"这件事无从得知，这里一律记 0：
-        --- 引擎只按成功推送量记账（与海龟盲容器同一语义）。
-        if not self.Containers:isReadableContainer(name) then
-            return
-        end
-        total = total + self.Containers:countIn(name, spec)
+        total = total + availableInTarget(self, name, kind, spec, (kind == "item") and slot or nil)
     end
     for _, target in ipairs(itemTargets or {}) do
-        collect(target)
+        collect(target, "item")
     end
     for _, target in ipairs(fluidTargets or {}) do
-        collect(target)
+        collect(target, "fluid")
     end
     return total
 end
 
---- 当前元素还缺的材料是否已经全在机器输入容器里（是的话就不必等待上游，也不必搬运）
-function Recipe:machineHasPending(process, record)
-    local machine = record.machine and self.Store:get("machines", record.machine) or nil
-    if not machine or (record.phase or "input") ~= "input" then
-        return false
-    end
-    local index = tonumber(record.index) or 1
-    local element = (process.inputs or {})[index]
-    if type(element) ~= "table" then
-        return false
-    end
-    if element.kind ~= "item" and element.kind ~= "fluid" and element.kind ~= "filter" then
-        return false
-    end
-    local required = elementDemand(element, record.batch or 1)
-    local transferred = (record.progress or {})[tostring(index)] or 0
-    local short = required - transferred
-    if short <= 0 then
-        return true
-    end
-    local itemTargets = self:inputContainers(machine, "item", element.containerIndex)
-    local fluidTargets = self:inputContainers(machine, "fluid", element.containerIndex)
-    return self:alreadyInTargets(elementSpec(element), itemTargets, fluidTargets) >= short
-end
+-- (claimInTargets is gone: the input phase no longer books what already sits in the
+-- machine input container as progress - that double counted the items this very batch
+-- had delivered and let slots look full while they were short. Input progress comes
+-- from the move results only, see Recipe:stepInput.)
 
---- 输入搬运卡住时给出可读原因（显示在网页“进行中的流程”里，同时写入会话日志）
+-- (machineHasPending is gone: it answered "the machine already holds the input" from the
+-- container content, the same non-move source the input phase no longer uses.)
+
 function Recipe:transferFailureReason(machine, element, itemTargets, fluidTargets, reason)
     if not machine then
-        return reason or "\\u673A\\u5668\\u4E0D\\u53EF\\u7528"
+        return reason or self.Message.msg(self.Message.KEYS.RECIPE_ERR_MACHINE_NOT_USABLE)
     end
     local kind = (element.kind == "fluid") and "fluid" or "item"
     local targets = (kind == "fluid") and fluidTargets or itemTargets
     local all = (kind == "fluid") and (machine.fluidInputs or {}) or (machine.itemInputs or {})
-    local label = (kind == "fluid") and "\\u6D41\\u4F53\\u8F93\\u5165\\u5BB9\\u5668\\uFF08fluidInputs\\uFF09" or "\\u7269\\u54C1\\u8F93\\u5165\\u5BB9\\u5668\\uFF08itemInputs\\uFF09"
+    local label = (kind == "fluid") and self.Message.msg(self.Message.KEYS.RECIPE_LABEL_FLUID_INPUTS_FULL)
+        or self.Message.msg(self.Message.KEYS.RECIPE_LABEL_ITEM_INPUTS_FULL)
     if #targets == 0 then
-        return "\\u673A\\u5668 " .. machine.name .. " \\u6CA1\\u6709\\u53EF\\u7528\\u7684" .. label
+        return self:messageOf(self.Message.KEYS.RECIPE_ERR_MACHINE_NO_INPUTS, { machine = machine.name, label = label })
     end
     local index = tonumber(element.containerIndex) or -1
     if index >= 1 and not all[index] then
-        return "\\u673A\\u5668 " .. machine.name .. " \\u6CA1\\u6709\\u7B2C " .. index .. " \\u4E2A" .. label
+        return self:messageOf(self.Message.KEYS.RECIPE_ERR_MACHINE_NO_INPUT_INDEX, { machine = machine.name, index = index, label = label })
     end
-    return reason or ("\\u65E0\\u6CD5\\u628A " .. tostring(element.id) .. " \\u9001\\u5165\\u673A\\u5668 " .. machine.name
-        .. "\\uFF08\\u5BB9\\u5668\\u5DF2\\u6EE1\\u3001\\u69FD\\u4F4D\\u4E0D\\u5339\\u914D\\u6216\\u8BE5\\u7269\\u54C1\\u4E0D\\u652F\\u6301\\u81EA\\u52A8\\u63D2\\u5165\\uFF09")
+        return reason or self.Message.msg(self.Message.KEYS.RECIPE_ERR_CANNOT_SEND, {
+            item = tostring(element.id),
+            machine = machine.name,
+        })
 end
 
---- 输出：从机器输出容器抽取产物到存储容器。
---- token：同 transferIn（同一逻辑抽取每次传同一个值，见在飞搬运的记忆）。
---- opts.fromSlot：流程"输出产物"元素里填的槽位序号（盲抽用；nil = 交给外设自己找第一个非空槽）。
----
---- 用户规则（见 modules/containers.lua 顶部"读取规则"）：**interaction / output 角色的容器绝不可读**
----（读一次要在搬运前多等 1 个游戏刻，输入/输出速度直接减半）。所以对这类容器改成**盲抽**：
----不读内容、不按种类筛选，直接把指定槽位（或外设自己找的槽位）里的东西推到存储容器，
----完成判定只按成功搬运量记账（record.outProgress）与"机器自己推进存储的增量"（storageGain）。
----只有可读的机器输出容器（storage/input 角色）才保持旧的精确抽取（先读、按种类筛）。
-function Recipe:transferOut(spec, machine, amount, token, opts)
+-- A filter output element is not one resource, but the mover needs a concrete
+-- item/fluid per move: look at what the machine's output containers hold right
+-- now and take the matching resource with the most to give. All the counting
+-- (machineRemaining, storageGain, the batch targets) stays filter based.
+-- opts.containerIndex / opts.slot narrow the search to one output container /
+-- one slot, so an element can pin exactly where it extracts from.
+function Recipe:resolveFilterOutput(spec, machine, opts)
+    local scopeIndex, scopeSlot = outputScopeOf(opts)
+    local best
+    for _, source in ipairs(self:outputContainers(machine, "item", scopeIndex)) do
+        local peripheralName = self.Containers:peripheralOf(source, "item")
+        if peripheralName then
+            for _, stack in ipairs(self.Containers:stacksPeripheral(peripheralName)) do
+                local name = stack.name
+                if (not scopeSlot or tonumber(stack.slot) == scopeSlot)
+                    and type(name) == "string" and name ~= ""
+                    and self.Filter:specMatches(spec, { kind = "item", name = name, nbt = stack.nbt }) then
+                    local available = self.Containers:safeTakeAmount(source, stack.slot,
+                        { name = name, nbt = stack.nbt })
+                    if available > 0 and (not best or available > best.available) then
+                        best = { kind = "item", id = name, nbt = stack.nbt, slot = stack.slot,
+                            available = available }
+                    end
+                end
+            end
+        end
+    end
+    for _, source in ipairs(self:outputContainers(machine, "fluid", scopeIndex)) do
+        local peripheralName = self.Containers:peripheralOf(source, "fluid")
+        if peripheralName then
+            for _, tank in ipairs(self.Containers:tanksPeripheral(peripheralName)) do
+                local name = tank.name
+                if type(name) == "string" and name ~= ""
+                    and self.Filter:specMatches(spec, { kind = "fluid", name = name }) then
+                    local available = self.Containers:fluidAvailable(source, name)
+                    if available > 0 and (not best or available > best.available) then
+                        best = { kind = "fluid", id = name, available = available }
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+function Recipe:takeFromMachine(spec, machine, amount, token, opts)
+    opts = opts or {}
     if amount <= 0 then
         return 0, nil
     end
-    -- 物品只送物品存储容器、流体只送流体存储容器（同名物品/流体定义也能正确区分）；
-    -- 顺序按存储优先级从大到小：高优先级容器优先存入（同优先级按定义名排序，见 Containers:byRole）
-    local itemTargets = self.Containers:byRole("storage", "item", "out")
-    local fluidTargets = self.Containers:byRole("storage", "fluid", "out")
-    if #itemTargets == 0 and #fluidTargets == 0 then
-        return 0, "\\u6CA1\\u6709 storage \\u89D2\\u8272\\u7684\\u7269\\u54C1/\\u6D41\\u4F53\\u5BB9\\u5668\\uFF08\\u4EA7\\u7269\\u6CA1\\u6709\\u5730\\u65B9\\u53EF\\u653E\\uFF09"
+    local settled, settleReason = self:settleInFlightMove(token)
+    if settled ~= nil then
+        return settled, settleReason
     end
-    local moved = 0
-    local reason
-    --- 盲抽的源槽位：流程"输出产物"里填的槽位序号（nil = 让外设自己找第一个非空槽）
-    --- 用户第 2 项：抽取按**内容快照**决策；只有"物品类"产物才用"槽位序号"作为限定
-    --- （流体从不指定槽位 —— 流程编辑器里流体元素已不再提供该输入框）。
-    local fromSlot = (spec.kind ~= "fluid" and type(opts) == "table") and tonumber(opts.fromSlot) or nil
-    if fromSlot ~= nil and fromSlot < 1 then
-        fromSlot = nil
+    if settleReason == "pending" then
+        return nil, "pending"
     end
-    --- 单次推送 + 记账。返回 got（0/n）；返回 nil,"pending" = 已交给 worker，调用方要立刻 return moved,"pending"
-    local function pushOne(source, target, slot, want)
-        local got, err = self.Containers:pushItem(source, slot, want, target, nil,
-            --- 机器产物进存储容器要快：优先放进能一次放下、余量最小的槽位（1.6.11）
-            self.Containers.INSERT_SPEED, "inventoryOut",
-            --- 用户第 2 项：把"想抽的物品"一起交给 Containers —— 盲源（海龟）要靠它去查源槽位
-            { name = spec.id, nbt = spec.nbt })
-        if err == "pending" then
-            self:rememberPendingMove(token, {
-                kind = "item", container = source, slot = slot,
-                want = want, target = target, toSlot = nil,
-                mode = self.Containers.INSERT_SPEED,
-                --- 续传时同样要带上它：不然盲源又拿不到槽位（见 resumePendingMove）
-                item = { name = spec.id, nbt = spec.nbt },
-            })
-            return nil, "pending"
-        end
-        got = tonumber(got) or 0
-        if got > 0 then
-            self.Containers:invalidate()
-        elseif err then
-            reason = reason or err
-        end
-        return got, nil
+    if type(spec) ~= "table" then
+        return 0, nil
     end
-    if token then
-        --- 上一次这条抽取交给了 worker、还没回报：先取它的结果（绝不再扫输出容器重发）
-        local got, pendingReason = self:resumePendingMove(token)
-        if pendingReason == "pending" then
-            return moved, "pending"
+    -- The element may pin the output container / the slot inside it; an empty
+    -- scope (-1) keeps the old "any output container" behaviour.
+    local scopeIndex, scopeSlot = outputScopeOf(opts)
+    local scoped = scopeIndex ~= nil or scopeSlot ~= nil
+    if spec.kind == "filter" then
+        local concrete = self:resolveFilterOutput(spec, machine, opts)
+        if not concrete then
+            if scoped then
+                -- The pinned container/slot holds nothing matching the filter:
+                -- that is "nothing to take yet", not an error.
+                return 0, nil
+            end
+            return 0, self.Message.msg(self.Message.KEYS.CONT_ERR_NO_ITEM_AVAILABLE,
+                { container = tostring(machine and machine.name), item = tostring(spec.id) })
         end
-        if got then
-            moved = got
-        end
-        if moved >= amount then
-            return moved, nil
+        spec = { kind = concrete.kind, id = concrete.id, nbt = concrete.nbt }
+        if scopeSlot == nil then
+            -- The filter resolved to one concrete stack: keep extracting from
+            -- that slot so a single filter move never spreads over slots.
+            scopeSlot = tonumber(concrete.slot)
+            if scopeSlot and scopeSlot < 1 then
+                scopeSlot = nil
+            end
         end
     end
-    if spec.kind ~= "fluid" then
-        for _, source in ipairs(self:outputContainers(machine, "item")) do
-            if moved >= amount then
+    local kind = (spec.kind == "fluid") and "fluid" or "item"
+    local item = { name = spec.id, nbt = spec.nbt }
+    -- Without a pinned container/slot any output container that really holds the
+    -- wanted resource is used, so the item does not have to sit in the first one.
+    -- A pinned scope still limits the search to that container/slot.
+    local sources = self:outputContainers(machine, kind, scopeIndex) or {}
+    if #sources == 0 then
+        return 0, self.Message.msg(self.Message.KEYS.RECIPE_ERR_NO_OUTPUT_CONTAINER,
+            { machine = tostring(machine and machine.name) })
+    end
+    -- Size the move to what the machine really offers right now: queueItemMove
+    -- rejects a move whose source slot holds less than the requested amount
+    -- (assertItemSource), so asking for the whole batch while the machine has
+    -- only a few pieces would be retried every tick and never move anything.
+    local source, fromSlot, available, sourceWhy
+    for _, name in ipairs(sources) do
+        if kind == "fluid" then
+            local have = self.Containers:fluidAvailable(name, spec.id)
+            if have > 0 then
+                source, available = name, have
                 break
             end
-            local peripheralName = self.Containers:peripheralOf(source, "item")
-            if peripheralName then
-                --- 用户第 2/3 项（1.9.0）：输出容器**一律按快照抽取** —— 交互容器现在也会被扫描
-                --- （海龟由它自己上报物品栏，见 Containers:applyScan + Transfer.onCrafterInventory）：
-                ---   * 只抽快照里与产物匹配的槽位（同名 + 同 NBT，由 Filter:specMatches 判）；
-                ---   * 跳过已被其它任务认领的脏槽位（用户第 3 项）；
-                ---   * opts.fromSlot（流程"输出产物"里填的槽位序号）现在只是**限定**：填了它就只抽那一个槽位；
-                ---   * 旧的"按固定槽位盲抽"分支已删除：拿不到快照 = 这一轮什么都不做（pushItem 会给出原因）。
-                for _, stack in ipairs(self.Containers:stacksPeripheral(peripheralName)) do
-                    if moved >= amount then
-                        break
-                    end
-                    local resource = { kind = "item", name = stack.name, nbt = stack.nbt }
-                    local slotAllowed = (fromSlot == nil) or (tonumber(stack.slot) == fromSlot)
-                    if slotAllowed and self.Filter:specMatches(spec, resource)
-                        and not self.Containers:isDirtySlot(peripheralName, stack.slot, false) then
-                        for _, target in ipairs(itemTargets) do
-                            if moved >= amount then
-                                break
+            sourceWhy = sourceWhy or self.Message.msg(self.Message.KEYS.CONT_ERR_NO_ITEM_AVAILABLE,
+                { container = tostring(name), item = tostring(spec.id) })
+        else
+            -- opts.fromSlot is the legacy name (a resolver already picked the slot);
+            -- the element's own slot arrives through the scope above.
+            local slot = tonumber(opts.fromSlot) or scopeSlot
+            if slot and slot >= 1 then
+                local safe = self.Containers:safeTakeAmount(name, slot, item)
+                if safe > 0 then
+                    source, fromSlot, available = name, slot, safe
+                    break
+                end
+            else
+                local picked, pickedWhy, safe = self.Containers:pickSourceSlot(name, item,
+                    self.Containers.ORDER_SPEED)
+                if picked then
+                    source, fromSlot, available = name, picked, safe
+                    break
+                end
+                sourceWhy = sourceWhy or pickedWhy
+            end
+        end
+    end
+    if not source then
+        if scoped then
+            -- A pinned container/slot holds nothing matching: "nothing to take
+            -- yet", not an error.
+            return 0, nil
+        end
+        return 0, sourceWhy or self.Message.msg(self.Message.KEYS.CONT_ERR_NO_ITEM_AVAILABLE,
+            { container = tostring(machine and machine.name), item = tostring(spec.id) })
+    end
+    local want = math.max(1, math.floor(amount))
+    if available and available < want then
+        want = math.floor(available)
+    end
+    if want <= 0 then
+        if scoped then
+            -- A pinned container/slot that simply does not hold the wanted item:
+            -- treat it as "nothing taken this tick" instead of an error.
+            return 0, nil
+        end
+        return 0, self.Message.msg(self.Message.KEYS.CONT_ERR_NO_ITEM_AVAILABLE,
+            { container = tostring(source), item = tostring(spec.id) })
+    end
+    local target, targetSlot, why
+    if kind == "fluid" then
+        target = (self.Containers:byRole("storage", "fluid", "in") or {})[1]
+        if not target then
+        return 0, self.Message.msg(self.Message.KEYS.RECIPE_ERR_NO_FLUID_STORAGE)
+        end
+    else
+        for _, storageName in ipairs(self.Containers:byRole("storage", "item", "in")) do
+            local slot, reason = self.Containers:pickTargetSlot(storageName, item, want)
+            if slot then
+                target, targetSlot = storageName, slot
+                break
+            end
+            why = why or reason
+        end
+        if not target then
+        return 0, why or self.Message.msg(self.Message.KEYS.RECIPE_ERR_NO_TARGET_SLOT)
+        end
+    end
+    self:stallLog("out-take %s %s slot=%s requested=%d available=%s -> taking %d",
+        tostring(machine and machine.name), tostring(spec.id), tostring(fromSlot), math.floor(amount),
+        available and tostring(math.floor(available)) or "n/a", want)
+    local key, keyErr
+    if kind == "fluid" then
+        key, keyErr = self.Containers:takeFluid(source, target, spec.id, want)
+    else
+        key, keyErr = self.Containers:takeItem(source, fromSlot, target, targetSlot, item, want)
+    end
+    if not key then
+        return 0, keyErr
+    end
+    self:trackMoveKey(token, key)
+    return nil, "pending"
+end
+
+-- Unordered IO: a machine output can sit in several slots of one or more output
+-- containers. Instead of one move per tick, this submits one move per source slot at
+-- once - each under its own token ("<token>\1<container>:<slot>") - so the extraction
+-- of one element runs in parallel. Recipe:settleInFlightMoves adds the results back
+-- up; Recipe:inflightWantOf reports what is still on the way so a later attempt does
+-- not request it again.
+-- Returns (nil, "pending") while moves are in flight, (0, reason) when nothing could
+-- be submitted, and (nil, "fallback") when the caller has to use the single-move path
+-- instead (fluid or filter outputs, a pinned container/slot).
+function Recipe:takeFromMachineMulti(spec, machine, amount, token, opts)
+    opts = opts or {}
+    if type(spec) ~= "table" or spec.kind ~= "item" then
+        return nil, "fallback"
+    end
+    local scopeIndex, scopeSlot = outputScopeOf(opts)
+    if scopeIndex ~= nil or scopeSlot ~= nil then
+        return nil, "fallback"
+    end
+    local prefix = tostring(token) .. "\1"
+    local want = math.max(0, math.floor(tonumber(amount) or 0))
+    local onTheWay = self:inflightWantOf(prefix)
+    if want <= 0 or onTheWay >= want then
+        return nil, "pending"
+    end
+    local item = { name = spec.id, nbt = spec.nbt }
+    local remaining, submitted, reason = want - onTheWay, 0, nil
+    for _, source in ipairs(self:outputContainers(machine, "item") or {}) do
+        if remaining <= 0 then
+            break
+        end
+        local slots, slotsWhy = self.Containers:pickSourceSlots(source, item, self.Containers.ORDER_SPEED)
+        if not slots then
+            reason = reason or slotsWhy
+        else
+            for _, entry in ipairs(slots) do
+                if remaining <= 0 then
+                    break
+                end
+                local take = math.min(remaining, math.floor(tonumber(entry.available) or 0))
+                if take > 0 then
+                    local moveToken = prefix .. tostring(source) .. ":" .. tostring(entry.slot)
+                    local plan, targetWhy = self:planTargetSlots(item, take,
+                        self.Containers:byRole("storage", "item", "in"))
+                    if #plan == 0 then
+                        reason = reason or targetWhy
+                            or self.Message.msg(self.Message.KEYS.RECIPE_ERR_NO_TARGET_SLOT)
+                    else
+                        local movedHere = 0
+                        for _, move in ipairs(plan) do
+                            local key, keyErr = self.Containers:takeItem(source, entry.slot, move.target,
+                                move.slot, item, move.count)
+                            if key then
+                                self:trackMoveKey(moveToken, key)
+                                movedHere = movedHere + move.count
+                            else
+                                reason = reason or keyErr
                             end
-                            local want = math.min(amount - moved, stack.count)
-                            if want > 0 then
-                                local got, pending = pushOne(source, target, stack.slot, want)
-                                if pending then
-                                    return moved, "pending"
-                                end
-                                moved = moved + got
-                            end
+                        end
+                        if movedHere > 0 then
+                            self:noteInflightWant(moveToken, movedHere)
+                            submitted = submitted + movedHere
+                            remaining = remaining - movedHere
+                            self:stallLog("out-take-multi %s %s %s#%d -> %d slot(s) x%d",
+                                tostring(machine and machine.name), tostring(spec.id), tostring(source),
+                                entry.slot, #plan, movedHere)
                         end
                     end
                 end
             end
         end
     end
-    if spec.kind ~= "item" then
-        for _, source in ipairs(self:outputContainers(machine, "fluid")) do
-            if moved >= amount then
-                break
-            end
-            local peripheralName = self.Containers:peripheralOf(source, "fluid")
-            if peripheralName then
-                --- 用户第 2/3 项：输出容器的储罐也按快照抽取（跳过已被认领的脏储罐）；
-                --- "盲抽流体"分支已随盲路径一起删除。
-                for _, tank in ipairs(self.Containers:tanksPeripheral(peripheralName)) do
-                    if moved >= amount then
-                        break
-                    end
-                    local resource = { kind = "fluid", name = tank.name }
-                    if self.Filter:specMatches(spec, resource)
-                        and not self.Containers:isDirtySlot(peripheralName, tank.tank, true) then
-                        for _, target in ipairs(fluidTargets) do
-                            if moved >= amount then
+    if submitted > 0 then
+        return nil, "pending"
+    end
+    return 0, reason
+end
+
+-- Every container with the "input" role is drained into storage: for each stack /
+-- tank of its snapshot that is not dirty, one take move is created. The "not dirty"
+-- check doubles as de-duplication, because creating a move marks the source slot
+-- dirty and claims the target slot, so the same stack is not submitted again until
+-- that move settles. Moves go through the existing inventoryIn ("stock in") queue.
+function Recipe:drainInputContainers(now)
+    local stats = self.inputDrainStats
+    if not stats then
+        stats = { containers = 0, moves = 0, skipped = 0, noTarget = 0 }
+        self.inputDrainStats = stats
+    end
+    local Containers = self.Containers
+    if not Containers then
+        return 0
+    end
+    for _, containerName in ipairs(Containers:byRole("input", "item")) do
+        local def = self.Store:findContainer(containerName, "item")
+        local peripheralName = def and def.peripheral or nil
+        if peripheralName and Containers:hasSnapshot(peripheralName) then
+            stats.containers = stats.containers + 1
+            for _, stack in ipairs(Containers:stacks(containerName)) do
+                if Containers:slotBusy(peripheralName, stack.slot) then
+                    stats.skipped = stats.skipped + 1
+                else
+                    local amount = math.max(1, math.floor(tonumber(stack.count) or 0))
+                    local item = { name = stack.name, nbt = stack.nbt }
+                    local done = false
+                    for _, storageName in ipairs(Containers:byRole("storage", "item", "in")) do
+                        local slot = Containers:pickTargetSlot(storageName, item, amount)
+                        if slot then
+                            local key = Containers:takeItem(containerName, stack.slot,
+                                storageName, slot, item, amount)
+                            if key then
+                                done = true
                                 break
                             end
-                            local got, err = self.Containers:pushFluid(source, amount - moved, tank.name, target, "inventoryOut")
-                            if err == "pending" then
-                                self:rememberPendingMove(token, {
-                                    kind = "fluid",
-                                    container = source,
-                                    want = amount - moved,
-                                    fluid = tank.name,
-                                    target = target,
-                                })
-                                return moved, "pending"
-                            end
-                            got = tonumber(got) or 0
-                            if got > 0 then
-                                moved = moved + got
-                                self.Containers:invalidate()
-                            elseif err then
-                                reason = reason or err
-                            end
                         end
+                    end
+                    if done then
+                        stats.moves = stats.moves + 1
+                    else
+                        stats.noTarget = stats.noTarget + 1
+                        break
                     end
                 end
             end
         end
     end
-    return moved, reason
+    for _, containerName in ipairs(Containers:byRole("input", "fluid")) do
+        local def = self.Store:findContainer(containerName, "fluid")
+        local peripheralName = def and def.peripheral or nil
+        if peripheralName and Containers:snapshotComplete(peripheralName, "fluid") then
+            stats.containers = stats.containers + 1
+            for _, tank in ipairs(Containers:tanks(containerName)) do
+                if Containers:fluidAvailable(containerName, tank.name) <= 0 then
+                    stats.skipped = stats.skipped + 1
+                else
+                    local amount = math.max(1, math.floor(tonumber(tank.amount) or 0))
+                    local done = false
+                    for _, storageName in ipairs(Containers:byRole("storage", "fluid", "in")) do
+                        local key = Containers:takeFluid(containerName, storageName, tank.name, amount)
+                        if key then
+                            done = true
+                            break
+                        end
+                    end
+                    if done then
+                        stats.moves = stats.moves + 1
+                    else
+                        stats.noTarget = stats.noTarget + 1
+                        break
+                    end
+                end
+            end
+        end
+    end
+    return stats.moves
 end
 
---- 用户第 2 项（1.9.0）：所有角色的容器都会被扫描（interaction / output 也一样，海龟由它自己上报），
---- 所以**不存在"按设计不可读"的机器输出容器**了 —— 这里恒为 false。
---- 保留函数是为了调用点（"等机器产出"的文案判断）不必改动。
-function Recipe:machineOutputsBlind(spec, machine)
-    return false
-end
 
---- 机器输出容器中剩余的可抽取数量（用户第 2/3 项：所有角色的容器都有内容快照，
---- 所以一律按快照算）。抽取完成判定仍然以记账为主：record.outProgress 与 storageGain。
-function Recipe:machineRemaining(spec, machine)
+-- How much of `spec` the machine still holds *inside the element's scope*: an
+-- element that pins a container/slot must not be kept waiting by matching
+-- resources sitting somewhere else, or the output phase could never complete.
+function Recipe:machineRemaining(spec, machine, opts)
+    local scopeIndex, scopeSlot = outputScopeOf(opts)
     local total = 0
     if spec.kind ~= "fluid" then
-        for _, source in ipairs(self:outputContainers(machine, "item")) do
-            if self.Containers:isReadableContainer(source, "item") then
-                local peripheralName = self.Containers:peripheralOf(source, "item")
-                if peripheralName then
-                    for _, stack in ipairs(self.Containers:stacksPeripheral(peripheralName)) do
-                        if self.Filter:specMatches(spec, { kind = "item", name = stack.name, nbt = stack.nbt }) then
-                            total = total + stack.count
-                        end
+        for _, source in ipairs(self:outputContainers(machine, "item", scopeIndex)) do
+            local peripheralName = self.Containers:peripheralOf(source, "item")
+            if peripheralName then
+                for _, stack in ipairs(self.Containers:stacksPeripheral(peripheralName)) do
+                    if (not scopeSlot or tonumber(stack.slot) == scopeSlot)
+                        and self.Filter:specMatches(spec, { kind = "item", name = stack.name, nbt = stack.nbt }) then
+                        total = total + stack.count
                     end
                 end
             end
         end
     end
     if spec.kind ~= "item" then
-        for _, source in ipairs(self:outputContainers(machine, "fluid")) do
-            if self.Containers:isReadableContainer(source, "fluid") then
-                local peripheralName = self.Containers:peripheralOf(source, "fluid")
-                if peripheralName then
-                    for _, tank in ipairs(self.Containers:tanksPeripheral(peripheralName)) do
-                        if self.Filter:specMatches(spec, { kind = "fluid", name = tank.name }) then
-                            total = total + tank.amount
-                        end
+        for _, source in ipairs(self:outputContainers(machine, "fluid", scopeIndex)) do
+            local peripheralName = self.Containers:peripheralOf(source, "fluid")
+            if peripheralName then
+                for _, tank in ipairs(self.Containers:tanksPeripheral(peripheralName)) do
+                    if self.Filter:specMatches(spec, { kind = "fluid", name = tank.name }) then
+                        total = total + tank.amount
                     end
                 end
             end
@@ -940,28 +1467,26 @@ function Recipe:machineRemaining(spec, machine)
     return total
 end
 
--- 说明：elementDemand / elementSpec 的定义已上移到文件开头（前面的 machineHasPending 等要用到）
-
---- 存储容器中可用于该输入元素的数量
---- 判定必须与 transferIn 完全一致（含 NBT 语义），否则会出现“材料检查通过、搬运时却匹配不到”，
---- 输入阶段就会永远停在 “正在发送 xxx 0/N”。
 function Recipe:availableFor(element)
     local total = self.Containers:countOf(elementSpec(element), "storage")
     return total
 end
 
---- 当前批次剩余待输入材料是否齐备
 function Recipe:batchMaterialsReady(process, record)
-    local batch = record.batch or 1
+    local batch = self.Assert.count(record.multiplier or record.batch, "record.multiplier")
     local progress = record.progress or {}
     for index, element in ipairs(process.inputs or {}) do
         if element.kind == "item" or element.kind == "fluid" or element.kind == "filter" then
-            local required = elementDemand(element, batch)
-            local done_ = progress[tostring(index)] or 0
-            if done_ < required then
-                local available = self:availableFor(element)
-                if available < (required - done_) then
-                    return false, element, (required - done_) - available, index
+            -- A skippable input never blocks readiness: it gets its one attempt in
+            -- Recipe:stepInput, which marks it skipped when it cannot be delivered.
+            if not element.skip then
+                local required = elementDemand(element, batch)
+                local done_ = progress[tostring(index)] or 0
+                if done_ < required then
+                    local available = self:availableFor(element)
+                    if available < (required - done_) then
+                        return false, element, (required - done_) - available, index
+                    end
                 end
             end
         end
@@ -969,7 +1494,6 @@ function Recipe:batchMaterialsReady(process, record)
     return true
 end
 
---- 上游产物是否满足下游输入元素
 function Recipe:outputMatchesInput(output, element)
     if element.kind == "item" then
         if output.kind == "item" then
@@ -994,237 +1518,75 @@ function Recipe:outputMatchesInput(output, element)
         if output.kind == "fluid" then
             return self.Filter:matches(element.id, { kind = "fluid", name = output.id })
         end
+        if output.kind == "filter" then
+            -- A process that outputs that very filter is a direct producer for it.
+            -- (Automatic containment is display-only: it is drawn in the dependency
+            -- graph, but it does not make the process a producer for the filter.)
+            return output.id == element.id
+        end
+        if output.kind == "placeholder" then
+            -- Same rule as upstreamCandidates: the placeholder stands for one item.
+            return type(output.item) == "string" and output.item ~= "" and
+                self.Filter:matches(element.id, { kind = "item", name = output.item })
+        end
         return false
     end
     return false
 end
 
---- 查找可以产出该输入元素的上游流程（按输出优先级从高到低）
---- 抽象流程（含 abstract 操作）永远不能当上游：它只是"流程设置复制"的来源，不能真的生产东西。
-function Recipe:upstreamCandidates(processName, element)
-    local result = {}
-    local index = {}
-    for _, other in ipairs(self.Store:list("processes")) do
-        if other.name ~= processName and not self:isAbstract(other) then
-            for _, output in ipairs(other.outputs or {}) do
-                local yieldPerBatch = 0
-                if output.kind == "item" or output.kind == "fluid" or output.kind == "filter" then
-                    if self:outputMatchesInput(output, element) then
-                        yieldPerBatch = math.max(1, tonumber(output.max) or 1)
-                    end
-                elseif output.kind == "placeholder" then
-                    if element.kind == "item" and output.item == element.id then
-                        yieldPerBatch = 1
-                    elseif element.kind == "filter" and output.item and self.Filter:matches(element.id, { kind = "item", name = output.item }) then
-                        yieldPerBatch = 1
-                    end
-                end
-                if yieldPerBatch > 0 then
-                    local entry = index[other.name]
-                    local priority = tonumber(output.priority) or 0
-                    if not entry then
-                        entry = {
-                            name = other.name,
-                            yield = yieldPerBatch,
-                            priority = priority,
-                        }
-                        index[other.name] = entry
-                        result[#result + 1] = entry
-                    else
-                        entry.priority = math.max(entry.priority, priority)
-                        entry.yield = math.max(entry.yield, yieldPerBatch)
-                    end
-                end
-            end
-        end
-    end
-    table.sort(result, function(a, b)
-        if a.priority ~= b.priority then
-            return a.priority > b.priority
-        end
-        return a.name < b.name
-    end)
-    return result
-end
+-- (upstreamCandidates / clearRequest / releaseInstanceRequests are gone: the
+-- material ledger owns every demand now, so instances no longer carry request
+-- ledgers and no code writes into another process' counters.)
 
---- 清空某输入元素的上游请求（下游不再缺料 / 下游被取消时撤销请求）
---- 撤销时会把当时加到上游的“下游单位数”减回去，否则上游会继续为已取消的下游生产。
-function Recipe:clearRequest(record, key)
-    local ledger = record.requests and record.requests[key]
-    if not ledger then
-        return
-    end
-    record.requests[key] = nil
-    if ledger.upstream and (ledger.added or 0) > 0 then
-        local upstreamRecord = self:record(ledger.upstream)
-        upstreamRecord.downstreamCount = math.max(0, (upstreamRecord.downstreamCount or 0) - ledger.added)
-    end
-    self.Cache:markDirty()
-end
+-- (chooseUpstream / requestUpstream are gone with the instance request ledger.)
 
---- 选择要请求的上游流程：按输出产物优先级从高到低，只在高优先级上游“缺失”时才顺延到下一个
-function Recipe:chooseUpstream(processName, element)
-    for _, candidate in ipairs(self:upstreamCandidates(processName, element)) do
-        if self:record(candidate.name).state ~= "missing" then
-            return candidate
-        end
-    end
-    return nil
-end
-
---- 请求上游产出：
----   * 每个输入元素同一时间只向一个上游请求（台账记录已请求数量，避免重复累加）；
----   * 处于缺失状态的上游不会被取消既有请求，只是不再新增；
----   * 下游不再缺料时由 clearRequest 撤销请求记录。
--- 返回值：是否已建立/已存在请求, 是否存在候选上游
-function Recipe:requestUpstream(processName, record, index, element, need, chain, depth)
-    chain = chain or {}
-    depth = depth or 0
-    if depth > MAX_CHAIN_DEPTH or chain[processName] then
-        return false, false
-    end
-    chain[processName] = true
-    local candidates = self:upstreamCandidates(processName, element)
-    if #candidates == 0 then
-        return false, false
-    end
-    record.requests = record.requests or {}
-    local key = tostring(index)
-    local ledger = record.requests[key]
-    if ledger and (ledger.items or 0) >= need then
-        return true, true
-    end
-    local candidate = self:chooseUpstream(processName, element)
-    if not candidate then
-        return false, true
-    end
-    local yieldPerBatch = math.max(1, candidate.yield)
-    local units = math.max(1, math.ceil(need / yieldPerBatch))
-    local previous = 0
-    if ledger and ledger.upstream == candidate.name then
-        previous = ledger.units or 0
-    elseif ledger and ledger.upstream then
-        -- 换上游：先把旧上游的下游单位数减回去
-        local oldRecord = self:record(ledger.upstream)
-        oldRecord.downstreamCount = math.max(0, (oldRecord.downstreamCount or 0) - (ledger.added or 0))
-        self.Cache:markDirty()
-    end
-    local added = math.max(0, units - previous)
-    if added > 0 then
-        local upstreamRecord = self:record(candidate.name)
-        upstreamRecord.downstreamCount = (upstreamRecord.downstreamCount or 0) + added
-        if upstreamRecord.state == "idle" or upstreamRecord.state == "done" then
-            upstreamRecord.state = "idle"
-            local upstreamProcess = self.Store:get("processes", candidate.name)
-            if upstreamProcess then
-                self:ensureMaterials(candidate.name, upstreamProcess, upstreamRecord, chain, depth + 1)
-            end
-        end
-    end
-    local total = math.max(units, previous)
-    record.requests[key] = {
-        upstream = candidate.name,
-        units = total,
-        added = added,
-        items = total * yieldPerBatch,
-        yield = yieldPerBatch,
-    }
-    self.Cache:markDirty()
-    return true, true
-end
-
---- 判断流程材料是否齐备；不足则按优先级请求上游，无法请求则标记缺失
-function Recipe:ensureMaterials(processName, process, record, chain, depth)
-    chain = chain or {}
-    depth = depth or 0
-    local remaining = (record.userCount or 0) + (record.downstreamCount or 0)
-    if remaining <= 0 then
-        return true
-    end
-    local maxMultiplier = math.max(1, tonumber(process.maxMultiplier) or 1)
-    local batch = math.min(maxMultiplier, remaining)
-    local missing = {}
+-- An input phase ran out of material. The shortage itself is *not* booked here:
+-- the planning engine reads the same shortage off the material ledger (that is
+-- what automateCount counts) and picks a producer for it. This only records the
+-- state the panel shows, and it answers whether the batch can go on now.
+-- Are all the material inputs of this instance fully delivered? The unordered IO
+-- mode keeps the instance alive until this is true, even when every output is
+-- already out.
+function Recipe:inputsSatisfied(process, record)
+    local batch = self:batchOf(record)
+    local progress = record.progress or {}
     for index, element in ipairs(process.inputs or {}) do
         if element.kind == "item" or element.kind == "fluid" or element.kind == "filter" then
-            local need = elementDemand(element, batch)
-            local available = self:availableFor(element)
-            if available < need then
-                missing[#missing + 1] = {
-                    index = index,
-                    element = element,
-                    need = need - available,
-                }
+            local required = elementDemand(element, batch)
+            if (tonumber(progress[tostring(index)]) or 0) < required then
+                return false
             end
         end
     end
-    if #missing == 0 then
-        if record.state == "missing" then
-            -- 批次进行中（batch > 0）时只把“缺失”恢复成“进行中”，不要回到 idle：
-            -- 否则下一 tick 会把正在进行的批次当成新批次，已经输入的材料进度会被清空。
-            record.state = (record.batch or 0) > 0 and "running" or "idle"
-            record.lastError = nil
-        end
-        return true
-    end
-    local requested = false
-    local hasUpstream = true
-    for _, item in ipairs(missing) do
-        local ok, exists = self:requestUpstream(processName, record, item.index, item.element, item.need, chain, depth)
-        if ok then
-            requested = true
-        end
-        if not exists then
-            hasUpstream = false
-        end
-    end
-    record.wait = { kind = "materials" }
-    if not hasUpstream then
-        record.state = "missing"
-        record.lastError = "\\u6750\\u6599\\u4E0D\\u8DB3\\u4E14\\u6CA1\\u6709\\u53EF\\u7528\\u7684\\u4E0A\\u6E38\\u6D41\\u7A0B"
-    elseif requested then
-        record.state = "waiting"
-        record.lastError = "\\u6750\\u6599\\u4E0D\\u8DB3\\uFF0C\\u5DF2\\u6309\\u4F18\\u5148\\u7EA7\\u8BF7\\u6C42\\u4E0A\\u6E38\\u6D41\\u7A0B"
-    else
-        record.state = "waiting"
-        record.lastError = "\\u4E0A\\u6E38\\u6D41\\u7A0B\\u5747\\u5904\\u4E8E\\u7F3A\\u5931\\u72B6\\u6001\\uFF0C\\u4FDD\\u7559\\u8BF7\\u6C42\\u5E76\\u7EE7\\u7EED\\u7B49\\u5F85"
-    end
-    self.Cache:markDirty()
-    return false
+    return true
 end
 
---- 批次执行过程中发现材料不足（按优先级请求上游，或标记缺失）
---- 1.7.0：去掉了"每秒才检查一次"的硬间隔 —— 流程队列每轮都会把进程放回队尾，
---- 轮转本身就是节流；上游请求是幂等的（requestUpstream 只加增量）。
-function Recipe:handleShortage(process, record, now)
+function Recipe:noteMaterialShortage(process, record, now)
     record.checkedAt = now
-    local ready, element, shortBy, index = self:batchMaterialsReady(process, record)
+    local ready, element = self:batchMaterialsReady(process, record)
     if ready then
-        record.requests = {}
         return true
     end
-    local requested = false
-    local hasUpstream = true
-    if element and shortBy and index then
-        local ok, exists = self:requestUpstream(process.name, record, index, element, shortBy, {}, 0)
-        requested = ok
-        hasUpstream = exists
-    end
     record.wait = { kind = "materials" }
-    if not hasUpstream then
-        record.state = "missing"
-        record.lastError = "\\u6750\\u6599\\u4E0D\\u8DB3\\u4E14\\u6CA1\\u6709\\u53EF\\u7528\\u7684\\u4E0A\\u6E38\\u6D41\\u7A0B"
-    elseif requested then
+    local hasProducer = true
+    if element then
+        local key = self:materialKeyOf(self:specOfElement(element))
+        local producers = self:craftIndex()[key]
+        hasProducer = producers ~= nil and #producers > 0
+    end
+    if hasProducer then
         record.state = "waiting"
-        record.lastError = "\\u6750\\u6599\\u4E0D\\u8DB3\\uFF0C\\u7B49\\u5F85\\u4E0A\\u6E38\\u6D41\\u7A0B\\u4EA7\\u51FA"
+        record.lastError = self.Message.msg(self.Message.KEYS.RECIPE_WAIT_UPSTREAM)
     else
-        record.state = "waiting"
-        record.lastError = "\\u4E0A\\u6E38\\u6D41\\u7A0B\\u5747\\u5904\\u4E8E\\u7F3A\\u5931\\u72B6\\u6001\\uFF0C\\u4FDD\\u7559\\u8BF7\\u6C42\\u5E76\\u7EE7\\u7EED\\u7B49\\u5F85"
+        -- Nothing can make that material: park the batch in "missing" so the panel
+        -- shows why it will never move.
+        record.state = "missing"
+        record.lastError = self.Message.msg(self.Message.KEYS.RECIPE_ERR_NO_UPSTREAM)
     end
     self.Cache:markDirty()
     return false
 end
 
---- 存储容器资源快照（用于输出进度估算）
 function Recipe:storageBaseline()
     local baseline = {}
     for _, entry in ipairs(self.Containers:resources()) do
@@ -1233,23 +1595,175 @@ function Recipe:storageBaseline()
     return baseline
 end
 
---- 输入阶段：按输入列表顺序依次输入，每个元素必须完全输入后才进入下一个
 function Recipe:stepInput(process, record, machine, now)
     local inputs = process.inputs or {}
-    -- 一步 = 至多一次搬运调用（见 Recipe.new 的 stepBudget）
-    local budget = self.stepBudget or 1
+    local budget = self.stepBudget
     record.progress = record.progress or {}
-    -- 红石脉冲是跨 tick 的多步动作：先把它推进完，再继续后面的元素
     if record.pulse and not self:advancePulse(record, now) then
         return
     end
-    local index = record.index or 1
+    -- "unordered IO": the material operations inside one block (a block ends at a
+    -- wait/signal op) are moved in parallel instead of one after the other. The
+    -- barriers keep their order and the phase only switches once every block is
+    -- satisfied, so a timer between two groups still splits them apart.
+    local unordered = processBlockParallel(process)
+    local firstShort = nil
+    local shortageChecked = false
+    -- One attempt for a single material input. Returns "done" (satisfied),
+    -- "retry" (moved something but still short) or "park" (nothing to do now).
+    local attempt = function(element, index, key)
+        local required = elementDemand(element, self:batchOf(record))
+        if element.skip and record.skipDone and record.skipDone[key] then
+            -- Already attempted once for this instance: it is off the table, do not retry.
+            return "done"
+        end
+        local ownerKey = "process:" .. tostring(process.name) .. "#" .. tostring(record.id or 0)
+        -- The instance reserved its whole batch on creation (Containers:claim). Every
+        -- successful input gives that exact slice back, so the claim shrinks with the
+        -- material actually consumed instead of staying at the batch size.
+        local function releaseInputClaim(element, amount)
+            amount = math.floor(tonumber(amount) or 0)
+            if amount <= 0 then
+                return
+            end
+            local elementSpec = self:specOfElement(element)
+            if elementSpec then
+                self.Containers:releaseClaimAmount(elementSpec, amount, ownerKey)
+            end
+        end
+        -- "Skippable": the input got its one attempt; whatever could not be delivered is
+        -- skipped (recorded so it is not attempted again) and the batch moves on.
+        local function markSkipped(transferred)
+            record.skipDone = record.skipDone or {}
+            record.skipDone[key] = true
+            record.progress[key] = required
+            if record.inflight then
+                record.inflight[key] = nil
+            end
+            self.Cache:markDirty()
+            self.debugInfo("input %s#%d %s skipped (skippable, delivered %d/%d)",
+                tostring(process.name), index, tostring(element.id), tonumber(transferred) or 0, required)
+        end
+        local inflightToken = "in:" .. tostring(process.name) .. "#" .. tostring(record.id or 0) .. "\1"
+            .. tostring(key)
+        local settledMove, settledReason = self:settleInFlightMove(inflightToken)
+        if settledMove == nil and settledReason == "pending" then
+            self:stallLog("input-wait %s#%d %s progress=%d required=%d inflight=%d (waiting for settle)",
+                tostring(process.name), index, tostring(element.id), record.progress[key] or 0, required,
+                tonumber((record.inflight or {})[key]) or 0)
+            return "park"
+        end
+        if settledMove ~= nil then
+            settledMove = tonumber(settledMove) or 0
+            record.inflight = record.inflight or {}
+            record.inflight[key] = nil
+            if settledMove > 0 then
+                record.progress[key] = (record.progress[key] or 0) + settledMove
+                releaseInputClaim(element, settledMove)
+                self.Cache:markDirty()
+            end
+        end
+        local transferred = record.progress[key] or 0
+        if transferred >= required then
+            return "done"
+        end
+        local spec = elementSpec(element)
+        local itemTargets = self:inputContainers(machine, "item", element.containerIndex)
+        local fluidTargets = self:inputContainers(machine, "fluid", element.containerIndex)
+        local inflight = tonumber((record.inflight or {})[key]) or 0
+        local short = required - transferred - inflight
+        if short <= 0 then
+            self:stallLog("input-wait %s#%d %s progress=%d required=%d inflight=%d (waiting for settle)",
+                tostring(process.name), index, tostring(element.id), transferred, required, inflight)
+            return "park"
+        end
+        -- Input is credited only by move results: the returns of settleInFlightMove
+        -- above and of sendToMachine below. What already sits in the machine input
+        -- container is deliberately NOT counted - it cannot be told apart from what
+        -- this very batch just delivered, which credited the same item twice and let
+        -- a slot look full while it was still short.
+        local ready = self:batchMaterialsReady(process, record)
+        if not ready then
+            -- One shortage scan per tick is enough: it always inspects the first
+            -- short element, so asking again for a later element in the same tick
+            -- would request the very same upstream demand twice.
+            if shortageChecked or not self:noteMaterialShortage(process, record, now) then
+                return "park"
+            end
+            shortageChecked = true
+        end
+        local moved, reason = self:sendToMachine(
+            spec,
+            itemTargets,
+            fluidTargets,
+            ((element.kind == "item" or element.kind == "filter") and element.slot or nil),
+            short,
+            inflightToken,
+            { storageOrder = self.Containers.ORDER_SPEED }
+        )
+        if reason == "pending" then
+            record.inflight = record.inflight or {}
+            record.inflight[key] = short
+            moved = tonumber(moved) or 0
+            if moved > 0 then
+                record.progress[key] = (record.progress[key] or 0) + moved
+                releaseInputClaim(element, moved)
+                self.Cache:markDirty()
+            end
+            return "park"
+        end
+        moved = tonumber(moved) or 0
+        budget = budget - 1
+        if record.inflight then
+            record.inflight[key] = nil
+        end
+        transferred = transferred + moved
+        record.progress[key] = transferred
+        if moved > 0 then
+            releaseInputClaim(element, moved)
+        end
+        self:debugInfo("input %s#%d %s slot=%s moved=%d progress=%d/%d reason=%s",
+            tostring(process.name), index, tostring(element.id), tostring(element.slot),
+            moved, transferred, required, self.Message.describe(reason))
+        if moved > 0 and record.lastError ~= nil and transferred >= required then
+            record.lastError = nil
+        end
+        self.Cache:markDirty()
+        if transferred < required then
+            if element.skip then
+                -- One attempt is all a skippable input gets.
+                markSkipped(transferred)
+                return "done"
+            end
+            if moved <= 0 then
+                local stallText = self:transferFailureReason(machine, element, itemTargets, fluidTargets, reason)
+                if record.lastError ~= stallText then
+                    record.lastError = stallText
+                    self.Cache:markDirty()
+                end
+                if now - (record.lastStallAt or 0) >= 5000 then
+                    record.lastStallAt = now
+                    self.log("Process %s stalled at input %s: %s", process.name, tostring(element.id), stallText)
+                end
+                return "park"
+            end
+            return "retry"
+        end
+        return "done"
+    end
+    local index = self:indexOf(record)
     while index <= #inputs and budget > 0 do
         local element = inputs[index]
         local key = tostring(index)
+        if firstShort ~= nil and not isMaterialElement(element) then
+            -- a wait/signal op stands in front of an unfinished block: the block
+            -- has to finish first (that is what keeps the blocks apart)
+            record.index = firstShort
+            self.Cache:markDirty()
+            return
+        end
         if element.kind == "waitTime" then
-            -- 输入阶段的等待时间随翻倍一起翻倍（产物阶段的等待时间不翻倍）
-            local batch = math.max(1, record.batch or 1)
+            local batch = self:batchOf(record)
             record.wait = {
                 kind = "time",
                 untilMs = now + math.floor((tonumber(element.seconds) or 0) * 1000 * batch),
@@ -1266,12 +1780,10 @@ function Recipe:stepInput(process, record, machine, now)
             end
             index = index + 1
         elseif element.kind == "emitSignal" then
-            -- 设置红石信号：写入强度并保持
             self:emitSignals(machine, element)
             index = index + 1
             budget = budget - 1
         elseif element.kind == "emitPulse" then
-            -- 发出红石脉冲：置位 -> 等 0.05s -> 复位 -> 等 0.05s（后续由 advancePulse 跨 tick 推进）
             index = index + 1
             budget = budget - 1
             self:startPulse(machine, element, record, now, index)
@@ -1283,123 +1795,37 @@ function Recipe:stepInput(process, record, machine, now)
         elseif element.kind == "placeholder" then
             index = index + 1
         else
-            local required = elementDemand(element, record.batch or 1)
-            local transferred = record.progress[key] or 0
-            if transferred >= required then
-                self:clearRequest(record, key)
+            local status = attempt(element, index, key)
+            if status == "done" then
                 index = index + 1
+            elseif unordered then
+                -- park the earliest unfinished element and let the rest of this
+                -- block keep moving; it is revisited on the next tick
+                if firstShort == nil or index < firstShort then
+                    firstShort = index
+                end
+                index = index + 1
+            elseif status == "retry" then
+                record.index = index
             else
-                local spec = elementSpec(element)
-                local itemTargets = self:inputContainers(machine, "item", element.containerIndex)
-                local fluidTargets = self:inputContainers(machine, "fluid", element.containerIndex)
-                --- 用户第 6 项（本轮）：要减掉"已经派出去、还没结算"的那部分 ——
-                --- 否则同一条材料会在在飞记忆被清掉（TTL / 批次边界）之后被重复派活
-                --- （现场：要求 64 个，实际搬了 64+64+52 个）。
-                local inflight = tonumber((record.inflight or {})[key]) or 0
-                local short = required - transferred - inflight
-                if short <= 0 then
-                    --- 在飞的部分还没结算：这一轮什么都别派，等它回来
-                    record.index = index
-                    return
-                end
-                -- 机器输入容器里已有的材料直接算作已输入（材料本来就在机器里时不再搬运）
-                local already = self:alreadyInTargets(spec, itemTargets, fluidTargets)
-                -- 材料齐备检查会读一遍存储容器：1.5.2 起该读取走 Containers 快照的按名合计表（O(1)，
-                -- 每 600ms 才真正重算一次），所以这里可以像以前一样每个 tick 都问，不必额外节流。
-                local ready = already >= short or self:batchMaterialsReady(process, record)
-                if not ready then
-                    if not self:handleShortage(process, record, now) then
-                        record.index = index
-                        return
-                    end
-                end
-                local moved, reason = 0, nil
-                if already > 0 then
-                    moved = math.min(short, already)
-                else
-                    moved, reason = self:transferIn(
-                        spec,
-                        itemTargets,
-                        fluidTargets,
-                        --- 用户第 2 项：只有**物品**元素才用"槽位序号"；流体元素从不指定槽位
-                        --- （流程编辑器里流体元素已经不再提供该输入框）。
-                        (element.kind == "item") and element.slot or nil,
-                        short,
-                        "in:" .. tostring(process.name) .. "\1" .. tostring(key),
-                        --- 给机器送料要快：从存储容器优先抽数量最多的那几堆（1.6.11）
-                        { storageOrder = self.Containers.ORDER_SPEED }
-                    )
-                end
-                if reason == "pending" then
-                    -- 材料搬运已交给 IFMWorker：本 tick 不推进（下个 tick 用同一个任务继续等）。
-                    -- 但已经回报的那部分要立刻记账 —— 否则下个 tick 会按“还没搬过”重新要一遍，
-                    -- 把同一批材料送两遍（用户实测：要 64 个结果搬了 127 个）。
-                    --- 用户第 6 项（本轮）：把"这次派出去的量"记进在飞账本，
-                    --- 派活量 = 需求量 − 已结算 − 在飞，重复派活因此不可能发生。
-                    local pendingMove = self.pendingMoves and self.pendingMoves[token]
-                    if pendingMove and tonumber(pendingMove.want) then
-                        record.inflight = record.inflight or {}
-                        record.inflight[key] = tonumber(pendingMove.want) or 0
-                    end
-                    moved = tonumber(moved) or 0
-                    if moved > 0 then
-                        record.progress[key] = (record.progress[key] or 0) + moved
-                        self.Cache:markDirty()
-                    end
-                    record.index = index
-                    return
-                end
-                moved = tonumber(moved) or 0
-                budget = budget - 1
-                --- 已经结算：清掉这个元素的在飞账（它的量已经算进 moved）
-                if record.inflight then
-                    record.inflight[key] = nil
-                end
-                transferred = transferred + moved
-                record.progress[key] = transferred
-                if moved > 0 and record.lastError ~= nil and transferred >= required then
-                    record.lastError = nil
-                end
-                self.Cache:markDirty()
-                if transferred < required then
-                    -- 未完全输入：下个 tick 继续重试同一元素
-                    record.index = index
-                    if moved <= 0 then
-                        -- 卡片上立刻显示原因；日志每 5 秒最多推一次（避免刷屏）
-                        local stallText = self:transferFailureReason(machine, element, itemTargets, fluidTargets, reason)
-                        if record.lastError ~= stallText then
-                            record.lastError = stallText
-                            self.Cache:markDirty()
-                        end
-                        if now - (record.lastStallAt or 0) >= 5000 then
-                            record.lastStallAt = now
-                            self.log("Process %s stalled at input %s: %s", process.name, tostring(element.id), stallText)
-                        end
-                        return
-                    end
-                else
-                    self:clearRequest(record, key)
-                    index = index + 1
-                end
+                record.index = index
+                return
             end
         end
     end
+    if firstShort ~= nil then
+        -- unordered IO: the scan walked past unfinished material elements, so the
+        -- record parks on the earliest one and the input phase continues
+        record.index = firstShort
+        self.Cache:markDirty()
+        return
+    end
     if index > #inputs then
-        --- turtle_crafter（用户第 3 项）：材料全部到位后先让海龟合成一次，再进入抽产物阶段。
-        --- craft 指令是"发出去就不管"的（合成器不回报状态），所以这里只看"有没有空闲合成器"：
-        --- 没有就停在本相位、下个 tick 再试 —— 免得流程以为已经合成过而直接去抽空气。
         if self.Store.isTurtleCrafter(machine) then
-            --- 用户第 3 项（本轮）：**不看海龟上报、也没有任何兜底**。
-            --- 现场：9 个铁粒只进去 1 个就发了 craft ⇒ 合成必然失败。
-            --- 判定改成只看主控自己的账：每个输入元素的 record.progress 只由**已结算**的搬运推进
-            --- （pushItem 派活时返回 nil,"pending"，不带数量 ⇒ 不记账），
-            --- 所以"全部元素 progress 达标 + 没有任何输入搬运在飞"= 材料确实都搬进去了。
-            --- 合成失败就一直停在这里，交由用户手动处理（不做超时放行）。
             local inflightKey = self:firstInflightInput(record, inputs)
             if inflightKey then
                 record.wait = { kind = "craft", machine = machine.name }
-                record.lastError = "\\u7B49\\u5F85\\u8F93\\u5165\\u642C\\u8FD0\\u7ED3\\u7B97" ..
-                    "\\uFF08\\u8FD8\\u6709\\u5728\\u98DE\\u7684\\u642C\\u8FD0\\uFF09"
+                record.lastError = self.Message.msg(self.Message.KEYS.RECIPE_WAIT_MOVE_SETTLE)
                 if now - (record.lastCraftWaitLogAt or 0) >= 10000 then
                     record.lastCraftWaitLogAt = now
                     self.log("Process %s: input %s still has an in-flight move - not crafting yet",
@@ -1408,30 +1834,46 @@ function Recipe:stepInput(process, record, machine, now)
                 self.Cache:markDirty()
                 return
             end
-            --- 发 craft 之前把每个元素的实际数量记一行：以后"合成信号提前发出"的问题看这一行就能定位
+            local batch = self:batchOf(record)
             local detail = {}
             for elementIndex, element in ipairs(inputs) do
                 if element.kind == "item" or element.kind == "fluid" or element.kind == "filter" then
                     detail[#detail + 1] = tostring(element.id or element.kind) .. "=" ..
                         tostring(record.progress[tostring(elementIndex)] or 0) .. "/" ..
-                        tostring(elementDemand(element, record.batch or 1))
+                        tostring(elementDemand(element, batch))
                 end
             end
             self.log("Process %s: all inputs settled (batch=%s, %s) - asking %s to craft",
-                tostring(process.name), tostring(record.batch or 1), table.concat(detail, " "),
+                tostring(process.name), tostring(batch), table.concat(detail, " "),
                 tostring(machine.name))
             local status = self:requestMachineCraft(process, record, machine)
             if status ~= "sent" then
                 record.wait = { kind = "craft", machine = machine.name }
-                record.lastError = "\\u7B49\\u5F85\\u6D77\\u9F9F\\u5408\\u6210\\u5668\\u7A7A\\u95F2"
+                record.lastError = self.Message.msg(self.Message.KEYS.RECIPE_WAIT_TURTLE)
                 self.Cache:markDirty()
                 return
             end
         end
+        do
+            local batch = self:batchOf(record)
+            local parts = {}
+            for elementIndex, element in ipairs(inputs) do
+                if element.kind == "item" or element.kind == "fluid" or element.kind == "filter" then
+                    parts[#parts + 1] = tostring(element.id) .. "=" ..
+                        tostring((record.progress or {})[tostring(elementIndex)] or 0) .. "/" ..
+                        tostring(elementDemand(element, batch))
+                end
+            end
+            self:stallLog("in-done %s batch=%d machine=%s inputs=%s", tostring(process.name),
+                batch, tostring(machine and machine.name), table.concat(parts, " "))
+        end
         record.phase = "output"
-        record.index = 1
-        record.outProgress = {}
-        self:prepareOutputs(process, record)
+        record.inputDone = true
+        if processIoMode(process) ~= "unordered" then
+            record.index = 1
+            record.outProgress = {}
+            self:prepareOutputs(process, record)
+        end
         self.Cache:markDirty()
     else
         record.index = index
@@ -1439,8 +1881,6 @@ function Recipe:stepInput(process, record, machine, now)
     end
 end
 
---- 第一个"还有在飞搬运没结算"的输入元素序号（没有就返回 nil）。
---- 用户第 3 项（本轮）：海龟合成前用它确认"材料不是还在路上" —— 不看海龟上报，也不做任何兜底。
 function Recipe:firstInflightInput(record, inputs)
     local inflight = record.inflight or {}
     for elementIndex in ipairs(inputs or {}) do
@@ -1451,65 +1891,203 @@ function Recipe:firstInflightInput(record, inputs)
     return nil
 end
 
---- 请这台机器的海龟合成（turtle_crafter）：返回 "sent" = 指令已发出 / "idle" = 没有空闲合成器。
---- 合成链路由 IFMMaster 挂上（setCraftProvider）；没挂时（纯引擎测试）直接放行，不阻塞流程。
 function Recipe:requestMachineCraft(process, record, machine)
     if type(self.craftProvider) ~= "function" then
         return "sent"
     end
-    local ok, status = pcall(self.craftProvider, {
+    return self.craftProvider({
         machine = machine.name,
-        crafter = machine.name,                 -- 虚拟机器的名字就是海龟的网络外设名
+        crafter = machine.name,
         process = process.name,
         batch = record.batch,
         key = table.concat({ tostring(process.name), tostring(record.batch or 0),
             tostring(record.startedAt or 0), tostring(machine.name) }, "|"),
     })
-    if not ok then
-        self.log("Process %s: craft request failed: %s", tostring(process.name), tostring(status))
-        return "idle"
-    end
-    return status
 end
 
---- 合成链路（IFMMaster 挂 `Transfer:requestCraft`）：function(spec) -> "sent" / "idle"
 function Recipe:setCraftProvider(provider)
     self.craftProvider = provider
 end
 
---- 进入输出阶段前记录目标产量与基线
+-- The scheduler handle used for the heavy storage-compact planning pass. Without
+-- it, Recipe:autoCompactStep cannot queue that pass and will fail loudly.
+function Recipe:setDispatch(dispatch)
+    self.dispatch = dispatch
+end
+
 function Recipe:prepareOutputs(process, record)
-    local batch = record.batch or 1
+    local batch = self:batchOf(record)
+    local baseline = self:storageBaseline()
     local targets = {}
     for _, element in ipairs(process.outputs or {}) do
         if element.kind == "item" or element.kind == "fluid" or element.kind == "filter" then
             targets[#targets + 1] = {
                 kind = element.kind,
                 id = element.id,
+                -- The batch's own numbers: the progress bar is scaled to `target`
+                -- (max x batch, the extraction cap) and draws a tick at `min` and at
+                -- `expect`, so a finished batch reads correctly even when the machine
+                -- still holds more than the expected yield.
+                min = (tonumber(element.min) or 0) * batch,
                 target = (tonumber(element.max) or 0) * batch,
+                expect = (tonumber(element.expect) or tonumber(element.max) or 0) * batch,
+                -- storage content before this batch (filter aware); frozen here
+                -- so the panel does not have to re-match the filter every push
+                baseline = self:baselineCountIn(baseline, element.kind, element.id),
             }
         end
     end
     record.target = targets
-    record.baseline = self:storageBaseline()
+    record.baseline = baseline
 end
 
---- 输出阶段：按输出列表顺序依次抽取，抽到“最多数目”或满足“最少数目”即进入下一个
 function Recipe:stepOutput(process, record, machine, now)
+    self:stallLog("out-enter %s idx=%d/%d batch=%d wait=%s moves=%d",
+        tostring(process.name), self:indexOf(record), #(process.outputs or {}),
+        self:batchOf(record), tostring(record.wait and record.wait.kind), self:moveKeyCount())
     local outputs = process.outputs or {}
-    -- 一步 = 至多一次搬运调用（见 Recipe.new 的 stepBudget）
-    local budget = self.stepBudget or 1
+    local budget = self.stepBudget
     record.outProgress = record.outProgress or {}
-    -- 红石脉冲是跨 tick 的多步动作：先把它推进完，再继续后面的元素
     if record.pulse and not self:advancePulse(record, now) then
         return
     end
-    local index = record.index or 1
+    -- Same "unordered IO" handling as the input phase: the material outputs of one
+    -- block (a block ends at a wait/signal op) are extracted in parallel.
+    local unordered = processBlockParallel(process)
+    local firstShort = nil
+    -- One attempt for a single material output element. Returns "done"
+    -- (satisfied), "retry" (moved something but still short) or "park".
+    local attempt = function(element, index, key)
+        local batch = self:batchOf(record)
+        local maxAmount = (tonumber(element.max) or 0) * batch
+        local minAmount = (tonumber(element.min) or 0) * batch
+        local collected = record.outProgress[key] or 0
+        local spec = elementSpec(element)
+        local token = "out:" .. tostring(process.name) .. "#" .. tostring(record.id or 0) .. "\1" .. tostring(key)
+        -- Unordered IO without a pinned container/slot extracts from *every* source
+        -- slot of this element at once: each move gets its own token under `token`,
+        -- and settling them together (below) keeps the bookkeeping in one place.
+        local multi = unordered and element.kind == "item"
+        if multi then
+            local scopeIndex, scopeSlot = outputScopeOf({ containerIndex = element.containerIndex,
+                slot = element.slot })
+            multi = (scopeIndex == nil and scopeSlot == nil)
+        end
+        -- The extraction of this element runs asynchronously: takeFromMachine only
+        -- queues a move and reports "pending" until the transfer subsystem answers.
+        -- That answer is the only thing that counts as "this batch produced it", so it
+        -- is collected here - before anything below can mark the element as finished
+        -- (once finished nobody asks for that move again, and the instance cleanup
+        -- would release its result as 0).
+        local settled, settledErr
+        if multi then
+            settled = self:settleInFlightMoves(token .. "\1")
+        else
+            settled, settledErr = self:settleInFlightMove(token)
+        end
+        if settled ~= nil then
+            if settled > 0 then
+                collected = collected + settled
+                record.outProgress[key] = collected
+                self.Cache:markDirty()
+            end
+            self:debugInfo("out-settle %s idx=%d moved=%d -> %d/%d err=%s", tostring(process.name), index,
+                settled, collected, maxAmount, self.Message.describe(settledErr))
+        end
+        self:stallLog("out-trace %s idx=%d/%d collected=%d max=%d min=%d moved_last=%s",
+            tostring(process.name), index, #outputs, collected, maxAmount, minAmount,
+            tostring(record.outLastMoved))
+        if collected >= maxAmount then
+            self:stallLog("out-advance %s idx=%d -> %d (collected=%d/%d)", tostring(process.name), index,
+                index + 1, collected, maxAmount)
+            return "done"
+        end
+        local moved, reason
+        if multi then
+            moved, reason = self:takeFromMachineMulti(spec, machine, maxAmount - collected, token,
+                { containerIndex = element.containerIndex, slot = element.slot })
+            if reason == "fallback" then
+                multi = false
+            end
+        end
+        if not multi then
+            moved, reason = self:takeFromMachine(spec, machine, maxAmount - collected, token,
+                { containerIndex = element.containerIndex, slot = element.slot })
+        end
+        if reason == "pending" then
+            local booked = tonumber(moved) or 0
+            if booked > 0 then
+                record.outProgress[key] = collected + booked
+                self.Cache:markDirty()
+            end
+            return "park"
+        end
+        budget = budget - 1
+        record.outLastMoved = moved
+        if moved > 0 then
+            record.outProgress[key] = collected + moved
+            record.lastError = nil
+            if collected + moved >= maxAmount then
+                self:stallLog("out-advance %s idx=%d -> %d (moved=%d -> %d/%d)",
+                    tostring(process.name), index, index + 1, moved, collected + moved, maxAmount)
+                self.Cache:markDirty()
+                return "done"
+            end
+            self.Cache:markDirty()
+            return "retry"
+        end
+        local leftover = self:machineRemaining(spec, machine,
+            { containerIndex = element.containerIndex, slot = element.slot })
+        self:stallLog("out-blocked %s leftover=%d reason=%s collected=%d min=%d max=%d " ..
+            "batch=%d idx=%d state=%s wait=%s",
+            tostring(process.name), leftover, self.Message.describe(reason), collected, minAmount, maxAmount,
+            tonumber(record.batch) or 0, index, tostring(record.state),
+            tostring(record.wait and record.wait.kind))
+        if leftover <= 0 and collected >= minAmount then
+            return "done"
+        end
+        if leftover > 0 then
+            local outText = self:messageOf(self.Message.KEYS.RECIPE_ERR_OUTPUT_STUCK, {
+                machine = tostring(machine.name),
+                item = tostring(element.id),
+                reason = reason and self.Message.reason(reason)
+                    or self.Message.msg(self.Message.KEYS.RECIPE_ERR_MOVE_FAILED),
+            })
+            if record.lastError ~= outText then
+                record.lastError = outText
+                self.Cache:markDirty()
+            end
+            if now - (record.lastStallAt or 0) >= 5000 then
+                record.lastStallAt = now
+                self.log("Process %s cannot move output %s out of machine %s: %s",
+                    process.name, tostring(element.id), tostring(machine.name), self.Message.describe(reason or "-"))
+            end
+            return "park"
+        end
+        if record.lastError == nil or now - (record.lastStallAt or 0) >= 5000 then
+            record.lastStallAt = now
+            record.lastError = self:messageOf(self.Message.KEYS.RECIPE_WAIT_MACHINE_OUTPUT, {
+                machine = tostring(machine.name),
+                item = tostring(element.id),
+            })
+            self.log("Process %s waiting for output %s from machine %s",
+                process.name, tostring(element.id), tostring(machine.name))
+        end
+        self.Cache:markDirty()
+        return "park"
+    end
+    local index = self:indexOf(record)
     while index <= #outputs and budget > 0 do
         local element = outputs[index]
         local key = tostring(index)
+        if firstShort ~= nil and not isMaterialElement(element) then
+            -- a wait/signal op stands in front of an unfinished block: the block
+            -- has to finish first (that is what keeps the blocks apart)
+            record.index = firstShort
+            self.Cache:markDirty()
+            return
+        end
         if element.kind == "waitTime" then
-            -- 产物阶段的等待时间不随翻倍变化（与输入阶段相反）
             record.wait = {
                 kind = "time",
                 untilMs = now + math.floor((tonumber(element.seconds) or 0) * 1000),
@@ -1526,12 +2104,10 @@ function Recipe:stepOutput(process, record, machine, now)
             end
             index = index + 1
         elseif element.kind == "emitSignal" then
-            -- 设置红石信号：写入强度并保持
             self:emitSignals(machine, element)
             index = index + 1
             budget = budget - 1
         elseif element.kind == "emitPulse" then
-            -- 发出红石脉冲：置位 -> 等 0.05s -> 复位 -> 等 0.05s（后续由 advancePulse 跨 tick 推进）
             index = index + 1
             budget = budget - 1
             self:startPulse(machine, element, record, now, index)
@@ -1543,154 +2119,61 @@ function Recipe:stepOutput(process, record, machine, now)
         elseif element.kind == "placeholder" then
             index = index + 1
         else
-            local batch = record.batch or 1
-            local maxAmount = (tonumber(element.max) or 0) * batch
-            local minAmount = (tonumber(element.min) or 0) * batch
-            local collected = record.outProgress[key] or 0
-            local spec = elementSpec(element)
-            -- 产物可能被机器自己直接吐进存储容器（Create 搅拌盆 + 漏斗等）：存储增量也算“已到手”
-            local gained = self:storageGain(spec, record)
-            if collected >= maxAmount or gained >= maxAmount then
+            local status = attempt(element, index, key)
+            if status == "done" then
                 index = index + 1
+            elseif unordered then
+                -- park the earliest unfinished element and let the rest of this
+                -- block keep moving; it is revisited on the next tick
+                if firstShort == nil or index < firstShort then
+                    firstShort = index
+                end
+                index = index + 1
+            elseif status == "retry" then
+                record.index = index
             else
-                local moved, reason = self:transferOut(spec, machine, maxAmount - collected,
-                    "out:" .. tostring(process.name) .. "\1" .. tostring(key),
-                    --- 用户第 2/3 项：抽取按**内容快照**决策；只有物品元素才用"槽位序号"（限定），
-                    --- 流体从不指定槽位（流程编辑器里流体元素不再提供该输入框）。
-                    { fromSlot = (element.kind == "item") and element.slot or nil })
-                if reason == "pending" then
-                    -- 产物抽取已交给 IFMWorker：本 tick 不推进（下个 tick 继续等同一个任务）；
-                    -- 已经回报的那部分照样记账（否则会重复抽取，见材料输入那一段的说明）。
-                    local booked = tonumber(moved) or 0
-                    if booked > 0 then
-                        record.outProgress[key] = collected + booked
-                        self.Cache:markDirty()
-                    end
-                    record.index = index
-                    return
-                end
-                budget = budget - 1
-                if moved > 0 then
-                    record.outProgress[key] = collected + moved
-                    record.lastError = nil
-                    self.Cache:markDirty()
-                else
-                    local leftover = self:machineRemaining(spec, machine)
-                    if leftover <= 0 and (collected >= minAmount or gained >= minAmount) then
-                        index = index + 1
-                    elseif leftover > 0 then
-                        -- 产物确实在机器输出容器里（这一支必然读过它），但搬不到存储容器：
-                        -- 原因只打印真实返回值，不列举"槽位不符"这类读才能知道的猜测
-                        record.index = index
-                        local outText = "\\u673A\\u5668 " .. tostring(machine.name) .. " \\u7684\\u8F93\\u51FA\\u5BB9\\u5668\\u91CC\\u8FD8\\u6709 "
-                            .. tostring(element.id) .. "\\uFF0C\\u4F46\\u642C\\u4E0D\\u5230\\u5B58\\u50A8\\u5BB9\\u5668\\uFF1A" .. tostring(reason or "\\u672A\\u80FD\\u642C\\u8FD0\\u4EFB\\u4F55\\u7269\\u54C1")
-                        if record.lastError ~= outText then
-                            record.lastError = outText
-                            self.Cache:markDirty()
-                        end
-                        if now - (record.lastStallAt or 0) >= 5000 then
-                            record.lastStallAt = now
-                            self.log("Process %s cannot move output %s out of machine %s: %s",
-                                process.name, tostring(element.id), tostring(machine.name), tostring(reason or "-"))
-                        end
-                        return
-                    else
-                        -- 机器尚未产出足够产物：下个 tick 重试（顺便把"等机器产出"写进卡片，5 秒最多一次）。
-                        -- 不可读的输出容器（interaction / output）我们**没看里面** —— 所以只说"等抽取量够了"，
-                        -- 绝不写"输出容器里还没有该产物"（那是读一眼才知道的判断，写了就是撒谎）。
-                        record.index = index
-                        if leftover <= 0 and (record.lastError == nil or now - (record.lastStallAt or 0) >= 5000) then
-                            record.lastStallAt = now
-                            local prefix = "\\u7B49\\u5F85\\u673A\\u5668 " .. tostring(machine.name) .. " \\u4EA7\\u51FA "
-                                .. tostring(element.id)
-                            local note
-                            if self:machineOutputsBlind(spec, machine) then
-                                note = "\\uFF08\\u8F93\\u51FA\\u5BB9\\u5668\\u6309\\u8BBE\\u8BA1\\u4E0D\\u8BFB\\uFF0C\\u53EA\\u6309\\u62BD\\u53D6\\u91CF\\u5224\\u5B9A\\uFF09"
-                            else
-                                note = "\\uFF08\\u8F93\\u51FA\\u5BB9\\u5668\\u91CC\\u8FD8\\u6CA1\\u6709\\u8BE5\\u4EA7\\u7269\\uFF09"
-                            end
-                            record.lastError = prefix .. note
-                            self.log("Process %s waiting for output %s from machine %s",
-                                process.name, tostring(element.id), tostring(machine.name))
-                        end
-                        self.Cache:markDirty()
-                        return
-                    end
-                end
+                record.index = index
+                return
             end
         end
     end
+    if firstShort ~= nil then
+        -- unordered IO: the scan walked past unfinished material elements, so the
+        -- record parks on the earliest one and the output phase continues
+        record.index = firstShort
+        self.Cache:markDirty()
+        return
+    end
     if index > #outputs then
-        self:finishBatch(process, record, now)
+        if processIoMode(process) == "unordered" and not self:inputsSatisfied(process, record) then
+            -- unordered IO: every output is already out, but the inputs are still
+            -- being delivered - keep the instance alive until they are complete.
+            record.outDone = true
+            self.Cache:markDirty()
+            return
+        end
+        self:finishInstance(process, record, now)
     else
         record.index = index
+        self:stallLog("out-stall %s idx=%d/%d collected=%d max=%d outLastMoved=%s",
+            tostring(process.name), index, #outputs,
+            tonumber((record.outProgress or {})[tostring(index)]) or 0,
+            (tonumber(outputs[index] and outputs[index].max) or 0) * self:batchOf(record),
+            tostring(record.outLastMoved))
         self.Cache:markDirty()
     end
 end
 
---- 一个批次完成：释放机器并行位，重置批次状态
-function Recipe:finishBatch(process, record, now)
-    if record.machine then
-        self:occupyMachine(record.machine, -1)
-    end
-    record.machine = nil
-    record.phase = "input"
-    record.index = 1
-    record.progress = {}
-    record.outProgress = {}
-    --- 这一批结束了：清掉它的在飞搬运记忆（token = "in:流程\1元素" / "out:流程\1元素"）
-    self:forgetPendingMovesWithPrefix("in:" .. tostring(process.name) .. "\1")
-    self:forgetPendingMovesWithPrefix("out:" .. tostring(process.name) .. "\1")
-    for key in pairs(record.requests or {}) do
-        self:clearRequest(record, key)
-    end
-    record.requests = {}
-    record.target = {}
-    record.batch = 0
-    record.state = "idle"
-    record.wait = nil
-    record.checkedAt = now
-    record.lastFinishedAt = now
-    record.lastError = nil
-    self.Cache:markDirty()
-end
 
---- 重新为当前批次未完成的输入元素请求上游（返回：是否已请求, 是否存在候选上游）
-function Recipe:retryUpstream(process, record)
-    local requested = false
-    local hasUpstream = true
-    local progress = record.progress or {}
-    for index, element in ipairs(process.inputs or {}) do
-        if element.kind == "item" or element.kind == "fluid" or element.kind == "filter" then
-            local required = elementDemand(element, record.batch or 1)
-            local transferred = progress[tostring(index)] or 0
-            if transferred < required then
-                local available = self:availableFor(element)
-                if available < (required - transferred) then
-                    local shortBy = (required - transferred) - available
-                    local ok, exists = self:requestUpstream(process.name, record, index, element, shortBy, {}, 0)
-                    if ok then
-                        requested = true
-                    end
-                    if not exists then
-                        hasUpstream = false
-                    end
-                end
-            end
-        end
-    end
-    return requested, hasUpstream
-end
+-- (retryUpstream is gone: the input phase no longer asks upstream processes for
+-- anything, the planning engine does that from the material ledger.)
 
---- 流程引用的容器 / 信号 / 机器类型是否齐全（不齐全时冻结流程，等外设回来自动恢复）
---- 定义被删掉、或方块（外设）不在，都会让 supports() 变假 —— 两种都算“引用缺失”。
---- 用途：换外设时可以直接删掉旧定义（网页上带 force），流程冻结而不是报错，重新建出同名定义就继续跑。
 function Recipe:peripheralProblem(process, record)
     local typeName = process.machineType
     if typeName and typeName ~= "" then
         local machineType = self.Store:get("machineTypes", typeName)
         if not machineType then
-            return "\\u673A\\u5668\\u7C7B\\u578B " .. tostring(typeName) .. " \\u5DF2\\u88AB\\u5220\\u9664"
+        return self:messageOf(self.Message.KEYS.RECIPE_ERR_MACHINE_TYPE_DELETED, { type = tostring(typeName) })
         end
         local reason = self:machineProblem(machineType)
         if reason then
@@ -1710,184 +2193,7 @@ function Recipe:peripheralProblem(process, record)
     return nil
 end
 
---- 推进单个流程（每个 tick 调用一次，绝不阻塞）
-function Recipe:stepProcess(process, now)
-    local record = self:record(process.name)
-    -- 抽象流程（含 abstract 操作）：永远不推进（也绝不允许被下单/当作上游）。
-    -- 用户可能把一个正在跑的流程改成抽象流程：这里把它冻结，避免拿 abstract 当真实材料去搬运。
-    if self:isAbstract(process) then
-        if record.state ~= "missing" or record.lastError ~= ABSTRACT_FROZEN then
-            record.state = "missing"
-            record.wait = nil
-            record.batch = 0
-            record.lastError = ABSTRACT_FROZEN
-            self.Cache:markDirty()
-            self.log("Process %s is an abstract process (element id 'abstract'), not runnable", tostring(process.name))
-        end
-        return
-    end
-    if record.batch == nil then
-        record.batch = 0
-    end
-    if record.index == nil then
-        record.index = 1
-    end
-    if record.progress == nil then
-        record.progress = {}
-    end
-    if record.outProgress == nil then
-        record.outProgress = {}
-    end
 
-    --- 引用的外设 / 定义缺失（例如换外设时把旧定义删了）：冻结这个流程，等外设回来再继续。
-    --- 冻结期间不动 batch / index / progress，所以外设一恢复就接着原来的进度跑。
-    local freeze = self:peripheralProblem(process, record)
-    if freeze then
-        if record.state ~= "missing" or record.lastError ~= freeze then
-            record.state = "missing"
-            record.lastError = freeze
-            record.wait = { kind = "peripheral" }
-            self.Cache:markDirty()
-            self.log("Process %s frozen: %s", tostring(process.name), tostring(freeze))
-        end
-        return
-    end
-    if record.wait and record.wait.kind == "peripheral" then
-        -- 外设回来了：解冻（有批次在跑就继续 running，否则回到 idle 等下一次下单）
-        record.wait = nil
-        record.state = (record.batch or 0) > 0 and "running" or "idle"
-        record.lastError = nil
-        self.Cache:markDirty()
-        self.log("Process %s resumed (peripherals are back)", tostring(process.name))
-    end
-
-    if record.state == "idle" or record.state == "done" then
-        record.state = "idle"
-        local remaining = (record.userCount or 0) + (record.downstreamCount or 0)
-        if remaining <= 0 then
-            record.batch = 0
-            return
-        end
-        if not self:ensureMaterials(process.name, process, record, {}, 0) then
-            return
-        end
-        remaining = (record.userCount or 0) + (record.downstreamCount or 0)
-        if remaining <= 0 then
-            return
-        end
-        local maxMultiplier = math.max(1, tonumber(process.maxMultiplier) or 1)
-        local batch = math.min(maxMultiplier, remaining)
-        local fromDownstream = math.min(record.downstreamCount or 0, batch)
-        record.downstreamCount = (record.downstreamCount or 0) - fromDownstream
-        record.userCount = math.max(0, (record.userCount or 0) - (batch - fromDownstream))
-        record.batch = batch
-        record.phase = "input"
-        record.index = 1
-        record.progress = {}
-        record.outProgress = {}
-        record.requests = {}
-        record.startedAt = now
-        record.wait = nil
-        record.state = "running"
-        record.lastError = nil
-        record.baseline = self:storageBaseline()
-        self.Cache:markDirty()
-    end
-
-    if (record.batch or 0) <= 0 then
-        record.state = "idle"
-        return
-    end
-
-    local wait = record.wait
-    if wait then
-        if wait.kind == "time" then
-            if now < (wait.untilMs or 0) then
-                return
-            end
-            record.wait = nil
-        elseif wait.kind == "machine" then
-            -- 1.7.0：去掉 500ms 硬间隔 —— 进程队列轮转本身就是节流
-            record.checkedAt = now
-            record.wait = nil
-        elseif wait.kind == "signal" then
-            local machine = record.machine and self.Store:get("machines", record.machine) or nil
-            if not machine or not wait.element then
-                record.wait = nil
-            elseif not self:signalSatisfied(machine, wait.element) then
-                return
-            else
-                record.wait = nil
-            end
-        else
-            -- 1.7.0：去掉"每秒重试"的硬间隔（同一进程每轮调度都会被推进一步）
-            record.checkedAt = now
-            if self:batchMaterialsReady(process, record) or self:machineHasPending(process, record) then
-                record.wait = nil
-                record.state = "running"
-                record.lastError = nil
-                record.requests = {}
-            else
-                local requested, hasUpstream = self:retryUpstream(process, record)
-                if not hasUpstream then
-                    record.state = "missing"
-                    record.lastError = "\\u6750\\u6599\\u4E0D\\u8DB3\\u4E14\\u6CA1\\u6709\\u53EF\\u7528\\u7684\\u4E0A\\u6E38\\u6D41\\u7A0B"
-                elseif requested then
-                    record.state = "waiting"
-                    record.lastError = "\\u6750\\u6599\\u4E0D\\u8DB3\\uFF0C\\u7B49\\u5F85\\u4E0A\\u6E38\\u6D41\\u7A0B\\u4EA7\\u51FA"
-                else
-                    record.state = "waiting"
-                    record.lastError = "\\u4E0A\\u6E38\\u6D41\\u7A0B\\u5747\\u5904\\u4E8E\\u7F3A\\u5931\\u72B6\\u6001\\uFF0C\\u4FDD\\u7559\\u8BF7\\u6C42\\u5E76\\u7EE7\\u7EED\\u7B49\\u5F85"
-                end
-                self.Cache:markDirty()
-                return
-            end
-        end
-    end
-
-    local machine = record.machine and self.Store:get("machines", record.machine) or nil
-    if record.machine and not machine then
-        -- 机器定义被删除 / 改名：清掉记录并释放并行位，重新选机器
-        self:occupyMachine(record.machine, -1)
-        record.machine = nil
-        self.Cache:markDirty()
-    end
-    if not machine or not self:machineUsable(machine) then
-        if machine then
-            -- 记下不可用的具体原因，方便在网页上定位（否则只能看到“等待机器”）
-            local problem = self:machineProblem(machine)
-            self:occupyMachine(machine.name, -1)
-            record.machine = nil
-            if problem then
-                record.lastError = "\\u673A\\u5668 " .. machine.name .. " \\u4E0D\\u53EF\\u7528\\uFF1A" .. problem
-                self.log("Process %s machine %s unusable: %s", process.name, machine.name, problem)
-            end
-        end
-        local selected, err = self:chooseMachine(process.machineType)
-        if not selected then
-            record.state = "waiting"
-            record.wait = { kind = "machine" }
-            record.checkedAt = now
-            record.lastError = err or "\\u6CA1\\u6709\\u53EF\\u7528\\u7684\\u673A\\u5668"
-            self.Cache:markDirty()
-            return
-        end
-        record.machine = selected.name
-        self:occupyMachine(selected.name, 1)
-        -- 关键：本地变量必须一起换成新选中的机器，否则下面 stepInput / stepOutput 拿到的还是 nil
-        -- （旧版本的 bug：这里没同步，导致 “attempt to index local 'machine' (a nil value)” 崩溃）
-        machine = selected
-        self.Cache:markDirty()
-    end
-
-    if record.phase == "input" then
-        self:stepInput(process, record, machine, now)
-    else
-        self:stepOutput(process, record, machine, now)
-    end
-end
-
---- 记录发送任务当前卡住的原因（网页上显示 + 推给网页控制台；原因没变就不重复写盘/刷日志）
 function Recipe:markDeliveryError(delivery, text)
     if delivery.lastError == text then
         return
@@ -1896,37 +2202,38 @@ function Recipe:markDeliveryError(delivery, text)
     self.Cache:markDirty()
     if text then
         self.log("Delivery %s (%s %s x%s -> %s): %s", tostring(delivery.id or 0), tostring(delivery.kind),
-            tostring(delivery.name), tostring(delivery.remaining or 0), tostring(delivery.container), tostring(text))
+            tostring(delivery.name), tostring(delivery.remaining or 0), tostring(delivery.container), self.Message.describe(text))
     end
 end
 
---- 追加发送任务：同一目标容器 + 同一资源的任务合并成一条，避免重复点“发送”时排队出多条
 function Recipe:addDelivery(entry)
     for _, existing in ipairs(self.Cache:deliveries()) do
-        if existing.container == entry.container and existing.kind == entry.kind and existing.name == entry.name then
-            local extra = math.max(1, tonumber(entry.remaining) or 1)
-            existing.remaining = (tonumber(existing.remaining) or 0) + extra
-            existing.total = (tonumber(existing.total) or 0) + extra
-            if entry.processName and not existing.processName then
-                existing.processName = entry.processName
+        if existing.container == entry.container and existing.kind == entry.kind
+            and existing.name == entry.name
+            and (existing.nbt or "") == (entry.nbt or "") then
+            local stuck = (tonumber(existing.stuckCount) or 0) >= 3
+            if stuck then
+                self.log("Delivery %s is stuck (%s remaining=%s): queueing the new request separately",
+                    tostring(existing.id or 0), tostring(existing.name), tostring(existing.remaining or 0))
+            else
+                local extra = self.Assert.positive(entry.remaining, "delivery.remaining")
+                existing.remaining = self.Assert.count(existing.remaining, "delivery.remaining") + extra
+                existing.total = self.Assert.count(existing.total, "delivery.total") + extra
+                if entry.processName and not existing.processName then
+                    existing.processName = entry.processName
+                end
+                self.log("Delivery %s extended by %s: %s x%s -> %s (total %s)",
+                    tostring(existing.id or 0), tostring(extra), tostring(existing.name),
+                    tostring(existing.remaining), tostring(existing.container), tostring(existing.total))
+                existing.lastError = nil
+                self.Cache:markDirty()
+                return existing
             end
-            --- 用户第 5 项（"发送中的数量变成了两倍"）：合并本身是刻意的（同一目标容器 + 同一资源的
-            --- 多次发送并成一条，避免点两次就排两条），但以前完全无声 —— 网页上只看到一条 762 的
-            --- 记录，没人知道那是两次 381 并起来的。现在明确记一行（终端 + 网页控制台都能看到）。
-            self.log("Delivery %s extended by %s: %s x%s -> %s (total %s)",
-                tostring(existing.id or 0), tostring(extra), tostring(existing.name),
-                tostring(existing.remaining), tostring(existing.container), tostring(existing.total))
-            existing.lastError = nil
-            self.Cache:markDirty()
-            return existing
         end
     end
     return self.Cache:addDelivery(entry)
 end
 
---- 发送中队列：每个 tick 都尝试把存储容器里的库存搬到目标 output 容器。
---- 这里不再等“流程完成一批”才搬运：只要存储里有货就先发（先发库存），
---- 不足的部分由流程继续产出，下一 tick 再搬，任务不会再永远停在“未发送”。
 function Recipe:processDeliveries(now)
     local deliveries = self.Cache:deliveries()
     if #deliveries == 0 then
@@ -1935,15 +2242,16 @@ function Recipe:processDeliveries(now)
     local pending = {}
     for _, delivery in ipairs(deliveries) do
         local remaining = tonumber(delivery.remaining) or 0
-        if remaining > 0 then
+        if remaining > 0 and delivery.nextAttemptAt and now < delivery.nextAttemptAt then
+            pending[#pending + 1] = delivery
+        elseif remaining > 0 then
             local containerKind = delivery.containerKind
             if containerKind ~= "item" and containerKind ~= "fluid" then
-                -- 旧任务（或 filter 资源）：按目标容器定义自己的种类判定
                 containerKind = self.Util.kindOfDef(self.Store:findContainer(delivery.container, delivery.kind))
             end
             if not self.Containers:peripheralOf(delivery.container, containerKind) then
                 self:markDeliveryError(delivery, self.Containers:unusableReason(delivery.container, containerKind)
-                    or ("\\u76EE\\u6807\\u5BB9\\u5668 " .. tostring(delivery.container) .. " \\u5F53\\u524D\\u4E0D\\u53EF\\u7528"))
+                    or self.Message.msg(self.Message.KEYS.RECIPE_ERR_DELIVERY_TARGET_UNAVAILABLE, { container = tostring(delivery.container) }))
             else
                 local targets = { delivery.container }
                 local itemTargets = {}
@@ -1954,42 +2262,30 @@ function Recipe:processDeliveries(now)
                 if delivery.kind ~= "item" then
                     fluidTargets = targets
                 end
-                --- 用户第 6 项（本轮）：派活量 = 剩余量 − 已经派出去但还没结算的量。
-                --- 以前直接把 remaining 交出去：在飞记忆一旦被清掉（TTL / 批次边界 / 结果被别处取走），
-                --- 同一个发货任务会再派一次足量搬运 —— 现场就是"要 64 个，实际发了 64+64+52 个"。
                 local inflightQty = tonumber(delivery.inflight) or 0
-                local wantQty = math.max(0, remaining - inflightQty)
+                local wantQty = remaining
                 local moveToken = "delivery:" .. tostring(delivery.id or delivery.name)
-                --- wantQty 可能是 0（在飞的那部分还没结算）：这时 transferIn 只负责"取回结算结果"、
-                --- 不会派新活（token 分支在数量检查之前先 resumePendingMove），所以照常调用。
-                local moved, reason = self:transferIn(
-                    { kind = delivery.kind, id = delivery.name },
+                local spec = { kind = delivery.kind, id = delivery.name }
+                if delivery.nbt ~= nil and delivery.nbt ~= "" then
+                    spec.nbt = delivery.nbt
+                    spec.ignoreNbt = false
+                end
+                local moved, reason = self:sendToMachine(
+                    spec,
                     itemTargets,
                     fluidTargets,
                     -1,
                     wantQty,
-                    --- token 按发货任务 id：同一条发货在 worker 回报之前只会有一条在飞请求
-                    --- （以前每次重扫源都会新发一条 → 64 个变成 63 + 64 = 127 个）
                     moveToken,
-                    --- 发货到输出容器要少碎片：从存储容器优先抽数量最少的那几堆（1.6.11）
-                    --- 队列：发货是"库存输出"（1.7.0）
                     { storageOrder = self.Containers.ORDER_FRAGMENT, queue = "inventoryOut" }
                 )
+                self:debugInfo("delivery#%s %s remaining=%d inflight=%d want=%d moved=%s reason=%s",
+                    tostring(delivery.id or delivery.name), tostring(delivery.name), remaining, inflightQty,
+                    wantQty, tostring(moved), self.Message.describe(reason))
                 if reason == "pending" then
-                    --- 派出去的量记进在飞账本（transferIn 把这次请求的细节存在 pendingMoves[token]）
-                    local pendingMove = self.pendingMoves and self.pendingMoves[moveToken]
-                    if pendingMove and tonumber(pendingMove.want) then
-                        delivery.inflight = (tonumber(delivery.inflight) or 0) + (tonumber(pendingMove.want) or 0)
-                    end
-                    -- 发送搬运已交给 IFMWorker：本 tick 不改状态（下个 tick 继续等同一个任务），
-                    -- 也不写 lastError —— 这不是失败，只是“等 worker 干完”。delivery 会由下面的
-                    -- “remaining > 0 就留在队列里”逻辑原样保留。
-                    -- 但已经回报的那部分必须立刻扣减：否则下个 tick 会按原来的 remaining
-                    -- 再发一遍（用户实测：要 64 个，结果搬了 63 + 64 = 127 个）。
                     local booked = tonumber(moved) or 0
                     if booked > 0 then
                         delivery.remaining = remaining - booked
-                        delivery.inflight = math.max(0, (tonumber(delivery.inflight) or 0) - booked)
                         delivery.lastError = nil
                         self.Cache:markDirty()
                     end
@@ -1998,6 +2294,9 @@ function Recipe:processDeliveries(now)
                     moved = tonumber(moved) or 0
                     delivery.remaining = remaining - moved
                     delivery.lastError = nil
+                    delivery.nextAttemptAt = nil
+                    delivery.stuckCount = 0
+                    delivery.lastProgressAt = now
                     self.Cache:markDirty()
                     if (tonumber(delivery.remaining) or 0) <= 0 then
                         self.log("Delivery %s done: %s x%s -> %s", tostring(delivery.id or 0),
@@ -2015,27 +2314,24 @@ function Recipe:processDeliveries(now)
                                 tostring(delivery.name), tostring(remaining), tostring(delivery.container))
                         end
                     else
-                        --- 用户第 5 项（"发送中的数量是两倍、却永远发不完"）：存储里没货时要说清"还缺
-                        --- 多少"；如果这个物品**根本没有流程能产出**（例如 Iron Nugget），更要明说
-                        --- "不会自动到货，请补库存或删除此项" —— 以前的"等待库存/上游产出"会让人一直
-                        --- 等一个永远不会发生的生产。这里只改这条发货记录的错误文案（reason 由
-                        --- transferIn 给出，非 nil 时它更具体，仍然优先）。
                         if #self:producers(delivery.kind, delivery.name) == 0 then
-                            reason = "\\u5B58\\u50A8\\u5BB9\\u5668\\u4E2D\\u6682\\u65F6\\u6CA1\\u6709 " ..
-                                tostring(delivery.name) ..
-                                "\\uFF08\\u8FD8\\u7F3A " .. tostring(remaining) ..
-                                "\\uFF09\\uFF0C\\u4E14\\u6CA1\\u6709\\u6D41\\u7A0B\\u80FD\\u4EA7\\u51FA\\u5B83 \\u2192 " ..
-                                "\\u4E0D\\u4F1A\\u81EA\\u52A8\\u5230\\u8D27\\uFF0C\\u8BF7\\u8865\\u5E93\\u5B58\\u6216\\u5220\\u9664\\u6B64\\u9879"
+                            reason = self:messageOf(self.Message.KEYS.RECIPE_ERR_NO_PRODUCER, {
+                                item = tostring(delivery.name),
+                                remaining = tostring(remaining),
+                            })
                         end
-                        self:markDeliveryError(delivery, reason or ("\\u5B58\\u50A8\\u5BB9\\u5668\\u4E2D\\u6682\\u65F6\\u6CA1\\u6709 " .. tostring(delivery.name)
-                            .. "\\uFF0C\\u7B49\\u5F85\\u5E93\\u5B58/\\u4E0A\\u6E38\\u4EA7\\u51FA"))
+                        self:markDeliveryError(delivery, reason
+                            or self.Message.msg(self.Message.KEYS.RECIPE_WAIT_STOCK, { item = tostring(delivery.name) }))
+                        local stuck = (tonumber(delivery.stuckCount) or 0) + 1
+                        delivery.stuckCount = stuck
+                        delivery.nextAttemptAt = now + math.min(30000, 1000 * (2 ^ math.min(stuck, 5)))
+                        self.Cache:markDirty()
                     end
                 end
             end
             if (tonumber(delivery.remaining) or 0) > 0 then
                 pending[#pending + 1] = delivery
             else
-                --- 这条发货做完了：清掉它的在飞搬运记忆（token 见上面的 transferIn 调用）
                 self:forgetPendingMove("delivery:" .. tostring(delivery.id or delivery.name))
             end
         end
@@ -2046,14 +2342,6 @@ function Recipe:processDeliveries(now)
     end
 end
 
---- ===== 存储整理（网页手动触发）=====
---- 目的：把同一种物品（同名 且 同 NBT，否则不可堆叠）散落在多个槽位、可以跨越多个容器上的堆，
---- 按「槽位内数量从小到大」的顺序合并到一起：数量最多的那堆当目标，最少的先往里装。
---- 计划是分批算的（每个 tick 最多问几次外设，见 Containers:compactPlanPass）：
---- 以前一口气算完会把主循环卡住十几秒 —— 期间引擎不推进、网页收不到推送，浏览器会
---- “15 秒没收到服务端数据”然后重连（点「整理」必然出现的那条消息就是这么来的）。
---- 现在 startCompact 立刻返回（state = "planning"），由 stepCompact 每 tick 推进一小步，
---- 算完再按 compactOpsPerTick 慢慢搬运 —— 全程不阻塞主循环。
 function Recipe:startCompact(role)
     local now = os.epoch("utc")
     self.compact = {
@@ -2076,62 +2364,42 @@ function Recipe:startCompact(role)
     return "planning"
 end
 
---- 推进「整理计划」的计算：每次调用只跑一遍分批计算（预算内），算完就转入执行阶段
+-- A compaction pass streams (see Containers:compactPlanSimple): every slot it looks at
+-- either hands one move to the compact queue right away or is skipped, and a refused move
+-- makes the pass rebuild its layout. There is no plan array to hand over, so the job only
+-- stays "planning" until the pass is through and the counters below are the result.
 function Recipe:advanceCompactPlan(job, now)
-    --- 整理计划只用当前已扫到的容器结果：计算期间打开“只读缓存模式”——
-    --- 1.7.0：容器读取本来就是"快照模式"（只有扫描队列会读外设），不需要再切只读缓存模式
-    --- 用 pcall 包住：算计划中途抛错（非 PLAN_YIELD）时也必须把只读缓存模式关掉，
-    --- 否则引擎后面做搬运判断时也会“只看旧缓存”，那样会漏搬/错判。
-    local okPlan, plan, done = pcall(self.Containers.compactPlanPass, self.Containers, job.planner)
-    if not okPlan then
-        error(plan, 0)
-    end
-    if not done then
-        -- 还没算完（这一轮的外设调用预算用光）：下个 tick 接着算。
-        -- 每 5 秒报一次进度，方便在网页/终端上看到“确实在算”。
-        if (now or 0) - (job.lastPlanReportAt or 0) >= 5000 then
-            job.lastPlanReportAt = now
-            local planner = job.planner or {}
-            local stage = tostring(planner.stage or "scan")
-            if stage == "detail" then
-                --- 正在等 worker 把物品详情（maxCount）送回来 —— 主控自己没有做阻塞的 getItemDetail
-                stage = "waiting for worker item details"
-            end
-            self.log("Storage compact planning: %s (%d/%d containers, %d/%d kinds probed, %d call(s))",
-                stage, tonumber(planner.containersDone) or 0,
-                tonumber(planner.containersTotal) or 0, tonumber(planner.groupsDone) or 0,
-                tonumber(planner.groupsTotal) or 0, tonumber(planner.totalCalls) or 0)
-        end
+    local queued, skipped, finished = self.Containers.compactPlanPass(self.Containers, job.planner)
+    if finished ~= true then
         return false
     end
-    plan = plan or {}
-    -- 计划就绪：统计种类数与总搬运量（网页显示与日志用），然后开始执行
-    local kinds, items = {}, 0
-    for _, move in ipairs(plan) do
-        items = items + (tonumber(move.amount) or 0)
-        kinds[tostring(move.name) .. "\1" .. tostring(move.nbt or "")] = true
-    end
-    local kindCount = 0
-    for _ in pairs(kinds) do
-        kindCount = kindCount + 1
-    end
-    job.state = "running"
-    job.plan = plan
+    local rejected = (job.planner and job.planner.rejected) or 0
+    local restarts = (job.planner and job.planner.restarts) or 0
+    job.state = "done"
+    job.plan = nil
     job.index = 1
-    job.total = #plan
-    job.items = items
-    job.kinds = kindCount
+    job.total = 0
+    job.items = 0
+    job.kinds = 0
+    job.moved = 0
+    job.failed = 0
+    job.skipped = skipped or 0
+    job.queued = queued or 0
+    job.rejected = rejected
     job.planner = nil
     job.plannedAt = now
     job.lastReportAt = now
+    self.compact = nil
+    self.compactPlanQueued = queued or 0
+    self.compactLastFinishAt = now
+    self.compactPlanStats = { total = queued or 0, queued = queued or 0, skipped = skipped or 0,
+        rejected = rejected, at = now }
     self.Cache:markDirty()
-    self.log("Storage compact plan ready: %d move(s) (%d item(s), %d kind(s)) - executing %d per tick",
-        job.total, job.items, job.kinds, self.compactOpsPerTick or 3)
+    self.log("Auto compact: %d move task(s) queued into the compact queue " ..
+        "(%d skipped, %d rejected, %d restart(s))", queued or 0, skipped or 0, rejected, restarts)
     return true
 end
 
---- 设置自动整理的空槽位阈值（用户第 4 项，网页设置里的输入框）：0 ~ 1，超出就夹到边界。
---- 阈值改了要允许"马上重算一遍"：否则下面那条"输入没变就短路"会一直挡着，用户改完看不到效果。
 function Recipe:setCompactFreeRatio(value)
     local ratio = tonumber(value)
     if not ratio or ratio < 0 then
@@ -2147,8 +2415,6 @@ function Recipe:setCompactFreeRatio(value)
     return ratio
 end
 
---- 存储容器的空槽位比例（0 ~ 1）：总槽位数还不知道时返回 nil（调用方按"先不整理"处理）。
---- 数据来自 Containers:capacityStats（已占用槽位 / 总槽位数，带 TTL 缓存，不额外读外设）。
 function Recipe:storageFreeRatio()
     local stats = self.Containers and self.Containers.capacityStats
         and self.Containers:capacityStats() or nil
@@ -2168,52 +2434,99 @@ function Recipe:storageFreeRatio()
     return (total - used) / total
 end
 
---- ===== 自动整理（1.8.0，用户第 4/5 项）=====
---- 不再有"手动点整理"：调度器每轮检查一次，**compact 队列为空**时就算一遍搬运计划，
---- 算完把**所有**搬运任务一次性排进 compact 队列（每个任务一个 tick 一步，多台 worker/本机协程并行执行）。
---- 计划本身仍是分批算的（每 tick 一小步，见 advanceCompactPlan），不会卡住主循环。
---- 计划的输入是**当前槽位扫描快照**（容器内容）+ 物品详情字典里的"槽位堆叠上限"（由 stackScan
---- 队列补齐）；还没扫到堆叠上限的物品在规划时直接跳过（见 Containers:compactPlanPass）。
---- 没有冷却：队列一空就算（用户要求）。
+-- The compact *plan* is generated here, inline, before the scheduler runs: it never
+-- enters a dispatch queue and never spends an executor slot. Nothing is planned while
+-- the compact queue still holds move tasks, while a container's slot capacity is
+-- still unknown, or while the free-slot ratio is above the threshold.
+function Recipe:compactPlanTick(now)
+    now = now or os.epoch("utc")
+    local job = self.compact
+    if job and job.state == "planning" then
+        self:advanceCompactPlan(job, now)
+        return 0
+    end
+    if job then
+        return 0
+    end
+    if self.dispatch and self.dispatch.depth and self.dispatch:depth("compact") > 0 then
+        return 0
+    end
+    -- A storage container whose slot count has not been read cannot be planned around
+    -- (its slots would be skipped), so compaction waits for the read instead of
+    -- generating a plan from a half-known storage.
+    if self.Containers.hasUnknownSlotCount and self.Containers:hasUnknownSlotCount() then
+        self.compactWaitReason = "slotCount"
+        return 0
+    end
+    local freeRatio = self:storageFreeRatio()
+    if freeRatio == nil or freeRatio >= (self.compactFreeRatio or 0.10) then
+        self.compactWaitReason = nil
+        return 0
+    end
+    if self.Containers.hasUnknownSlotCapacity and self.Containers:hasUnknownSlotCapacity() then
+        self.compactWaitReason = "capacity"
+        return 0
+    end
+    local revision = self.Containers.planInputRevision and self.Containers:planInputRevision() or nil
+    if revision ~= nil and revision == self.compactPlanRevision and (self.compactPlanQueued or 0) == 0 then
+        return 0
+    end
+    self.compactPlanRevision = revision
+    self.compactWaitReason = nil
+    self:startCompact("storage")
+    job = self.compact
+    if job and job.state == "planning" then
+        self:advanceCompactPlan(job, now)
+    end
+    return 0
+end
+
+-- Drop the current plan (a move failed): the next plan is generated from a fresh
+-- snapshot once the compact queue is empty again.
+function Recipe:abortCompact(reason)
+    local job = self.compact
+    self.compact = nil
+    self.compactPlanQueued = 0
+    self.compactPlanStats = nil
+    self.compactAbortReason = reason
+    self.compactAbortedAt = os.epoch("utc")
+    self.Cache:markDirty()
+    if job then
+        self.log("Storage compact aborted (%s) after %d move(s)",
+            tostring(reason or "move failed"), tonumber(job.total) or 0)
+    end
+    return job ~= nil
+end
+
+-- Push the moves of the finished plan into the compact queue (one concrete move task
+-- per element). Only the execution runs here; the plan itself is already complete.
 function Recipe:autoCompactStep(now)
     now = now or os.epoch("utc")
     local job = self.compact
-    if not job then
-        --- 用户第 4 项：存储容器空槽位还够（比例 ≥ 阈值）就**不整理** —— 有地方放东西就没必要搬；
-        --- 总槽位数未知（外设还没扫到 size()）时同样先不整理，等知道容量再说。
-        local freeRatio = self:storageFreeRatio()
-        if freeRatio == nil or freeRatio >= (self.compactFreeRatio or 0.10) then
-            return 0
-        end
-        --- 没有冷却（队列一空就算），但"输入没变、上一轮又什么都没排出来"时不重复算：
-        --- 计划的输入 = 容器快照（换代次数）+ 已知的堆叠上限数量（见 Containers:planInputRevision）。
-        local revision = self.Containers.planInputRevision and self.Containers:planInputRevision() or nil
-        if revision ~= nil and revision == self.compactPlanRevision and (self.compactPlanQueued or 0) == 0 then
-            return 0
-        end
-        self.compactPlanRevision = revision
-        self:startCompact("storage")
-        job = self.compact
-    end
-    if job.state == "planning" then
-        self:advanceCompactPlan(job, now)
+    if not job or job.state ~= "running" then
         return 0
     end
     local plan = job.plan or {}
     local queued, skipped, rejected = 0, job.skipped or 0, 0
     for _, move in ipairs(plan) do
-        --- 复核源槽位里还是不是当初计划的那一堆（同名 + 同 NBT；整理期间流程可能也在搬东西）
         local current = move.name and self.Containers:stackAt(move.fromContainer, move.fromSlot) or nil
+        local fromPeripheral = self.Containers:peripheralOf(move.fromContainer, "item")
+        local toPeripheral = self.Containers:peripheralOf(move.toContainer, "item")
         if current and (current.name ~= move.name or tostring(current.nbt or "") ~= tostring(move.nbt or "")) then
             skipped = skipped + 1
+        elseif (fromPeripheral and self.Containers:slotBusy(fromPeripheral, move.fromSlot))
+            or (toPeripheral and self.Containers:slotBusy(toPeripheral, move.toSlot)) then
+            skipped = skipped + 1
         else
-            --- 提交成一条搬运任务（进 compact 队列）。返回 "pending" = 已经排进队列（正常路径）
-            local _, reason = self.Containers:pushItem(move.fromContainer, move.fromSlot, move.amount,
-                move.toContainer, move.toSlot, nil, "compact")
-            if reason == "pending" then
+            local key, why = self.Containers:manageItem(move.fromContainer, move.fromSlot, move.toContainer,
+                move.toSlot, { name = move.name, nbt = move.nbt }, move.amount)
+            if key then
                 queued = queued + 1
             else
                 rejected = rejected + 1
+                if rejected <= 3 then
+                    self.log.warn("compact move rejected: %s", self.Message.describe(why))
+                end
             end
         end
     end
@@ -2221,19 +2534,39 @@ function Recipe:autoCompactStep(now)
     self.compactLastFinishAt = now
     self.compactPlanQueued = queued
     self.compactPlanStats = { total = #plan, queued = queued, skipped = skipped, rejected = rejected,
-        skippedUnknown = job.skippedUnknown or 0, at = now }
+        at = now }
     self.Cache:markDirty()
     self.log("Auto compact: %d/%d move task(s) queued into the compact queue (%d skipped, %d rejected)",
         queued, #plan, skipped, rejected)
     return queued
 end
 
---- 整理进度（网页显示用；没有整理任务时返回 nil）
 function Recipe:compactStatus()
     local job = self.compact
     if not job then
-        --- 计划已经生成成搬运任务（在 compact 队列里跑）：显示上一次生成了多少条
-        --- （只在生成后 30 秒内显示，之后进度条自己隐藏）
+        if self.compactWaitReason == "slotCount" and self.Containers.unknownSlotCountList
+            and #self.Containers:unknownSlotCountList() > 0 then
+            -- Compaction is waiting for the slot-count read of some storage container.
+            return {
+                planning = false,
+                waiting = "slotCount",
+                pendingSlotCount = #self.Containers:unknownSlotCountList(),
+                containers = self.Containers:unknownSlotCountList(4),
+                done = 0, pending = 0, moved = 0, items = 0, kinds = 0, failed = 0, queued = 0,
+            }
+        end
+        if self.compactWaitReason == "capacity" and self.Containers.pendingCapacityCount
+            and self.Containers:pendingCapacityCount() > 0 then
+            -- Compaction is waiting for the slot-capacity scan of some container.
+            return {
+                planning = false,
+                waiting = "capacity",
+                pendingCapacity = self.Containers:pendingCapacityCount(),
+                containers = self.Containers.pendingCapacityList
+                    and self.Containers:pendingCapacityList(4) or {},
+                done = 0, pending = 0, moved = 0, items = 0, kinds = 0, failed = 0, queued = 0,
+            }
+        end
         local stats = self.compactPlanStats
         if not stats or (os.epoch("utc") - (stats.at or 0)) > 30000 then
             return nil
@@ -2246,7 +2579,6 @@ function Recipe:compactStatus()
             skipped = stats.skipped or 0,
             rejected = stats.rejected or 0,
             at = stats.at,
-            --- 执行侧的进度由主控用 compact 队列的统计补上（见 buildStatus）
             done = 0,
             pending = stats.queued or 0,
             moved = 0,
@@ -2256,7 +2588,6 @@ function Recipe:compactStatus()
         }
     end
     if job.state == "planning" then
-        -- 计划还在算（分批进行）：网页显示“正在计算搬运计划（扫描容器 3/19）”
         local planner = job.planner or {}
         return {
             planning = true,
@@ -2288,57 +2619,687 @@ function Recipe:compactStatus()
     }
 end
 
---- 推进整理任务（每次 tick 调用）：算计划阶段每 tick 走一小步，执行阶段最多搬 compactOpsPerTick 次
---- 兼容入口（诊断 / 旧调用方）：1.8.0 起整理没有"手动启动"，搬运任务也由调度器的 compact 队列执行。
---- 这里只推进"自动整理"：计划算完 → 一次性生成所有搬运任务（见 autoCompactStep）。
 function Recipe:stepCompact(now)
     return self:autoCompactStep(now)
 end
 
---- 空闲判定：没有排队批次、没有上游请求、也没有等待中的步骤 ⇒ 这个流程完全没事可做。
---- 系统里大多数流程大多数时间都是空闲的（空闲流程不列出、也不处理），
---- 所以 tick 与 runtime() 都要先把它们筛掉，避免每 tick 白跑一遍、每帧白推一遍。
-function Recipe:idleRecord(record)
-    if not record then
+
+function Recipe:elementKeyOf(spec)
+    local kind = (type(spec) == "table" and spec.kind == "fluid") and "fluid" or "item"
+    local id = (type(spec) == "table" and spec.id) or tostring(spec or "")
+    return kind .. ":" .. tostring(id)
+end
+
+function Recipe:specOfElement(element)
+    if type(element) ~= "table" then
+        return { kind = "item", id = "" }
+    end
+    if element.kind == "filter" then
+        return { kind = "filter", id = element.id, nbt = element.nbt, ignoreNbt = element.ignoreNbt ~= false }
+    end
+    return {
+        kind = element.kind == "fluid" and "fluid" or "item",
+        id = element.id,
+        nbt = element.nbt,
+        ignoreNbt = element.ignoreNbt ~= false,
+    }
+end
+
+function Recipe:availableForCraft(element)
+    local spec = self:specOfElement(element)
+    if element.kind == "filter" then
+        -- Exact figure: matching stacks minus dirty marks and instance claims (both are
+        -- booked per concrete resource, which is why plain countOf() over-counted).
+        return self.Containers:availableForFilterSpec(spec), 0, 0
+    end
+    local available, visible, dirty, claimed = self.Containers:availableForCraft(spec)
+    return available, visible, dirty, claimed
+end
+
+-- With "mix resources" off, a material filter has to be bound to exactly one
+-- concrete resource, and the batch size has to fit what that single resource can
+-- supply (the request is then covered by several instances instead of one mixed
+-- batch). Returns that concrete spec plus its really available amount (claims
+-- already deducted), or nil when nothing matching sits in storage.
+function Recipe:bestSingleInput(element)
+    if type(element) ~= "table" or element.kind ~= "filter" then
+        return nil
+    end
+    local spec = self:specOfElement(element)
+    if not spec then
+        return nil
+    end
+    local bestSpec, bestAvailable
+    -- One candidate is one concrete (name, nbt) pair. countOf()'s fast path sums
+    -- every nbt variant of an id, so the visible amount is summed here instead
+    -- and only the dirty/claimed amounts are taken from the container side (both
+    -- of those honour the nbt of the spec).
+    local function consider(kind, name, nbt, visible)
+        local concrete = { kind = kind, id = name, nbt = nbt or "", ignoreNbt = false }
+        local available = (tonumber(visible) or 0)
+            - (tonumber(self.Containers:dirtyAmount(concrete)) or 0)
+            - (tonumber(self.Containers:claimedAmount(concrete)) or 0)
+        available = math.max(0, math.floor(available))
+        if available > 0 and (not bestAvailable or available > bestAvailable) then
+            bestSpec, bestAvailable = concrete, available
+        end
+    end
+    local totals, order = {}, {}
+    for _, storageName in ipairs(self.Containers:byRole("storage", "item", "out")) do
+        for _, stack in ipairs(self.Containers:stacks(storageName)) do
+            if self.Filter:specMatches(spec, { kind = "item", name = stack.name, nbt = stack.nbt }) then
+                local key = tostring(stack.name) .. "\1" .. tostring(stack.nbt or "")
+                local bucket = totals[key]
+                if not bucket then
+                    bucket = { name = stack.name, nbt = stack.nbt, count = 0 }
+                    totals[key] = bucket
+                    order[#order + 1] = bucket
+                end
+                bucket.count = bucket.count + (tonumber(stack.count) or 0)
+            end
+        end
+    end
+    for _, bucket in ipairs(order) do
+        consider("item", bucket.name, bucket.nbt, bucket.count)
+    end
+    for _, storageName in ipairs(self.Containers:byRole("storage", "fluid", "out")) do
+        for _, tank in ipairs(self.Containers:tanks(storageName)) do
+            if self.Filter:specMatches(spec, { kind = "fluid", name = tank.name }) then
+                consider("fluid", tank.name, nil, tank.amount)
+            end
+        end
+    end
+    if not bestSpec then
+        return nil
+    end
+    return bestSpec, bestAvailable
+end
+
+-- Identity of a material in the ledger. Items, fluids, filters and placeholders
+-- keep their own row, so a filter request never merges with a request for one
+-- concrete item it happens to match.
+function Recipe:materialKeyOf(spec)
+    local kind = (type(spec) == "table" and spec.kind) and tostring(spec.kind) or "item"
+    local id = ""
+    if type(spec) == "table" then
+        id = tostring(spec.id or spec.name or "")
+    end
+    return kind .. ":" .. id
+end
+
+-- Same identity, straight from a process element.
+function Recipe:materialKeyOfElement(element)
+    if type(element) ~= "table" then
+        return nil
+    end
+    if element.kind == "placeholder" then
+        return "placeholder:" .. tostring(element.name or "")
+    end
+    if element.kind == "item" or element.kind == "fluid" or element.kind == "filter" then
+        return element.kind .. ":" .. tostring(element.id or "")
+    end
+    return nil
+end
+
+-- material key -> { { process = <name>, yield = <per round> }, ... } for every
+-- process that can craft that material and has its "craft reference" switch on.
+-- Rebuilt when the store revision changes (a definition was added, edited or
+-- deleted); never written to disk.
+function Recipe:craftIndex()
+    local revision = self.Store.revision and self.Store:revision() or 0
+    if self.craftIndexRev == revision and self.craftIndexCache then
+        return self.craftIndexCache
+    end
+    local index = {}
+    local function add(key, processName, yieldPerBatch)
+        local bucket = index[key]
+        if not bucket then
+            bucket = {}
+            index[key] = bucket
+        end
+        bucket[#bucket + 1] = { process = processName, yield = yieldPerBatch }
+    end
+    for _, process in ipairs(self.Store:list("processes")) do
+        if not self:isAbstract(process) then
+            for _, output in ipairs(process.outputs or {}) do
+                if output.craft ~= false then
+                    local yieldPerBatch = math.max(1, math.floor(tonumber(self:expectedYield(process, output)) or 0))
+                    if output.kind == "placeholder" then
+                        -- A placeholder stands for one item; it is reachable both as
+                        -- "that placeholder" and as the concrete item it names, which
+                        -- is what a downstream input usually asks for.
+                        if output.name and output.name ~= "" then
+                            add("placeholder:" .. output.name, process.name, yieldPerBatch)
+                        end
+                        if output.item and output.item ~= "" then
+                            add("item:" .. output.item, process.name, yieldPerBatch)
+                        end
+                    elseif output.kind == "item" or output.kind == "fluid" or output.kind == "filter" then
+                        add(output.kind .. ":" .. tostring(output.id), process.name, yieldPerBatch)
+                    end
+                end
+            end
+        end
+    end
+    self.craftIndexRev = revision
+    self.craftIndexCache = index
+    return index
+end
+
+function Recipe:expectedYield(process, element)
+    local total = 0
+    for _, output in ipairs(process.outputs or {}) do
+        if output.kind == element.kind or (element.kind == "filter" and
+                (output.kind == "item" or output.kind == "fluid")) then
+            if self:outputMatchesInput(output, element) then
+                local expect = tonumber(output.expect)
+                if expect == nil then
+                    expect = tonumber(output.max) or 0
+                end
+                total = total + math.max(0, expect)
+            end
+        end
+    end
+    return total
+end
+
+-- (downstreamNeed / downstreamCap / countKeys are gone: the demand of a process
+-- is derived from the material ledger every tick by Recipe:planTick.)
+
+-- (markCountDirty is gone: nothing has to be marked, the material ledger is the
+-- only place a demand lives and Recipe:planTick re-derives it every tick.)
+
+-- (consumeDemand is gone: a finished batch is settled against its *material* rows
+-- by Recipe:settleProduced - automateCount first, then queryCount.)
+
+-- (upstreamOf is gone: the reverse lookup lives in Recipe:craftIndex, keyed by
+-- material instead of by process.)
+
+-- (recomputeDirty is gone: Recipe:planTick derives the whole demand from the
+-- material ledger on every tick, so nothing has to be marked dirty any more.)
+
+-- (enabledOwners / noteOwnerEnabled are gone: the set of processes that have
+-- work to do is derived from the material ledger by Recipe:planTick every tick.)
+
+-- The batch limit of one planning round: maxMultiplier, capped by how many rounds the
+-- material that is available *right now* covers (one figure per material input, the
+-- tightest one wins) and by the rounds that are still owed (`gap`). `report` is an
+-- optional out table: diagnostics pass one and get one row per material input, which is
+-- what makes a small batch explainable (see Diagnose:report).
+function Recipe:materialLimit(process, gap, report)
+    local limit = math.max(1, math.floor(tonumber(process.maxMultiplier) or 1))
+    -- Several input elements may draw from the same storage stock (nine slot-pinned
+    -- coal inputs are nine consumers of one pile). Availability therefore has to be
+    -- divided by the *sum* of their per-round demand: measuring the whole pile once per
+    -- element made the batch bigger than the stock - it fed a part of it and then
+    -- stalled while holding a machine slot.
+    local stocks, order = {}, {}
+    for _, element in ipairs(process.inputs or {}) do
+        -- A skippable input must not cap the batch either: it is optional, so its
+        -- missing stock cannot reduce the multiplier to 0.
+        if (element.kind == "item" or element.kind == "fluid" or element.kind == "filter")
+            and not element.skip then
+            local perCraft = elementDemand(element, 1)
+            if perCraft > 0 then
+                local key, available
+                if element.kind == "filter" and element.allowMix == false then
+                    -- A non-mixing filter is bound to one concrete resource, so its
+                    -- stock is that resource - not the filter.
+                    local concrete, single = self:bestSingleInput(element)
+                    if concrete then
+                        key = "item:" .. tostring(concrete.id)
+                        available = single
+                    end
+                elseif element.kind == "filter" then
+                    key = "filter:" .. tostring(element.id)
+                    available = self:availableForCraft(element)
+                else
+                    local spec = self:specOfElement(element)
+                    key = self:elementKeyOf(spec)
+                    available = self:availableForCraft(element)
+                end
+                if key then
+                    local stock = stocks[key]
+                    if not stock then
+                        stock = { key = key,
+                            available = math.max(0, math.floor(tonumber(available) or 0)), perCraft = 0 }
+                        stocks[key] = stock
+                        order[#order + 1] = stock
+                    end
+                    stock.perCraft = stock.perCraft + perCraft
+                end
+            end
+        end
+    end
+    for _, stock in ipairs(order) do
+        if stock.perCraft > 0 then
+            local share = math.floor(stock.available / stock.perCraft)
+            limit = math.min(limit, share)
+            if report then
+                report[#report + 1] = { key = stock.key, perCraft = stock.perCraft,
+                    available = stock.available, limit = share }
+            end
+        end
+    end
+    return math.max(0, math.min(limit, math.floor(tonumber(gap) or 0)))
+end
+
+-- "Mix resources" off: replace every such material input filter of the instance
+-- definition with the concrete item/fluid this instance will consume. The
+-- definition is a per-instance copy (inst.def), so other instances of the same
+-- process may well bind a different resource - what never happens is one batch
+-- mixing two of them. Returns how many elements were bound.
+function Recipe:bindSingleInputs(inst)
+    local def = inst and inst.def
+    if type(def) ~= "table" then
+        return 0
+    end
+    local bound = 0
+    for index, element in ipairs(def.inputs or {}) do
+        if element.kind == "filter" and element.allowMix == false then
+            local concrete, available = self:bestSingleInput(element)
+            if concrete then
+                def.inputs[index] = {
+                    kind = concrete.kind,
+                    id = concrete.id,
+                    nbt = concrete.nbt or "",
+                    ignoreNbt = false,
+                    count = element.count,
+                    containerIndex = element.containerIndex,
+                    slot = element.slot,
+                    min = element.min,
+                    expect = element.expect,
+                    max = element.max,
+                    craft = element.craft,
+                    allowMix = true,
+                    catalyst = element.catalyst,
+                    skip = element.skip,
+                }
+                inst.bindings = inst.bindings or {}
+                inst.bindings[tostring(index)] = {
+                    filter = tostring(element.id),
+                    kind = concrete.kind,
+                    id = concrete.id,
+                    available = math.floor(tonumber(available) or 0),
+                }
+                bound = bound + 1
+                self.log("Process %s: input #%d filter %s bound to %s (%d available, batch x%d)",
+                    tostring(inst.owner), index, tostring(element.id), tostring(concrete.id),
+                    math.floor(tonumber(available) or 0), tonumber(inst.multiplier) or 0)
+            end
+        end
+    end
+    return bound
+end
+
+function Recipe:createInstance(process, machine, multiplier, now)
+    local inst = self.Cache.defaultInstance()
+    inst.owner = process.name
+    inst.machineType = process.machineType
+    inst.machine = machine.name
+    inst.multiplier = math.max(1, math.floor(tonumber(multiplier) or 1))
+    inst.def = self.Util.deepcopy(process)
+    -- Identity of that frozen definition: the file stores each definition once and an
+    -- instance only carries this key (see Cache:exportData).
+    inst.defKey = self.Cache:noteDef(inst.def)
+    inst.startedAt = now
+    inst.phase = "input"
+    inst.index = 1
+    inst.state = "running"
+    local conversion = self.Store.isTypeConversion(process.machineType)
+    -- The output side is prepared up front for an unordered process (and every type
+    -- conversion): the outputs then have their own index and may progress while the
+    -- inputs are still being delivered.
+    if conversion or processIoMode(process) == "unordered" then
+        inst.outProgress = {}
+        inst.outIndex = 1
+        self:prepareOutputs(inst.def, inst)
+    end
+    if not conversion then
+        -- Bind the non-mixing material filters to one concrete resource before
+        -- anything is claimed, so the claims below (and the whole batch) work on the
+        -- exact item/fluid this instance is going to consume.
+        self:bindSingleInputs(inst)
+    end
+    -- Register the instance first so its id is final: the id is the claim source.
+    self.Cache:addInstance(inst)
+    local ownerKey = instanceSource(inst)
+    local claims = {}
+    if not conversion then
+        -- Claim against the *bound* definition (inst.def): a non-mixing material filter
+        -- was replaced by the concrete item this instance is going to consume, so the
+        -- reservation follows the real resource (that is what makes the next instance
+        -- see it through Recipe:availableForCraft / bestSingleInput).
+        for _, element in ipairs((inst.def or process).inputs or {}) do
+            -- A skippable input is not reserved: it may not be consumed at all.
+            if (element.kind == "item" or element.kind == "fluid") and not element.skip then
+                local amount = elementDemand(element, inst.multiplier)
+                if amount > 0 then
+                    local spec = self:specOfElement(element)
+                    self.Containers:claim(spec, amount, ownerKey)
+                    local key = self:elementKeyOf(spec)
+                    claims[key] = (claims[key] or 0) + amount
+                end
+            end
+        end
+    end
+    inst.claims = claims
+    self:occupyMachine(machine.name, 1, instanceSource(inst))
+    -- Book what this batch is going to produce: the ledger counts it as "being
+    -- crafted" until the instance ends, so the very same rounds are not queued
+    -- again while it runs.
+    self:noteCrafting(process, inst, 1)
+    local record = self:record(process.name)
+    record.state = "running"
+    record.wait = nil
+    record.lastError = nil
+    record.checkedAt = now
+    self.instanceScanBurst = true
+    self.Cache:markDirty()
+    self.log("Process %s: instance #%d started on %s x%d", tostring(process.name), inst.id,
+        tostring(machine.name), inst.multiplier)
+    return inst
+end
+
+function Recipe:finishInstance(process, inst, now)
+    if type(inst) ~= "table" then
+        return false
+    end
+    local ownerName = tostring(inst.owner or (process and process.name) or "")
+    local ownerKey = instanceSource(inst)
+    for key, amount in pairs(inst.claims or {}) do
+        local kind, id = key:match("^(%a+):(.*)$")
+        if kind and id then
+            self.Containers:releaseClaim({ kind = kind, id = id }, amount, ownerKey)
+        end
+    end
+    inst.claims = {}
+    -- Drop whatever is left of this instance's reservations (the successful input
+    -- already gave back the slices that were consumed).
+    self.Containers:releaseClaimSource(ownerKey)
+    if type(inst.machine) == "string" and inst.machine ~= "" then
+        self:occupyMachine(inst.machine, -1, instanceSource(inst))
+    end
+    self:forgetPendingMovesWithPrefix("in:" .. ownerName .. "#" .. tostring(inst.id or 0))
+    self:forgetPendingMovesWithPrefix("out:" .. ownerName .. "#" .. tostring(inst.id or 0))
+    if inst.id ~= nil then
+        self.Cache:removeInstance(inst.id)
+    end
+    -- The batch is out: give the craftingCount back and settle what really came
+    -- out of the machine (automateCount first, then the user request).
+    self:releaseCrafting(inst)
+    if process then
+        self:settleProduced(process, inst)
+    end
+    local record = self.Cache.data.processes and self.Cache.data.processes[ownerName]
+    if record then
+        record.lastFinishedAt = now or os.epoch("utc")
+        record.wait = nil
+        record.lastError = nil
+        record.state = "idle"
+    end
+    self.Cache:markDirty()
+    self.log("Process %s: instance #%s finished (x%s)", ownerName, tostring(inst.id),
+        tostring(inst.multiplier))
+    return true
+end
+
+-- Kill one instance without touching the material ledger: the demand stays where
+-- it is, so the planning engine queues those rounds again on the next tick. That
+-- is the intended behaviour of "abort instance"; Recipe:cancel builds on it for
+-- "abort process" (it zeroes the user request of the products right after killing
+-- every instance).
+function Recipe:killInstance(inst, reason)
+    if type(inst) ~= "table" then
+        return false
+    end
+    local ownerName = tostring(inst.owner or "")
+    local ownerKey = instanceSource(inst)
+    for key, amount in pairs(inst.claims or {}) do
+        local kind, id = key:match("^(%a+):(.*)$")
+        if kind and id then
+            self.Containers:releaseClaim({ kind = kind, id = id }, amount, ownerKey)
+        end
+    end
+    inst.claims = {}
+    self.Containers:releaseClaimSource(ownerKey)
+    if type(inst.machine) == "string" and inst.machine ~= "" then
+        self:occupyMachine(inst.machine, -1, instanceSource(inst))
+    end
+    self:forgetPendingMovesWithPrefix("in:" .. ownerName .. "#" .. tostring(inst.id or 0))
+    self:forgetPendingMovesWithPrefix("out:" .. ownerName .. "#" .. tostring(inst.id or 0))
+    if inst.id ~= nil then
+        self.Cache:removeInstance(inst.id)
+    end
+    self:releaseCrafting(inst)
+    local record = self.Cache.data.processes and self.Cache.data.processes[ownerName]
+    if record then
+        record.wait = nil
+        record.lastError = nil
+    end
+    self.Cache:markDirty()
+    self.log("Process %s: instance #%s killed (%s, x%d)", ownerName, tostring(inst.id),
+        tostring(reason or "killed"), tonumber(inst.multiplier) or 1)
+    return true
+end
+
+
+function Recipe:abortInstance(processName, id)
+    processName = tostring(processName or "")
+    local wanted = tonumber(id)
+    if processName == "" or wanted == nil then
+        return false, self.Message.msg(self.Message.KEYS.RECIPE_ERR_INSTANCE_ARGS)
+    end
+    local inst = self.Cache:instance(wanted)
+    if not inst or tostring(inst.owner or "") ~= processName then
+        return false, self.Message.msg(self.Message.KEYS.RECIPE_ERR_INSTANCE_MISSING, { id = tostring(wanted) })
+    end
+    self:killInstance(inst, "aborted")
+    return true, { process = processName, instance = wanted }
+end
+
+
+function Recipe:stepInstance(inst, now)
+    local def = inst and inst.def
+    if type(def) ~= "table" then
+        return false
+    end
+    if self.Store.isTypeConversion(def.machineType) then
+        self:stepConversionInstance(inst, def, now)
         return true
     end
-    if (tonumber(record.batch) or 0) > 0 then
-        return false
+    local machine = self.Store:get("machines", inst.machine)
+    if not machine or not self:machineUsable(machine) then
+        local problem = machine and self:machineProblem(machine) or nil
+        inst.state = "missing"
+        inst.wait = { kind = "peripheral" }
+        if problem then
+            inst.lastError = self.Message.msg(self.Message.KEYS.RECIPE_ERR_MACHINE_UNAVAILABLE_WHY,
+                { machine = tostring(inst.machine), problem = problem })
+        else
+            inst.lastError = self.Message.msg(self.Message.KEYS.RECIPE_ERR_MACHINE_UNAVAILABLE,
+                { machine = tostring(inst.machine) })
+        end
+        self.Cache:markDirty()
+        return true
     end
-    if (tonumber(record.userCount) or 0) > 0 then
-        return false
+    if inst.wait and inst.wait.kind == "peripheral" then
+        inst.wait = nil
+        inst.state = "running"
+        inst.lastError = nil
+        self.Cache:markDirty()
     end
-    if (tonumber(record.downstreamCount) or 0) > 0 then
-        return false
+    if processIoMode(def) == "unordered" then
+        -- Input and output progress in the same tick. The two phases must not share
+        -- record.index, so the output phase runs on record.outIndex (swapped in
+        -- around the call); stepInput keeps the input index in record.index.
+        if not inst.outProgress then
+            inst.outProgress = {}
+            inst.outIndex = 1
+            self:prepareOutputs(def, inst)
+        end
+        if inst.phase ~= "output" then
+            self:stepInput(def, inst, machine, now)
+        end
+        local inputIndex = inst.index
+        inst.index = tonumber(inst.outIndex) or 1
+        self:stepOutput(def, inst, machine, now)
+        inst.outIndex = inst.index
+        inst.index = inputIndex
+        return true
     end
-    if record.wait ~= nil then
-        return false
-    end
-    -- 只有真正的 idle（或还没有运行态）才算空闲：missing / waiting / running 都要继续推进
-    local state = record.state
-    if state ~= nil and state ~= "idle" then
-        return false
+    if inst.phase == "input" then
+        self:stepInput(def, inst, machine, now)
+    else
+        self:stepOutput(def, inst, machine, now)
     end
     return true
 end
 
---- 队列外的每轮维护（1.7.0）：外设包装自愈、在飞搬运记忆清理、输入容器卸货。
---- 这些不属于"调度器推进"，worker 全忙时也照做。
+-- A type conversion instance is a bridge: it consumes nothing and touches no
+-- peripheral. Its input operation only checks that the material exists; its output
+-- operation checks that the configured filter really matches that material and then
+-- records the filter as produced. A mismatch parks the instance so the user sees
+-- that the filter does not actually accept the input.
+function Recipe:conversionInputMatchesFilter(input, output)
+    if input.kind == "item" or input.kind == "fluid" then
+        if self.Filter:matches(output.id, { kind = input.kind, name = input.id, nbt = input.nbt }) then
+            return true, false
+        end
+        -- The item's tags may simply not be scanned yet: wait instead of crying
+        -- "mismatch" (that is the whole reason the bridge exists).
+        if input.kind == "item" and self.Cache and self.Cache.hasTags
+            and not self.Cache:hasTags(input.id) then
+            return false, true
+        end
+        return false, false
+    end
+    if input.kind == "filter" then
+        -- A filter input: the output filter has to accept everything it accepts.
+        return self.Filter:isSubsetOf(input.id, output.id), false
+    end
+    return false, false
+end
+
+function Recipe:stepConversionInstance(inst, def, now)
+    local input = (def.inputs or {})[1]
+    local output = (def.outputs or {})[1]
+    inst.progress = inst.progress or {}
+    inst.outProgress = inst.outProgress or {}
+    if not input or not output then
+        inst.state = "missing"
+        inst.wait = { kind = "conversion" }
+        inst.lastError = self.Message.msg(self.Message.KEYS.RECIPE_ERR_CONVERSION_SHAPE)
+        self.Cache:markDirty()
+        return
+    end
+    local batch = self:batchOf(inst)
+    local required = elementDemand(input, batch)
+    local available = math.max(0, math.floor(tonumber(self:availableFor(input)) or 0))
+    local done = math.min(available, required)
+    inst.progress["1"] = done
+    local matched, pending = self:conversionInputMatchesFilter(input, output)
+    local outTarget = math.max(0,
+        math.floor((tonumber(output.expect) or tonumber(output.max) or 1) * batch))
+    -- Unordered IO streams the output with the input as it arrives; the other modes
+    -- wait for the whole batch of input before producing anything.
+    local target = 0
+    if required > 0 and done >= required then
+        target = outTarget
+    elseif processIoMode(def) == "unordered" and required > 0 then
+        target = math.floor(outTarget * done / required)
+    end
+    local produced = tonumber(inst.outProgress["1"]) or 0
+    if matched and target > produced then
+        inst.outProgress["1"] = target
+        produced = target
+    end
+    if not matched then
+        inst.state = "waiting"
+        inst.wait = { kind = "conversion" }
+        inst.lastError = pending
+            and self.Message.msg(self.Message.KEYS.RECIPE_ERR_CONVERSION_SCANNING,
+                { item = tostring(input.id) })
+            or self.Message.msg(self.Message.KEYS.RECIPE_ERR_CONVERSION_MISMATCH,
+                { filter = tostring(output.id), item = tostring(input.id) })
+        self.Cache:markDirty()
+        return
+    end
+    if produced >= outTarget and done >= required then
+        self:finishInstance(def, inst, now)
+        return
+    end
+    -- Still short of the full batch: park and let the planner top the input up.
+    inst.state = "waiting"
+    inst.wait = { kind = "materials" }
+    inst.lastError = nil
+    self:noteMaterialShortage(def, inst, now)
+end
+
+function Recipe:stepInstances(now)
+    local list = {}
+    for _, inst in pairs(self.Cache:instances()) do
+        list[#list + 1] = inst
+    end
+    if #list == 0 then
+        return 0
+    end
+    table.sort(list, function(a, b) return (tonumber(a.id) or 0) < (tonumber(b.id) or 0) end)
+    local stepped = 0
+    for _, inst in ipairs(list) do
+        self.stepInstance(self, inst, now)
+        stepped = stepped + 1
+    end
+    local stats = self.tickStats
+    if stats then
+        stats.active = stepped
+    end
+    return stepped
+end
+
+-- Interaction containers are only scanned while an active instance references
+-- them (plus the web manual tool's watch lease and the reconciliation escape).
+function Recipe:activeInstanceContainers()
+    local out = {}
+    local instances = self.Cache:instances()
+    if not instances then
+        return out
+    end
+    for _, inst in pairs(instances) do
+        local machineName = type(inst.machine) == "string" and inst.machine or nil
+        local machine = machineName and self.Store:get("machines", machineName) or nil
+        if machine then
+            for _, listKey in ipairs({ "itemInputs", "fluidInputs", "itemOutputs", "fluidOutputs" }) do
+                local kind = string.find(listKey, "^fluid") and "fluid" or "item"
+                for _, containerName in ipairs(machine[listKey] or {}) do
+                    local peripheralName = self.Containers:peripheralOf(containerName, kind)
+                    if peripheralName then
+                        out[peripheralName] = true
+                    end
+                end
+            end
+        end
+    end
+    return out
+end
+
+function Recipe:takeInstanceScanBurst()
+    local burst = self.instanceScanBurst == true
+    self.instanceScanBurst = nil
+    return burst
+end
+
+-- (tryCreateInstances is gone: Recipe:planTick decides and sends the instances,
+-- from the material ledger instead of from per-process counters.)
+
 function Recipe:maintain(now)
     now = now or os.epoch("utc")
     self.tickCount = (self.tickCount or 0) + 1
     self.lastTickAt = now
-    -- 每 10 秒丢弃一次外设包装缓存：外设被替换 / 区块重载后旧包装对象会失效，
-    -- 这样不用重启服务端也能自愈（否则 pushItems / list 可能一直静默失败）。
     if now - (self.wrapResetAt or 0) >= 10000 then
         self.wrapResetAt = now
         self.Peripherals:invalidate()
     end
-    --- 在飞搬运的记忆（见在飞搬运的记忆一节）：清掉过期的（worker 早已超时的那些）
-    self:sweepPendingMoves(now)
-    --- 输入容器：不再每轮扫一遍 —— 1.8.0 起由 inputScan 队列扫描成功后触发入库任务生成
-    --- （见 IFMMaster 的 afterScan → drainInputContainers(now, container)）。
-    -- 本轮的细分计数（慢步骤明细用）：真正读了几次外设（缓存命中不算）
     self.tickStats = {
         steps = 0, active = 0, processes = #self.Store:list("processes"), reads = 0, readMs = 0,
         readsAtStart = self.Containers.readCount or 0,
@@ -2346,7 +3307,92 @@ function Recipe:maintain(now)
     }
 end
 
---- 本轮结束：把容器读取计数收尾（主控在一次调度执行完成后调用）
+-- Stock keeping: the operator pins a target amount for a craftable material and the
+-- engine tops the storage up whenever it drops below that. The demand is injected
+-- through the same material ledger a manual "craft_resource" uses, so the planner
+-- treats it like any other request. keepPending remembers how much of the target is
+-- already on its way; without it every tick would ask for the full shortfall again
+-- while a slow producer is still catching up.
+function Recipe:maintainKeepStock(now)
+    now = now or os.epoch("utc")
+    local keep = {}
+    if self.Store and self.Store.keepSettings then
+        keep = self.Store:keepSettings()
+    end
+    self.keepPending = self.keepPending or {}
+    local stats = self.keepStats
+    if not stats then
+        stats = { targets = 0, requested = 0, satisfied = 0, pending = 0 }
+        self.keepStats = stats
+    end
+    stats.targets = 0
+    stats.requested = 0
+    stats.satisfied = 0
+    stats.pending = 0
+    if next(keep) == nil then
+        return 0
+    end
+    local index = self:craftIndex()
+    for key, amount in pairs(keep) do
+        if amount > 0 then
+            stats.targets = stats.targets + 1
+            local kind, name = tostring(key):match("^(%a+):(.*)$")
+            if not name or name == "" then
+                self.keepPending[key] = nil
+            elseif kind == "placeholder" then
+                -- A placeholder has no stock (always 0): its keep target is a rolling
+                -- demand on the material ledger, so the process that outputs it keeps
+                -- running while its output is consumed downstream. The ledger itself is
+                -- the "pending" amount here, so keepPending is not used.
+                local material = self:materialOfKey(key)
+                local outstanding = material
+                    and ((tonumber(material.queryCount) or 0) + (tonumber(material.craftingCount) or 0)) or 0
+                if outstanding < amount then
+                    local producers = index[key]
+                    if producers and #producers > 0 then
+                        local needed = amount - outstanding
+                        local ok = self:startResource(kind, name, needed)
+                        if ok then
+                            stats.requested = stats.requested + needed
+                        end
+                    end
+                else
+                    stats.satisfied = stats.satisfied + 1
+                end
+                self.keepPending[key] = nil
+            else
+                local stock = self:visibleStock({ kind = kind, id = name })
+                if stock >= amount then
+                    self.keepPending[key] = nil
+                    stats.satisfied = stats.satisfied + 1
+                else
+                    local need = amount - stock
+                    local pending = tonumber(self.keepPending[key]) or 0
+                    if pending > need then
+                        pending = need
+                    end
+                    local deficit = need - pending
+                    if deficit > 0 then
+                        local producers = index[kind .. ":" .. name]
+                        if producers and #producers > 0 then
+                            local ok = self:startResource(kind, name, deficit)
+                            if ok then
+                                pending = pending + deficit
+                                stats.requested = stats.requested + deficit
+                            end
+                        end
+                    end
+                    self.keepPending[key] = pending
+                    stats.pending = stats.pending + pending
+                end
+            end
+        else
+            self.keepPending[key] = nil
+        end
+    end
+    return stats.requested
+end
+
 function Recipe:finishTick()
     local stats = self.tickStats
     if not stats then
@@ -2356,128 +3402,35 @@ function Recipe:finishTick()
     stats.readMs = (self.Containers.readMsTotal or 0) - (stats.readMsAtStart or 0)
 end
 
---- 流程队列的一条任务 = 一个进程推进一步。
---- 这个流程现在"有事可做"吗（批次 / 用户下单 / 下游需求任一 > 0）。
---- 空闲流程不要进流程队列 —— 生成器与流程队列的 run 都用这一个判断，
---- 免得"没事可做"的流程每轮白占一个时间片。
-function Recipe:hasPendingWork(record)
-    if type(record) ~= "table" then
-        return false
-    end
-    return (tonumber(record.batch) or 0) > 0 or (tonumber(record.userCount) or 0) > 0 or
-        (tonumber(record.downstreamCount) or 0) > 0
-end
 
---- 一步的定义：一次材料输入 / 产物抽出调用算一步，无论它是否搬满了
---- 需要的数量 —— 调用完就让位（回队列尾），否则机器还在合成时这个进程会一直卡着等产物抽取。
---- 返回 true = 还没结束（调度器把它放回队尾）；false = 没事可做了（出队）。
-function Recipe:stepProcessOnce(name, now)
-    local process = self.Store:get("processes", name)
-    if not process then
-        return false                        -- 定义被删了：任务出队
-    end
-    local record = self:record(name)
-    --- 空闲（没有批次 / 下单 / 下游需求）→ 立刻出队：不推进、也不消耗时间片。
-    --- 编码规范（用户第 1 项）：这属于未定义行为（生成器只该把"有事可做"的流程排进队列），
-    --- 所以必须报错并计数，而不是静默出队 —— 否则出了 bug 谁也看不见。
-    if not self:hasPendingWork(record) or self:idleRecord(record) then
-        self.guardCounters = self.guardCounters or {}
-        self.guardCounters.idleProcessInQueue = (self.guardCounters.idleProcessInQueue or 0) + 1
-        self.log("[IFM] BUG: idle process %s was in the process queue (state=%s) - the generator must not enqueue it",
-            tostring(name), tostring(record and record.state))
-        if record.state ~= "idle" then
-            -- 上一批刚跑完：把残留的运行态清干净（网页那边也才会把这一行移除）
-            record.state = "idle"
-            record.phase = "input"
-            record.progress = nil
-            record.current = nil
-            record.wait = nil
-            self.Cache:markDirty()
-        end
-        return false
-    end
-    local stats = self.tickStats
-    if stats then
-        stats.active = stats.active + 1
-        stats.steps = stats.steps + 1
-    end
-    local ok, err = pcall(self.stepProcess, self, process, now)
-    if not ok then
-        record = self:record(name)
-        record.lastError = tostring(err)
-        self.log("Process %s failed: %s", tostring(name), tostring(err))
-        self.Cache:markDirty()
-    end
-    record = self:record(name)
-    return not self:idleRecord(record)      -- 还有事 → 回队尾
-end
 
---- 把所有"有事可做但还没在流程队列里"的流程补进队列（调度器的生成器每轮调用一次）。
---- 队列本身是 FIFO + 出队才回队：同一个进程不会在队列里出现两次；
---- dispatch:isQueued 只是兜底（例如用户在它排队时又点了一次合成）。
-function Recipe:enqueueActiveProcesses(dispatch)
-    if not dispatch then
-        return 0
-    end
-    local added = 0
-    for _, process in ipairs(self.Store:list("processes")) do
-        local record = self.Cache.data.processes and self.Cache.data.processes[process.name]
-        if record then
-            --- 空闲流程（没有批次 / 下单 / 下游需求）不进队列
-            local pending = self:hasPendingWork(record)
-            if not pending then
-                -- 没有任何待办（批次 / 用户下单 / 上游需求都是 0）：清掉残留运行态
-                -- （旧实现是在"每 tick 遍历所有流程"里做这件事，现在由这个生成器负责）
-                if record.state ~= "idle" or record.wait ~= nil or record.progress ~= nil or
-                    record.current ~= nil or record.pulse ~= nil then
-                    record.state = "idle"
-                    record.phase = "input"
-                    record.progress = nil
-                    record.current = nil
-                    record.wait = nil
-                    record.pulse = nil
-                    record.outProgress = nil
-                    self.Cache:markDirty()
-                end
-            elseif not dispatch:isQueued("process", process.name) then
-                if dispatch:enqueue("process", { key = process.name, name = process.name }) then
-                    added = added + 1
-                end
-            end
-        end
-    end
-    return added
-end
 
---- 兼容入口（诊断 / 旧调用方）：维护 + 待发送队列 + 整理。
---- 1.7.0 起流程推进走调度器的流程队列（见 stepProcessOnce / enqueueActiveProcesses）。
+-- The instance pipeline of the tick: step what is running and deliver. The
+-- *planning* part (who owes how many rounds, what is short) runs as
+-- Recipe:planTick before the task scheduler - see IFMMaster.masterTick.
 function Recipe:tick(now)
     now = now or os.epoch("utc")
     self:maintain(now)
-    local okDeliver, errDeliver = pcall(self.processDeliveries, self, now)
-    if not okDeliver then
-        self.log("Delivery queue error: %s", tostring(errDeliver))
-    end
-    local okCompact, errCompact = pcall(self.stepCompact, self, now)
-    if not okCompact then
-        -- 整理出错就直接放弃这一次任务（下次网页再点一次即可），别让异常每 tick 重复抛
-        self.compact = nil
-        self.log("Storage compact error: %s", tostring(errCompact))
-    end
+    self.stepInstances(self, now)
+    self.processDeliveries(self, now)
     self:finishTick()
 end
 
---- 最近一次 tick 的明细文本（主控的慢步骤日志会带上它：一眼看出慢在“推进流程”还是“扫描容器”）
 function Recipe:tickStatsText()
     local stats = self.tickStats or {}
     local scan = self.Containers.scanSummary and self.Containers:scanSummary() or {}
+    local plan = self.planStats or {}
     return string.format(
-        "active=%d/%d steps=%d containerReads=%d readMs=%dms | containers=%s readCost=%sms passCost=%sms scanTtl=%sms defer=%s",
+        "active=%d/%d steps=%d containerReads=%d readMs=%dms | materials=%d planNeed=%d created=%d | " ..
+        "containers=%s readCost=%sms passCost=%sms scanTtl=%sms defer=%s",
         tonumber(stats.active) or 0,
         tonumber(stats.processes) or 0,
         tonumber(stats.steps) or 0,
         tonumber(stats.reads) or 0,
         tonumber(stats.readMs) or 0,
+        tonumber(plan.materials) or 0,
+        tonumber(plan.need) or 0,
+        tonumber(plan.created) or 0,
         tostring(scan.containers or "?"),
         tostring(scan.readCost or "?"),
         tostring(scan.passCost or "?"),
@@ -2485,7 +3438,6 @@ function Recipe:tickStatsText()
         tostring(scan.defer or 0))
 end
 
---- 清理已被删除定义的残留运行态
 function Recipe:reconcile()
     local processNames = {}
     for _, process in ipairs(self.Store:list("processes")) do
@@ -2509,54 +3461,91 @@ function Recipe:reconcile()
     end
 end
 
---- 存储容器中某资源的数量（过滤器按符合的物品个数 + 流体 mB 之和）
-function Recipe:storageCount(kind, name)
+function Recipe:storageCount(kind, name, nbt)
     if kind == "filter" then
         return self.Containers:filterCount(name)
     end
-    local total = self.Containers:countOf({ kind = kind, id = name }, "storage")
+    local spec = { kind = kind, id = name }
+    if nbt ~= nil and nbt ~= "" then
+        spec.nbt = nbt
+        spec.ignoreNbt = false
+    end
+    return self.Containers:countOf(spec, "storage")
+end
+
+-- Pre-batch storage content of one output element. Concrete items/fluids are
+-- stored per resource name, but a filter matches many of them, so its baseline
+-- has to be summed over every matching entry - otherwise the whole pre-existing
+-- matching stock would look like output of this batch. It is computed once per
+-- element when the batch starts (prepareOutputs) and frozen onto the element,
+-- because the filter matcher is far too heavy to re-run on every panel push.
+function Recipe:baselineCountIn(baseline, kind, id)
+    if kind ~= "filter" then
+        return tonumber((baseline or {})[kind .. ":" .. tostring(id)]) or 0
+    end
+    local spec = { kind = "filter", id = id }
+    local total = 0
+    for key, count in pairs(baseline or {}) do
+        local entryKind, name = key:match("^([^:]+):(.*)$")
+        if name and (entryKind == "item" or entryKind == "fluid") then
+            if self.Filter:specMatches(spec, { kind = entryKind, name = name }) then
+                total = total + (tonumber(count) or 0)
+            end
+        end
+    end
     return total
 end
 
---- 存储容器里相对“本批基线”增加的数量：
---- 很多机器（例如 Create 搅拌盆 + 漏斗）会把产物直接吐进存储容器，机器输出容器里什么都没有，
---- 所以判断“产物是否到手”必须把存储增量也算上。
+function Recipe:storageBaselineCount(record, kind, id)
+    return self:baselineCountIn((record or {}).baseline, kind, id)
+end
+
 function Recipe:storageGain(spec, record)
     local baseline = (record.baseline or {})[spec.kind .. ":" .. spec.id] or 0
     return math.max(0, self:storageCount(spec.kind, spec.id) - baseline)
 end
 
---- 单个流程的产物进度（当前存储数目 / 目标数目）
 function Recipe:progressOf(record)
-    local batch = record.batch or 0
+    local batch = record.multiplier or record.batch or 0
     if batch <= 0 or record.phase ~= "output" then
         return {}
     end
-    local baseline = record.baseline or {}
     local out = {}
-    for _, entry in ipairs(record.target or {}) do
-        local key = entry.kind .. ":" .. entry.id
-        local current = self:storageCount(entry.kind, entry.id)
-        local produced = math.max(0, current - (baseline[key] or 0))
+    for index, entry in ipairs(record.target or {}) do
+        -- Same source as the ledger: only what the extraction moves reported. The
+        -- storage content is deliberately not consulted here either.
+        local produced = math.max(0, math.floor(tonumber((record.outProgress or {})[tostring(index)]) or 0))
+        -- The bar shows this batch's own output against the expected yield
+        -- (expect x batch), not against how much the element may extract at
+        -- most - max is the extraction cap, so a full bar there would mean
+        -- "nothing left to take", not "expected amount reached".
+        local expected = tonumber(entry.expect) or tonumber(entry.target) or 0
         local percent = 1
-        if (entry.target or 0) > 0 then
-            percent = math.min(1, produced / entry.target)
+        if expected > 0 then
+            percent = math.min(1, produced / expected)
         end
         out[#out + 1] = {
             kind = entry.kind,
             id = entry.id,
-            current = current,
+            -- Legacy alias: the progress bar reads "current" as a fallback only.
+            current = produced,
             produced = produced,
+            -- target = max x batch (bar scale), min/expected are the two tick marks.
             target = entry.target,
+            min = tonumber(entry.min) or 0,
+            expected = expected,
             percent = percent,
         }
     end
     return out
 end
 
---- 当前正在处理/等待的元素（给网页显示“正在发送 xxx / 正在抽取 xxx / 等待…”用）
 function Recipe:currentElement(process, record)
-    local index = tonumber(record.index) or 1
+    local batch = self.Assert.count(record.multiplier or record.batch, "record.multiplier")
+    if batch < 1 then
+        return nil
+    end
+    local index = self:indexOf(record)
     local isOutput = record.phase == "output"
     local list = isOutput and (process.outputs or {}) or (process.inputs or {})
     local element = list[index]
@@ -2564,7 +3553,6 @@ function Recipe:currentElement(process, record)
         return nil
     end
     local key = tostring(index)
-    local batch = math.max(1, tonumber(record.batch) or 1)
     local entry = {
         phase = isOutput and "output" or "input",
         kind = element.kind,
@@ -2577,9 +3565,14 @@ function Recipe:currentElement(process, record)
             entry.done = (record.outProgress or {})[key] or 0
             entry.min = (tonumber(element.min) or 0) * batch
             entry.target = (tonumber(element.max) or 0) * batch
+            entry.expect = (tonumber(element.expect) or tonumber(element.max) or 0) * batch
         else
             entry.done = (record.progress or {})[key] or 0
-            entry.target = (tonumber(element.count) or 0) * batch
+            -- elementDemand honours the "catalyst" flag: a catalyst input keeps its
+            -- fixed count instead of being scaled by the batch.
+            entry.target = elementDemand(element, batch)
+            entry.catalyst = element.catalyst == true
+            entry.skip = element.skip == true
         end
     elseif element.kind == "placeholder" then
         entry.id = element.item
@@ -2590,213 +3583,148 @@ function Recipe:currentElement(process, record)
         entry.threshold = tonumber(element.threshold) or 0
         entry.op = element.op or "ge"
         entry.strength = tonumber(element.strength) or 0
-        -- 只引用机器定义的信号序号（全局“红石信号序号”已移除；默认 1）
         entry.machineSignalIndex = tonumber(element.machineSignalIndex) or 1
     end
     return entry
 end
 
---- 当前批次里“正在合成”的份数（材料已送达机器、还没出货的那些）：
----   * 每个材料输入元素有“每份需要多少个”（element.count），已送达数量 / 该比值 = 这一元素够做几份；
----     取所有输入里的最小值（任一材料不够就做不出那么多份），再按当前批次数封顶；
----   * 没有材料输入的流程（纯等待 / 红石等待）算整批都在合成；
----   * 用途：网页流程依赖图的材料节点上显示「正在合成 / 剩余目标」（用户第 11 项要求）。
-function Recipe:activeUnits(process, record)
-    local batch = tonumber(record and record.batch) or 0
-    if batch <= 0 then
-        return 0
-    end
-    local progress = (record and record.progress) or {}
-    local units = nil
-    for index, element in ipairs(process.inputs or {}) do
-        if element.kind == "item" or element.kind == "fluid" or element.kind == "filter" then
-            local each = tonumber(element.count) or 0
-            if each > 0 then
-                local transferred = tonumber(progress[tostring(index)]) or 0
-                local covered = math.floor(transferred / each)
-                if units == nil or covered < units then
-                    units = covered
-                end
-            end
+-- (activeUnits is gone: the rounds a process is working on are the sum of the
+-- multipliers of its live instances, which is what planTick keeps in activeCount.)
+function Recipe:instancesOf(owner)
+    local out = {}
+    for key, inst in pairs(self.Cache:instances()) do
+        if inst.owner == owner then
+            out[#out + 1] = inst
         end
     end
-    if units == nil then
-        units = batch
-    end
-    return math.max(0, math.min(batch, units))
+    table.sort(out, function(a, b) return (tonumber(a.id) or 0) < (tonumber(b.id) or 0) end)
+    return out
 end
 
---- ===== 输入容器（role = "input"）=====
---- 用途（用户第 13 项要求）：把外设设成“输入容器”后，IFM 会像扫描存储容器一样定期扫它，
---- 一旦里面有东西就搬进存储容器 —— 这样人工/上游丢进去的料会自动进入存储系统，
---- 参与库存统计与后续合成，不需要手动开容器工具搬。
---- 1.7.0：输入容器卸货不再有毫秒间隔与"每轮最多 N 次"的硬上限：
---- 每个调度轮次看一遍输入容器的快照（扫描由 inputScan 队列负责），有货就提交入库任务
---- （进 inventoryIn 队列；重复提交由 Containers.moveInflight 去重），pending 时下轮继续。
+-- (hasAccounting is gone: the panel decides from the material ledger rows and the
+-- live instances whether a process row is worth showing.)
 
-function Recipe:drainInputContainers(now, onlyPeripheral)
-    now = now or os.epoch("utc")
-    self.inputDrain = self.inputDrain or { items = 0, fluids = 0, lastAt = 0, lastLogAt = 0 }
-    local state = self.inputDrain
-    --- 1.7.0：不再有"每 INPUT_DRAIN_INTERVAL 毫秒扫一轮"的硬间隔 —— 输入容器的内容由
-    --- inputScan 队列扫（扫描成功时才调用本函数，见 IFMMaster 的 afterScan），有货就提交入库任务
-    --- （重复提交会被 moveInflight 去重），因此"投料 → 入库"的延迟只取决于队列轮转。
-    state.lastAt = now
-    local sources = {
-        item = self.Containers:byRole("input", "item"),
-        fluid = self.Containers:byRole("input", "fluid"),
-    }
-    --- onlyPeripheral（1.8.0）：只处理刚刚扫到的那个输入容器（扫描成功触发的入库任务）。
-    --- byRole 返回的是**容器名**，所以容器名与外设名都对一下。
-    if onlyPeripheral then
-        local function keepOnly(list, kind)
-            local out = {}
-            for _, name in ipairs(list) do
-                if name == onlyPeripheral or
-                    self.Containers:peripheralOf(name, kind) == onlyPeripheral then
-                    out[#out + 1] = name
-                end
-            end
-            return out
-        end
-        sources.item = keepOnly(sources.item, "item")
-        sources.fluid = keepOnly(sources.fluid, "fluid")
-    end
-    if #sources.item == 0 and #sources.fluid == 0 then
-        return 0
-    end
-    local targets = {
-        item = self.Containers:byRole("storage", "item", "out"),
-        fluid = self.Containers:byRole("storage", "fluid", "out"),
-    }
-    local ops = 0
-    local movedItems = 0
-    local movedFluids = 0
-    local pending = false
-    --- 用户第 4 项：输入容器里同时有好几格东西时，一轮里**能提交的搬运全部提交**（并行）。
-    --- 以前是"第一条交给 worker（err = pending）就 return"，于是每个扫描周期只搬走一格 ——
-    --- 现场看就是"输入容器里的东西没有被并行搬走"。上限只用于防止一次塞爆队列；
-    --- 去重与源槽位预留由 Containers:pushItem / reserveOut 负责（同一格不会被提交两次）。
-    local INPUT_DRAIN_MAX_MOVES = 32
-    local submitted = 0
-
-    local function drainItems()
-        if #targets.item == 0 then
-            return
-        end
-        for _, source in ipairs(sources.item) do
-            if submitted >= INPUT_DRAIN_MAX_MOVES then
-                return
-            end
-            for _, stack in ipairs(self.Containers:orderStacks(self.Containers:stacks(source),
-                self.Containers.ORDER_FRAGMENT)) do
-                if submitted >= INPUT_DRAIN_MAX_MOVES then
-                    return
-                end
-                local amount = tonumber(stack.count) or 0
-                if amount > 0 then
-                    for _, target in ipairs(targets.item) do
-                        local got, err = self.Containers:pushItem(source, stack.slot, amount, target, nil,
-                            --- 输入容器 → 存储容器：先并入同类槽位，少留碎片（1.6.11）
-                            self.Containers.INSERT_LEAST, "inventoryIn")
-                        if err == "pending" then
-                            --- 这一格已经交给 worker / 本机池了：继续排下一格（不再中断整轮）
-                            pending = true
-                            submitted = submitted + 1
-                            break
-                        end
-                        got = tonumber(got) or 0
-                        if got > 0 then
-                            self.Containers:invalidate()
-                            state.items = (state.items or 0) + got
-                            movedItems = movedItems + got
-                            ops = ops + 1
-                            break
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    local function drainFluids()
-        if #targets.fluid == 0 then
-            return
-        end
-        for _, source in ipairs(sources.fluid) do
-            if submitted >= INPUT_DRAIN_MAX_MOVES then
-                return
-            end
-            for _, tank in ipairs(self.Containers:tanks(source)) do
-                if submitted >= INPUT_DRAIN_MAX_MOVES then
-                    return
-                end
-                local amount = tonumber(tank.amount) or 0
-                if amount > 0 then
-                    for _, target in ipairs(targets.fluid) do
-                        local got, err = self.Containers:pushFluid(source, amount, tank.name, target, "inventoryIn")
-                        if err == "pending" then
-                            --- 同一个道理（用户第 4 项）：继续排下一罐，不再中断整轮
-                            pending = true
-                            submitted = submitted + 1
-                            break
-                        end
-                        got = tonumber(got) or 0
-                        if got > 0 then
-                            self.Containers:invalidate()
-                            state.fluids = (state.fluids or 0) + got
-                            movedFluids = movedFluids + got
-                            ops = ops + 1
-                            break
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    drainItems()
-    drainFluids()
-    local moved = movedItems + movedFluids
-    if moved > 0 and now - (state.lastLogAt or 0) >= 30000 then
-        state.lastLogAt = now
-        self.log("Input containers drained: %d item(s) / %d mB fluid moved into storage (totals %d / %d)",
-            movedItems, movedFluids, state.items or 0, state.fluids or 0)
-    end
-    return moved
-end
-
---- 流程运行态（推送给网页）
---- 只下发有事可做的流程（idle 的不下发，也不创建记录）：系统里大多数流程大多数时间都是空闲的，
---- 之前每个 tick 都把它们推一遍，既浪费带宽也让浏览器白重画。
+-- One row per process that has something to show: a live instance, owed rounds or
+-- a ledger row of one of its products. `userCount` / `downstreamCount` /
+-- `craftingCount` are the ledger of that process' products summed up; they stay
+-- next to the new `needCount` / `activeCount` / `materials` fields so a web panel
+-- written before this refactor still renders (P3 switches the UI over).
 function Recipe:runtime()
     local out = {}
+    local materials = self.Cache:materials()
+    local actives = self.Cache:activeProcesses()
     for _, process in ipairs(self.Store:list("processes")) do
-        local record = self.Cache.data.processes and self.Cache.data.processes[process.name]
-        if record and not self:idleRecord(record) then
+        local record = self:record(process.name)
+        local instances = record and self:instancesOf(process.name) or {}
+        local entry = actives[process.name]
+        local needCount = entry and (tonumber(entry.needCount) or 0) or 0
+        local activeCount = entry and (tonumber(entry.activeCount) or 0) or 0
+        local rows, queryCount, automateCount, craftingCount = {}, 0, 0, 0
+        for _, output in ipairs(process.outputs or {}) do
+            for _, key in ipairs(self:materialKeysOfOutput(output)) do
+                local material = materials[key]
+                if material then
+                    local query = tonumber(material.queryCount) or 0
+                    local automate = tonumber(material.automateCount) or 0
+                    local crafting = tonumber(material.craftingCount) or 0
+                    queryCount = queryCount + query
+                    automateCount = automateCount + automate
+                    craftingCount = craftingCount + crafting
+                    rows[#rows + 1] = {
+                        key = material.key,
+                        kind = material.kind,
+                        id = material.id,
+                        queryCount = query,
+                        automateCount = automate,
+                        craftingCount = crafting,
+                    }
+                end
+            end
+        end
+        if record and (#instances > 0 or needCount > 0 or #rows > 0) then
+            local first = instances[1]
+            -- One row per live instance: the web panel lists them under the
+            -- process row (each with its own abort button), so the detailed
+            -- fields have to travel with the snapshot instead of only the first
+            -- instance being described.
+            local instanceList = {}
+            for _, inst in ipairs(instances) do
+                instanceList[#instanceList + 1] = {
+                    id = inst.id,
+                    machine = inst.machine,
+                    multiplier = tonumber(inst.multiplier) or 0,
+                    phase = inst.phase or "input",
+                    state = inst.state or "running",
+                    waitKind = inst.wait and inst.wait.kind or nil,
+                    lastError = inst.lastError,
+                    startedAt = inst.startedAt,
+                    current = self:currentElement(inst.def, inst),
+                    progress = self:progressOf(inst),
+                }
+            end
+            -- The process row is the summary of its instances: its progress bars are the
+            -- sums of the instance bars (one bar per product, so the products of several
+            -- instances end up in the same bar) and its batch figure is how many rounds
+            -- all live instances together are working on. Only an instance that reached
+            -- its output phase has progress at all (progressOf reports nothing before),
+            -- so the bars appear as soon as the first batch produces.
+            local batchTotal = 0
+            for _, inst in ipairs(instances) do
+                batchTotal = batchTotal + math.max(1, math.floor(tonumber(inst.multiplier) or 1))
+            end
+            local progress, progressAt = {}, {}
+            for _, entry in ipairs(instanceList) do
+                for _, bar in ipairs(entry.progress or {}) do
+                    local key = tostring(bar.kind) .. "\1" .. tostring(bar.id)
+                    local row = progressAt[key]
+                    if not row then
+                        row = { kind = bar.kind, id = bar.id, target = bar.target,
+                            produced = 0, expected = 0, min = 0, percent = 1 }
+                        progressAt[key] = row
+                        progress[#progress + 1] = row
+                    end
+                    row.produced = row.produced + (tonumber(bar.produced) or 0)
+                    row.expected = row.expected + (tonumber(bar.expected) or 0)
+                    row.min = row.min + (tonumber(bar.min) or 0)
+                end
+            end
+            for _, row in ipairs(progress) do
+                -- Legacy alias: the progress bar reads "current" as a fallback only.
+                row.current = row.produced
+                row.percent = row.expected > 0 and math.min(1, row.produced / row.expected) or 1
+            end
             out[#out + 1] = {
                 name = process.name,
                 state = record.state or "idle",
-                phase = record.phase or "input",
-                batch = record.batch or 0,
+                phase = first and first.phase or "input",
+                batch = batchTotal,
                 maxMultiplier = math.max(1, tonumber(process.maxMultiplier) or 1),
-                userCount = record.userCount or 0,
-                downstreamCount = record.downstreamCount or 0,
-                remaining = (record.userCount or 0) + (record.downstreamCount or 0),
-                --- 正在合成的份数（材料已送到机器的那部分）：材料节点显示「active/remaining」
-                active = self:activeUnits(process, record),
-                machine = record.machine,
+                needCount = needCount,
+                activeCount = activeCount,
+                remaining = math.max(0, needCount - activeCount),
+                materials = rows,
+                -- Compatibility names for a panel from before the refactor.
+                userCount = queryCount,
+                downstreamCount = automateCount,
+                craftingCount = craftingCount,
+                active = activeCount,
+                instances = #instances,
+                -- A single instance: describe that one (its machine, its current step).
+                -- Several: the row stays a summary - those details belong to the instance
+                -- rows, which the panel lists under the process row.
+                machine = #instances == 1 and first.machine or nil,
+                machines = #instances,
                 lastError = record.lastError,
                 waitKind = record.wait and record.wait.kind or nil,
-                current = self:currentElement(process, record),
-                progress = self:progressOf(record),
+                current = #instances == 1 and self:currentElement(first.def, first) or nil,
+                progress = progress,
+                instanceList = instanceList,
             }
         end
     end
     return out
 end
 
---- 可以产出该资源的全部流程名（不含抽象模板：模板带虚操作，只能用于复制流程设置）
 function Recipe:producers(kind, name)
     local out = {}
     for _, process in ipairs(self.Store:list("processes")) do
@@ -2812,10 +3740,6 @@ function Recipe:producers(kind, name)
     return out
 end
 
---- 只被“抽象模板”（含虚操作）产出的资源：返回那个模板的名字 —— 下单时用它给出具体原因，
---- 而不是笼统地说“没有可以产出该资源的流程”（模板本来就不能合成）。
---- 只被抽象流程"产出"的资源（含 abstract 操作的流程）：用它给出更准确的错误提示
---- （"抽象流程不能用于合成"，而不是笼统的"没有流程能产出"）
 function Recipe:abstractProducer(kind, name)
     for _, process in ipairs(self.Store:list("processes")) do
         if self:isAbstract(process) then
@@ -2829,7 +3753,6 @@ function Recipe:abstractProducer(kind, name)
     return nil
 end
 
---- 某个流程的某个产物每批产出多少（“想要 N 个产物”换算成“要跑几批”用）
 function Recipe:outputPerBatch(process, kind, name)
     if not process then
         return 1
@@ -2847,155 +3770,119 @@ function Recipe:outputPerBatch(process, kind, name)
     return 1
 end
 
---- 网页 + 号：按资源启动合成（可指定流程名）
---- 说明：count 是想要的产物数量（不是批次数），这里按“每批产出”换算批次数
+-- A user request: "make `count` of that material". It goes straight to the
+-- material ledger - which process makes it, and how many rounds that is, is the
+-- planning engine's business. `processName` is accepted and ignored: the old
+-- panel let the operator pin a producer, the ledger does not.
 function Recipe:startResource(kind, name, count, processName)
     count = math.max(1, math.floor(tonumber(count) or 1))
-    if not processName then
-        local best = nil
-        local bestScore = nil
-        for _, candidate in ipairs(self:producers(kind, name)) do
-            local process = self.Store:get("processes", candidate)
-            if process then
-                local record = self:record(candidate)
-                local score = record.state == "missing" and 0 or 1000
-                for _, output in ipairs(process.outputs or {}) do
-                    if self:outputMatchesInput(output, { kind = kind, id = name }) then
-                        local priority = tonumber(output.priority) or 0
-                        if priority > score then
-                            score = priority
-                        end
-                    end
-                end
-                if bestScore == nil or score > bestScore then
-                    best = candidate
-                    bestScore = score
-                end
-            end
-        end
-        processName = best
+    kind = tostring(kind or "item")
+    name = tostring(name or "")
+    -- A placeholder is a valid request target: its producer key exists in the craft
+    -- index ("placeholder:<name>"), and stock keeping uses it to keep the producing
+    -- process running (see Recipe:maintainKeepStock).
+    if name == "" then
+        return false, self.Message.msg(self.Message.KEYS.RECIPE_ERR_NO_PRODUCER_PROCESS)
     end
-    if not processName then
-        -- 只有抽象流程（含 abstract 操作）能产出它：直接说清为什么不能合成，比"没有流程"好定位
+    local key = kind .. ":" .. name
+    local producers = self:craftIndex()[key]
+    if producers == nil or #producers == 0 then
         if self:abstractProducer(kind, name) then
-            return false, ABSTRACT_MESSAGE
+            return false, self.Message.msg(self.Message.KEYS.RECIPE_ERR_ABSTRACT_PROCESS)
         end
-        return false, "\\u6CA1\\u6709\\u53EF\\u4EE5\\u4EA7\\u51FA\\u8BE5\\u8D44\\u6E90\\u7684\\u6D41\\u7A0B"
+        return false, self.Message.msg(self.Message.KEYS.RECIPE_ERR_NO_PRODUCER_PROCESS)
     end
-    local process = self.Store:get("processes", processName)
-    local perBatch = self:outputPerBatch(process, kind, name)
-    local batches = math.max(1, math.ceil(count / perBatch))
-    local ok, info = self:start(processName, batches)
-    if not ok then
-        return false, info
+    local material = self:materialOfKey(key)
+    if not material then
+        return false, self.Message.msg(self.Message.KEYS.RECIPE_ERR_NO_PRODUCER_PROCESS)
     end
+    material.queryCount = (tonumber(material.queryCount) or 0) + count
+    material.updatedAt = os.epoch("utc")
+    self.Cache:markDirty()
+    self.log("[debug] request %s +%d -> queryCount=%d producers=%d caller=%s", key, count,
+        material.queryCount, #producers, callerOf(2))
     return true, {
-        process = processName,
-        userCount = info.userCount,
         kind = kind,
         name = name,
         count = count,
-        perBatch = perBatch,
-        batches = batches,
+        queryCount = material.queryCount,
+        producers = #producers,
     }
 end
 
---- 追加用户合成次数
-function Recipe:start(processName, count)
-    local process = self.Store:get("processes", processName)
-    if not process then
-        return false, "\\u6D41\\u7A0B " .. tostring(processName) .. " \\u4E0D\\u5B58\\u5728"
-    end
-    if self:isAbstract(process) then
-        -- 抽象流程只用于"流程设置复制"：它的 abstract 操作不对应任何真实资源
-        return false, ABSTRACT_MESSAGE
-    end
-    count = math.max(1, math.floor(tonumber(count) or 1))
-    local record = self:record(processName)
-    record.userCount = (record.userCount or 0) + count
-    if record.state == "missing" and (record.batch or 0) <= 0 then
-        record.state = "idle"
-        record.wait = nil
-    end
-    self.Cache:markDirty()
-    return true, {
-        process = processName,
-        userCount = record.userCount,
-        downstreamCount = record.downstreamCount or 0,
-    }
-end
+-- (start / setUserCount are gone together with the "make N batches of that
+-- process" actions: a request is always made for a *material*, see
+-- Recipe:startResource.)
 
---- 直接设定用户合成次数
-function Recipe:setUserCount(processName, count)
-    local process = self.Store:get("processes", processName)
-    if not process then
-        return false, "\\u6D41\\u7A0B " .. tostring(processName) .. " \\u4E0D\\u5B58\\u5728"
-    end
-    if self:isAbstract(process) then
-        return false, ABSTRACT_MESSAGE
-    end
-    count = math.max(0, math.floor(tonumber(count) or 0))
-    local record = self:record(processName)
-    record.userCount = count
-    self.Cache:markDirty()
-    return true, { process = processName, userCount = record.userCount }
-end
-
---- 取消流程（清空计数并释放机器并行位）
+-- "Abort process": stop every instance of it and drop the user request of its
+-- products. The automatic demand is left alone - what the processes below need is
+-- their business, and the engine keeps feeding them.
 function Recipe:cancel(processName)
     local process = self.Store:get("processes", processName)
     if not process then
-        return false, "\\u6D41\\u7A0B " .. tostring(processName) .. " \\u4E0D\\u5B58\\u5728"
+        return false, self.Message.msg(self.Message.KEYS.RECIPE_ERR_PROCESS_MISSING, { name = tostring(processName) })
     end
     local record = self:record(processName)
-    if record.machine then
-        self:occupyMachine(record.machine, -1)
+    local killed = 0
+    local ids = {}
+    for key in pairs(self.Cache:instances()) do
+        ids[#ids + 1] = key
+    end
+    table.sort(ids)
+    for _, key in ipairs(ids) do
+        local inst = self.Cache:instances()[key]
+        if inst and inst.owner == processName then
+            killed = killed + 1
+            self:killInstance(inst, "cancelled")
+        end
     end
     record.state = "idle"
-    record.batch = 0
-    record.userCount = 0
-    record.downstreamCount = 0
-    record.machine = nil
     record.wait = nil
-    record.phase = "input"
-    record.index = 1
-    record.progress = {}
-    record.outProgress = {}
-    --- 取消流程：它的在飞搬运记忆一并清掉（下一次重新开始会重新扫源）
+    record.lastError = nil
+    record.pulse = nil
     self:forgetPendingMovesWithPrefix("in:" .. tostring(process.name) .. "\1")
     self:forgetPendingMovesWithPrefix("out:" .. tostring(process.name) .. "\1")
-    -- 取消时把还没跑完的红石脉冲复位（否则中继器会一直停在通电状态）
     if record.pulse then
         self:switchSignals(record.pulse.targets, 0)
         record.pulse = nil
     end
-    -- 取消时把对外请求一并撤销（含上游的下游计数），上游才能真正停下来
-    for key in pairs(record.requests or {}) do
-        self:clearRequest(record, key)
+    -- Every product of this process loses its user request. The ledger row itself
+    -- is dropped by the engine once nothing is left in it.
+    local cleared = 0
+    for _, output in ipairs(process.outputs or {}) do
+        for _, key in ipairs(self:materialKeysOfOutput(output)) do
+            local material = self.Cache:materialByKey(key)
+            if material and (tonumber(material.queryCount) or 0) > 0 then
+                material.queryCount = 0
+                material.updatedAt = os.epoch("utc")
+                cleared = cleared + 1
+            end
+        end
     end
-    record.requests = {}
-    record.lastError = nil
+    self.Cache:dropActiveProcess(processName)
     self.Cache:markDirty()
-    return true, { canceled = processName }
+    self.log("Process %s: cancelled (%d instance(s) killed, %d request row(s) cleared)",
+        tostring(processName), killed, cleared)
+    return true, { canceled = processName, instances = killed, cleared = cleared }
 end
 
---- 排队发送：把存储容器中已有的资源送到 output 容器。
---- 资源种类可以是 item / fluid / filter；容器种类按目标容器定义自己的种类判定。
-function Recipe:queueSend(kind, name, count, containerName)
+function Recipe:queueSend(kind, name, count, containerName, nbt)
     local container = self.Store:findContainer(containerName, kind)
     if not container then
-        return false, "\\u5BB9\\u5668 " .. tostring(containerName) .. " \\u4E0D\\u5B58\\u5728"
+        return false, self.Message.msg(self.Message.KEYS.MASTER_ERR_CONTAINER_NOT_FOUND, { name = tostring(containerName) })
     end
     if container.role ~= "output" then
-        return false, "\\u53EA\\u80FD\\u53D1\\u9001\\u5230 output \\u89D2\\u8272\\u7684\\u5BB9\\u5668"
+        return false, self.Message.msg(self.Message.KEYS.MASTER_ERR_OUTPUT_ONLY)
     end
     if not self.Containers:supports(containerName, kind) then
-        return false, self.Containers:unusableReason(containerName, kind) or "\\u5BB9\\u5668\\u4E0D\\u53EF\\u7528"
+        return false, self.Containers:unusableReason(containerName, kind)
+            or self.Message.msg(self.Message.KEYS.MASTER_ERR_CONTAINER_UNUSABLE)
     end
     count = math.max(1, math.floor(tonumber(count) or 1))
     local entry = self:addDelivery({
         kind = kind,
         name = name,
+        nbt = nbt,
         container = container.name,
         containerKind = self.Util.kindOfDef(container),
         remaining = count,
@@ -3005,22 +3892,20 @@ function Recipe:queueSend(kind, name, count, containerName)
     return true, { id = entry.id, kind = kind, name = name, count = count, container = container.name }
 end
 
---- 排队发送 + 触发合成：已有的库存先发出去，只有缺的部分才交给流程合成，
---- 合成出的产物落进存储容器后由发送队列继续搬运到 output 容器。
-function Recipe:craftAndSend(kind, name, count, containerName)
+function Recipe:craftAndSend(kind, name, count, containerName, nbt)
     local container = self.Store:findContainer(containerName, kind)
     if not container then
-        return false, "\\u5BB9\\u5668 " .. tostring(containerName) .. " \\u4E0D\\u5B58\\u5728"
+        return false, self.Message.msg(self.Message.KEYS.MASTER_ERR_CONTAINER_NOT_FOUND, { name = tostring(containerName) })
     end
     if container.role ~= "output" then
-        return false, "\\u53EA\\u80FD\\u53D1\\u9001\\u5230 output \\u89D2\\u8272\\u7684\\u5BB9\\u5668"
+        return false, self.Message.msg(self.Message.KEYS.MASTER_ERR_OUTPUT_ONLY)
     end
     if not self.Containers:supports(containerName, kind) then
-        return false, self.Containers:unusableReason(containerName, kind) or "\\u5BB9\\u5668\\u4E0D\\u53EF\\u7528"
+        return false, self.Containers:unusableReason(containerName, kind)
+            or self.Message.msg(self.Message.KEYS.MASTER_ERR_CONTAINER_UNUSABLE)
     end
     count = math.max(1, math.floor(tonumber(count) or 1))
-    -- 已有库存先发；只把不足的部分交给流程（不要按全量下单，否则库存会被卡在“未发送”）
-    local available = self:storageCount(kind, name)
+    local available = self:storageCount(kind, name, nbt)
     local shortBy = math.max(0, count - available)
     local processName = nil
     if shortBy > 0 then
@@ -3034,6 +3919,7 @@ function Recipe:craftAndSend(kind, name, count, containerName)
     local entry = self:addDelivery({
         kind = kind,
         name = name,
+        nbt = nbt,
         container = container.name,
         containerKind = self.Util.kindOfDef(container),
         remaining = count,
@@ -3051,7 +3937,6 @@ function Recipe:craftAndSend(kind, name, count, containerName)
     }
 end
 
---- 待发送队列（推送给网页）
 function Recipe:deliveries()
     local out = {}
     for _, delivery in ipairs(self.Cache:deliveries()) do
@@ -3059,11 +3944,467 @@ function Recipe:deliveries()
             id = delivery.id,
             kind = delivery.kind,
             name = delivery.name,
+            nbt = delivery.nbt,
             remaining = delivery.remaining or 0,
             total = delivery.total or 0,
             container = delivery.container,
             processName = delivery.processName,
             lastError = delivery.lastError,
+        }
+    end
+    return out
+end
+
+-- ---------------------------------------------------------------------------
+-- The planning engine.
+--
+-- Every main loop tick walks the material ledger, which is the only place a
+-- demand lives now: user requests (queryCount), what the processes below still
+-- need once the stock is counted (automateCount) and what is being crafted right
+-- now (craftingCount). From that it derives how many rounds each producer owes
+-- (activeProcesses), sends the instances for them, pushes the demand it could not
+-- cover one level up, and drops whatever is empty. Instances are never cancelled
+-- because a demand moved: they run to their end, and finish / kill settle the
+-- ledger.
+-- ---------------------------------------------------------------------------
+
+-- A material ledger row, created on first use. `element` may be a process input
+-- element, an output element or a bare { kind = ..., id = ... } spec.
+function Recipe:ensureMaterial(element)
+    local key = self:materialKeyOfElement(element) or self:materialKeyOf(element)
+    local material = self.Cache:materialByKey(key)
+    if material then
+        return material
+    end
+    local kind, id = "item", ""
+    if type(element) == "table" then
+        kind = tostring(element.kind or "item")
+        id = tostring(element.kind == "placeholder" and element.name or element.id or "")
+    else
+        id = tostring(element or "")
+    end
+    material = self.Cache:material(kind, id, key)
+    material.updatedAt = os.epoch("utc")
+    return material
+end
+
+function Recipe:materialOfKey(key)
+    local material = self.Cache:materialByKey(key)
+    if material then
+        return material
+    end
+    local kind, id = tostring(key or ""):match("^(%a+):(.*)$")
+    if not kind then
+        return nil
+    end
+    return self.Cache:material(kind, id, key)
+end
+
+-- Every ledger key one output element stands for. A placeholder is both "that
+-- placeholder" and the concrete item it names, so a downstream process that asks
+-- for the item sees the batch that is being crafted for it.
+function Recipe:materialKeysOfOutput(output)
+    local keys = {}
+    if type(output) ~= "table" then
+        return keys
+    end
+    if output.kind == "placeholder" then
+        if output.name and output.name ~= "" then
+            keys[#keys + 1] = "placeholder:" .. output.name
+        end
+        if output.item and output.item ~= "" then
+            keys[#keys + 1] = "item:" .. output.item
+        end
+    elseif output.kind == "item" or output.kind == "fluid" or output.kind == "filter" then
+        keys[#keys + 1] = output.kind .. ":" .. tostring(output.id)
+    end
+    return keys
+end
+
+-- How much storage really holds of a material: deliberately the *visible* amount.
+-- A stack a live instance already claimed is still physically there, and that
+-- instance's demand is already gone from the ledger (it is running).
+function Recipe:visibleStock(material)
+    if material.kind == "item" or material.kind == "fluid" or material.kind == "filter" then
+        local spec = { kind = material.kind, id = material.id, ignoreNbt = true }
+        -- countOf returns (total, items, fluids). A call sitting in the last
+        -- argument slot expands to *all* of them, so the total has to be captured
+        -- first: tonumber(total, items, ...) would read the item list as its base
+        -- argument and crash with "bad argument (number expected, got table)".
+        -- Item/fluid specs take countOf's fast path and return one value, which is
+        -- why only filter materials used to break here.
+        local total = self.Containers:countOf(spec, "storage")
+        if type(total) ~= "number" then
+            total = 0
+        end
+        return math.max(0, math.floor(total))
+    end
+    -- A placeholder is not a resource of its own: it is covered by the item it
+    -- stands for, which has its own ledger row.
+    return 0
+end
+
+-- How many units one round of a process takes of an input element.
+function Recipe:perCraftUnits(element)
+    if type(element) ~= "table" then
+        return 0
+    end
+    if element.kind == "placeholder" then
+        return 1
+    end
+    return math.max(0, math.floor(tonumber(element.count) or 0))
+end
+
+-- How many rounds the machines of a process type can hold at once: the parallel
+-- slots of every machine of that type, times what one round may scale to.
+function Recipe:parallelCap(process)
+    local parallel = 0
+    for _, machine in ipairs(self:machinesOfType(process.machineType)) do
+        parallel = parallel + math.max(1, math.floor(tonumber(machine.parallel) or 1))
+    end
+    if parallel <= 0 then
+        return 0
+    end
+    return parallel * math.max(1, math.floor(tonumber(process.maxMultiplier) or 1))
+end
+
+-- Expected amount of one output of one batch. A placeholder stands for one item.
+function Recipe:outputUnits(process, output, multiplier)
+    local perRound = math.max(0, math.floor(tonumber(self:expectedYield(process, output)) or 0))
+    if perRound <= 0 and type(output) == "table" and output.kind == "placeholder" then
+        perRound = 1
+    end
+    return perRound * math.max(1, math.floor(tonumber(multiplier) or 1))
+end
+
+-- craftingCount ledger: one RefCount per material key, sources are instances.
+-- `material.craftingCount` stays a plain number in cache.json (mirror of value()).
+function Recipe:craftingRef(key)
+    self.craftingLedger = self.craftingLedger or {}
+    local ref = self.craftingLedger[key]
+    if not ref then
+        ref = RefCount.new("crafting:" .. tostring(key))
+        self.craftingLedger[key] = ref
+    end
+    return ref
+end
+
+local function syncCrafting(self, key)
+    local ref = self.craftingLedger and self.craftingLedger[key]
+    local material = self.Cache:materialByKey(key)
+    if material then
+        material.craftingCount = ref and ref:value() or 0
+        material.updatedAt = os.epoch("utc")
+    end
+end
+
+-- Book the craftingCount of every output of a batch that just started (+1) or
+-- ended (-1). The instance is the source, so finish / kill give back exactly what
+-- was taken even if the definition changes while the batch runs.
+function Recipe:noteCrafting(process, inst, sign)
+    local credit = {}
+    local source = instanceSource(inst)
+    for _, output in ipairs(process.outputs or {}) do
+        local perBatch = self:outputUnits(process, output, inst.multiplier)
+        if perBatch > 0 then
+            for _, key in ipairs(self:materialKeysOfOutput(output)) do
+                local ref = self:craftingRef(key)
+                if sign > 0 then
+                    ref:add(source, perBatch)
+                else
+                    ref:remove(source)
+                end
+                syncCrafting(self, key)
+                credit[key] = (credit[key] or 0) + perBatch
+            end
+        end
+    end
+    if sign > 0 then
+        inst.craftCredit = credit
+    else
+        inst.craftCredit = {}
+    end
+    return credit
+end
+
+-- Give back the craftingCount an instance had booked (both on finish and on kill).
+function Recipe:releaseCrafting(inst)
+    local source = instanceSource(inst)
+    for key in pairs(inst.craftCredit or {}) do
+        local ref = self.craftingLedger and self.craftingLedger[key]
+        if ref then
+            ref:remove(source)
+            syncCrafting(self, key)
+        end
+    end
+    inst.craftCredit = {}
+end
+
+-- Startup: rebuild the crafting ledger from the restored instances (their
+-- craftCredit is persisted), so the mirrored numbers match the live sources.
+function Recipe:rebuildCrafting()
+    self.craftingLedger = {}
+    local restored = 0
+    for _, inst in pairs(self.Cache:instances()) do
+        local source = instanceSource(inst)
+        for key, amount in pairs(inst.craftCredit or {}) do
+            self:craftingRef(key):add(source, amount)
+            restored = restored + 1
+        end
+    end
+    for key in pairs(self.craftingLedger) do
+        syncCrafting(self, key)
+    end
+    return restored
+end
+
+-- A batch came out: settle its *real* output against every material row it
+-- produced - automateCount first (that is what the factory below is waiting for),
+-- then the user request. Nothing is written off that was not really produced: the
+-- amounts come from the instance's outProgress, and an output without a recorded
+-- amount settles nothing at all (no fallback to the expected yield).
+function Recipe:settleProduced(process, inst)
+    local outProgress = inst.outProgress or {}
+    for index, output in ipairs(process.outputs or {}) do
+        local produced = math.max(0, math.floor(tonumber(outProgress[tostring(index)]) or 0))
+        if produced <= 0 then
+            self.debugInfo("settle %s #%s out#%d: no recorded output, nothing settled",
+                tostring(inst.owner), tostring(inst.id), index)
+        else
+            for _, key in ipairs(self:materialKeysOfOutput(output)) do
+                local material = self.Cache:materialByKey(key)
+                if material then
+                    local automated = math.min(math.max(0, tonumber(material.automateCount) or 0), produced)
+                    material.automateCount = math.max(0, (tonumber(material.automateCount) or 0) - automated)
+                    local left = produced - automated
+                    if left > 0 then
+                        material.queryCount = math.max(0, (tonumber(material.queryCount) or 0) - left)
+                    end
+                    material.updatedAt = os.epoch("utc")
+                    self.debugInfo("settle %s #%s %s produced=%d automate-=%d query-=%d (query=%d)",
+                        tostring(inst.owner), tostring(inst.id), key, produced, automated, left,
+                        tonumber(material.queryCount) or 0)
+                end
+            end
+        end
+    end
+end
+
+function Recipe:countMap(map)
+    local n = 0
+    for _ in pairs(map or {}) do
+        n = n + 1
+    end
+    return n
+end
+
+-- One planning pass. Runs once per main loop tick, before the task scheduler: the
+-- demand is walked top-down (materials -> rounds), the instances are sent, and
+-- whatever material is still short is booked for the level above. A single pass
+-- per tick is intended - the chain is followed one level per tick.
+function Recipe:planTick(now)
+    local materials = self.Cache:materials()
+    local actives = self.Cache:activeProcesses()
+    local index = self:craftIndex()
+    self.planStats = { need = 0, created = 0, materials = 0, machines = 0 }
+
+    -- (0) The owed rounds are a per-tick figure: they are re-derived from the
+    -- ledger below. (automateCount is reset later, in step 4 - step 1 *reads* it,
+    -- because it carries the demand the previous tick could not cover.)
+    for _, entry in pairs(actives) do
+        entry.needCount = 0
+    end
+
+    -- (1) material -> rounds. What a material row still lacks becomes rounds of
+    -- every process that can craft it (in definition order). Several producers of
+    -- the same material each get their own rounds: that is what makes a request
+    -- with two producers over-produce on purpose.
+    for _, material in pairs(materials) do
+        local need = (tonumber(material.queryCount) or 0) + (tonumber(material.automateCount) or 0)
+            - (tonumber(material.craftingCount) or 0)
+        if need > 0 then
+            for _, producer in ipairs(index[material.key] or {}) do
+                local entry = self.Cache:activeProcess(producer.process)
+                local rounds = math.ceil(need / math.max(1, producer.yield))
+                if rounds > entry.needCount then
+                    entry.needCount = rounds
+                    self.planStats.need = self.planStats.need + 1
+                    self.debugInfo("plan %s: need=%d -> %s rounds=%d", tostring(material.key), need,
+                        tostring(producer.process), rounds)
+                end
+            end
+        end
+    end
+
+    -- (2) Cap the rounds at what the machines of that type can hold, then reset
+    -- the in-flight counter: it is rebuilt from the instances in the next step.
+    -- A process that owes rounds but has parallelCap 0 (no machine of its type at all,
+    -- or an empty machine type) is reported right here: step (5) only runs for
+    -- pending > 0, so without this the process would sit at "idle / remaining 0" with no
+    -- reason at all - the exact "requested, but nothing happens and nothing says why".
+    for _, entry in pairs(actives) do
+        local process = self.Store:get("processes", entry.name)
+        local raw = tonumber(entry.needCount) or 0
+        entry.rawNeedCount = raw
+        entry.needCount = process and math.min(self:parallelCap(process), raw) or 0
+        entry.activeCount = 0
+        if process and raw > 0 and entry.needCount <= 0 then
+            local reason
+            if #self:machinesOfType(process.machineType) == 0 then
+                reason = self:messageOf(self.Message.KEYS.RECIPE_ERR_NO_MACHINE,
+                    { type = tostring(process.machineType or "") })
+            else
+                reason = self:messageOf(self.Message.KEYS.RECIPE_ERR_MACHINES_UNUSABLE)
+            end
+            local record = self:record(entry.name)
+            record.wait = { kind = "machine" }
+            record.state = "waiting"
+            if record.lastError ~= reason then
+                record.lastError = reason
+                self.Cache:markDirty()
+            end
+        end
+    end
+
+    -- (3) Live instances say what is really running.
+    for _, inst in pairs(self.Cache:instances()) do
+        local entry = actives[inst.owner]
+        if entry then
+            entry.activeCount = entry.activeCount
+                + math.max(1, math.floor(tonumber(inst.multiplier) or 1))
+        end
+    end
+
+    -- (4) Book the demand a round could not cover: the uncovered demand is a
+    -- per-tick figure too, so it is reset here and rebuilt from the rounds that are
+    -- still owed. One stock pool per material: the first consumer of a material
+    -- takes what is there, the next one only sees the remainder, so a material
+    -- several processes ask for is never counted twice.
+    for _, material in pairs(materials) do
+        material.automateCount = 0
+    end
+    local stockLeft = {}
+    for _, entry in pairs(actives) do
+        local pending = entry.needCount - entry.activeCount
+        local process = pending > 0 and self.Store:get("processes", entry.name) or nil
+        if process then
+            for _, input in ipairs(process.inputs or {}) do
+                -- A skippable input is optional, so it never books demand upstream.
+                if isMaterialElement(input) and not input.skip then
+                    local material = self:ensureMaterial(input)
+                    local want = elementDemand(input, pending)
+                    local left = stockLeft[material.key]
+                    if left == nil then
+                        left = self:visibleStock(material)
+                        stockLeft[material.key] = left
+                    end
+                    local taken = math.min(left, want)
+                    stockLeft[material.key] = left - taken
+                    if want > taken then
+                        material.automateCount = (tonumber(material.automateCount) or 0) + (want - taken)
+                        material.updatedAt = os.epoch("utc")
+                        self.debugInfo("plan %s: %s want=%d stock=%d -> automate=%d",
+                            tostring(entry.name), tostring(material.key), want, taken, want - taken)
+                    end
+                end
+            end
+        end
+    end
+
+    -- (5) Send the rounds that are still missing. The multiplier is capped by what
+    -- the storage can really send, by the missing rounds and by the definition.
+    for _, entry in pairs(actives) do
+        local pending = entry.needCount - entry.activeCount
+        if pending > 0 then
+            local process = self.Store:get("processes", entry.name)
+            -- self:record() also creates the run-state record on first use, which is
+            -- what the instance pipeline writes its wait/state into.
+            local record = process and self:record(entry.name) or nil
+            if process and record then
+                local machine, err = self:chooseMachine(process.machineType)
+                if machine then
+                    local limit = self:materialLimit(process, pending)
+                    local maxMultiplier = math.max(1, math.floor(tonumber(process.maxMultiplier) or 1))
+                    local multiplier = math.min(limit, pending, maxMultiplier)
+                    if multiplier > 0 then
+                        -- One line per instance: these are the terms a small batch has to
+                        -- be explained with - a big request that comes out as many small
+                        -- instances was limited by one of them, not by a bug per se.
+                        self.log("Plan %s: instance x%d (needCount=%d activeCount=%d pending=%d " ..
+                            "parallelCap=%d materialLimit=%d maxMultiplier=%d)",
+                            tostring(process.name), multiplier, entry.needCount, entry.activeCount,
+                            pending, self:parallelCap(process), limit, maxMultiplier)
+                        self:createInstance(process, machine, multiplier, now)
+                        entry.activeCount = entry.activeCount + multiplier
+                        self.planStats.created = self.planStats.created + 1
+                    else
+                        -- Rounds are owed but the storage cannot send that material
+                        -- yet: the demand was booked one level up above, so the panel
+                        -- only has to explain the wait.
+                        record.wait = { kind = "materials" }
+                        record.state = "waiting"
+                        local text = self:messageOf(self.Message.KEYS.RECIPE_ERR_NOT_ENOUGH_MATERIALS)
+                        if record.lastError ~= text then
+                            record.lastError = text
+                            self.Cache:markDirty()
+                        end
+                    end
+                else
+                    record.wait = { kind = "machine" }
+                    record.state = "waiting"
+                    if err and record.lastError ~= err then
+                        record.lastError = err
+                        self.Cache:markDirty()
+                    end
+                end
+            end
+        end
+    end
+
+    -- (6) Drop what owes nothing. A material that is still being crafted keeps its
+    -- row: its craftingCount has to be given back when that instance ends. A process
+    -- that owes no round is dropped and comes back as soon as a demand asks for it.
+    for name, entry in pairs(actives) do
+        if entry.needCount <= 0 then
+            actives[name] = nil
+            self.Cache:markDirty()
+        end
+    end
+    for key, material in pairs(materials) do
+        if (tonumber(material.queryCount) or 0) <= 0 and (tonumber(material.automateCount) or 0) <= 0
+            and (tonumber(material.craftingCount) or 0) <= 0 then
+            materials[key] = nil
+            self.Cache:markDirty()
+        end
+    end
+    self.planStats.materials = self:countMap(materials)
+    return self.planStats
+end
+
+-- Ledger rows for the web panel: one entry per active material.
+function Recipe:materials()
+    local out = {}
+    for _, material in pairs(self.Cache:materials()) do
+        out[#out + 1] = {
+            key = material.key,
+            kind = material.kind,
+            id = material.id,
+            queryCount = tonumber(material.queryCount) or 0,
+            automateCount = tonumber(material.automateCount) or 0,
+            craftingCount = tonumber(material.craftingCount) or 0,
+        }
+    end
+    return out
+end
+
+-- Ledger rows for the web panel: one entry per active process.
+function Recipe:plan()
+    local out = {}
+    for _, entry in pairs(self.Cache:activeProcesses()) do
+        out[#out + 1] = {
+            name = entry.name,
+            needCount = tonumber(entry.needCount) or 0,
+            activeCount = tonumber(entry.activeCount) or 0,
         }
     end
     return out

@@ -1,9 +1,45 @@
-// IFM :: web/ifm-processes.js
-// 进程 / 外设与定义 / 机器 / 过滤器 / 依赖图
-// （由 index.html 拆分而来；所有文件按顺序在页面里加载，共享同一份全局作用域）
 'use strict';
 
-// ===================== 进程 =====================
+    // Which processes show their instances: instances are folded away by default (the
+    // process row then carries their count) and the folded state is kept in the browser,
+    // so it survives a reload. What is stored is the set of *expanded* processes - a
+    // process nobody ever opened stays folded.
+    const EXPANDED_STORAGE = 'ifmExpandedProcesses';
+    let expandedProcesses = null;
+
+    function expandedProcessSet() {
+        if (expandedProcesses) return expandedProcesses;
+        expandedProcesses = new Set();
+        try {
+            const raw = localStorage.getItem(EXPANDED_STORAGE);
+            if (raw) JSON.parse(raw).forEach(function (name) { expandedProcesses.add(String(name)); });
+        } catch (err) {  }
+        return expandedProcesses;
+    }
+
+    function processInstancesExpanded(name) {
+        return expandedProcessSet().has(String(name));
+    }
+
+    function setProcessInstancesExpanded(name, expanded) {
+        const set = expandedProcessSet();
+        if (expanded) set.add(String(name));
+        else set.delete(String(name));
+        try {
+            localStorage.setItem(EXPANDED_STORAGE, JSON.stringify(Array.from(set)));
+        } catch (err) {  }
+    }
+
+    // The instance list of one process, for the toggle in bindProcessList: keyed by the
+    // process name, which may contain characters a selector cannot carry.
+    function instanceListOf(name) {
+        const lists = document.querySelectorAll('#processList [data-process-instances]');
+        for (let i = 0; i < lists.length; i += 1) {
+            if (lists[i].getAttribute('data-process-instances') === String(name)) return lists[i];
+        }
+        return null;
+    }
+
     function stateLabel(state) {
         if (state === 'running') return t('running');
         if (state === 'waiting') return t('waiting');
@@ -17,18 +53,33 @@
     }
 
     function progressBarHtml(item) {
-        const percent = Math.max(0, Math.min(100, Math.round((item.percent || 0) * 100)));
-        const cls = percent >= 100 ? '' : (percent > 0 ? 'warn' : 'bad');
+        // The bar is scaled to the extraction maximum (max x batch, `target`): the
+        // produced part is produced/target, and the two tick marks show where the
+        // guaranteed minimum and the expected yield sit on that scale.
+        const max = Math.max(0, Number(item.target !== undefined && item.target !== null
+            ? item.target : (item.max || 0)) || 0);
+        const produced = Math.max(0, Number(item.produced !== undefined && item.produced !== null
+            ? item.produced : (item.current || 0)) || 0);
+        const expected = Math.max(0, Number(item.expected !== undefined && item.expected !== null
+            ? item.expected : 0) || 0);
+        const min = Math.max(0, Number(item.min || 0) || 0);
+        const pct = function (value) {
+            if (!(max > 0)) return 0;
+            return Math.max(0, Math.min(100, Math.round(value / max * 100)));
+        };
+        // Colour still follows "did this batch reach its expected yield".
+        const cls = (expected > 0 && produced >= expected) ? '' : (produced > 0 ? 'warn' : 'bad');
         return '<div style="margin-top:6px">' +
             '<div style="display:flex;justify-content:space-between">' +
             '<span>' + escapeHtml(resourceLabel(item.kind, item.id)) + '</span>' +
-            '<span>' + fmtCount(item.current || 0) + ' / ' + fmtCount(item.target || 0) + '</span>' +
+            '<span>' + fmtAmount(produced) + ' / ' + fmtAmount(expected) + '</span>' +
             '</div>' +
-            '<div class="progress"><div class="bar ' + cls + '" style="width:' + percent + '%"></div></div>' +
+            '<div class="progress"><div class="bar ' + cls + '" style="width:' + pct(produced) + '%"></div>' +
+            '<span class="progress-tick" style="left:' + pct(min) + '%"></span>' +
+            '<span class="progress-tick expect" style="left:' + pct(expected) + '%"></span></div>' +
             '</div>';
     }
 
-    // 流程标题由“产物”推导（流程定义没有名称字段）：Text 版返回纯文本，用于悬停详情
     function processTitleText(process) {
         const outputs = asArray(process.outputs).filter(function (element) {
             return element.kind === 'item' || element.kind === 'fluid' || element.kind === 'filter';
@@ -46,7 +97,6 @@
         return escapeHtml(processTitleText(process));
     }
 
-    // 当前阶段状态文本：正在发送/抽取 xxx、等待材料/机器/信号、定时等待
     function processPhaseText(record) {
         const wait = record.waitKind;
         if (wait === 'materials') return t('processWaitMaterials');
@@ -60,7 +110,12 @@
             const name = current.kind === 'filter'
                 ? (t('filterKind2') + ' ' + (current.id || ''))
                 : displayName(current.kind, current.id);
-            const params = { name: name, done: fmtCount(current.done || 0), target: fmtCount(current.target || 0) };
+            const params = {
+                name: name,
+                done: fmtAmount(current.done || 0),
+                target: fmtAmount(current.expect !== undefined && current.expect !== null
+                    ? current.expect : (current.target || 0))
+            };
             return current.phase === 'output' ? t('processExtracting', params) : t('processSending', params);
         }
         if (current.kind === 'placeholder') return t('placeholderKind') + ' ' + (current.name || '');
@@ -70,32 +125,172 @@
         return '';
     }
 
-    // 流程每批大约产出多少产物（取各产物元素的最多数目；用于把“批次数”换算成“产物数量”）
     function processPerBatch(process) {
         let per = 0;
         asArray(process.outputs).forEach(function (element) {
             if (element.kind === 'item' || element.kind === 'fluid' || element.kind === 'filter') {
-                per = Math.max(per, Math.max(0, Number(element.max) || 0));
+                per = Math.max(per, Math.max(0, Number(element.expect !== undefined && element.expect !== null
+                    ? element.expect : element.max) || 0));
             }
         });
         return Math.max(1, per);
     }
 
+    function processInstanceRowHtml(process, instance) {
+        const state = instance.state || 'running';
+        const batch = instance.multiplier || 0;
+        const phaseText = processPhaseText(instance);
+        const bars = asArray(instance.progress).map(progressBarHtml).join('');
+        const id = (instance.id === undefined || instance.id === null) ? 0 : instance.id;
+        return '<div class="flow-row instance-row">' +
+            '<span class="state-tag ' + escapeHtml(state) + '">' + escapeHtml(stateLabel(state)) + '</span>' +
+            '<span class="grow">' +
+            '<strong>' + escapeHtml(t('instanceLabel')) + ' #' + escapeHtml(String(id)) + '</strong> ' +
+            (instance.machine ? '<span class="muted">@' + escapeHtml(unescapeAsciiText(String(instance.machine))) + '</span> ' : '') +
+            (batch > 0 ? '<span class="muted">' + escapeHtml(t('processBatch', { n: fmtCount(batch) })) + '</span>' : '') +
+            (phaseText ? '<div class="muted">' + escapeHtml(phaseText) + '</div>' : '') +
+            (instance.lastError ? '<div class="muted">' + escapeHtml(describeMessage(instance.lastError)) + '</div>' : '') +
+            bars +
+            '</span>' +
+            '<button class="btn-pixel danger" data-instance-cancel="' + escapeHtml(process.name) + '"' +
+            ' data-instance-id="' + escapeHtml(String(id)) + '" title="' +
+            escapeHtml(t('instanceAbortHint')) + '"><i class="fa fa-stop"></i></button>' +
+            '</div>';
+    }
+
+    // The material ledger of one process row: what is asked for, what the factory
+    // below still needs and what is being crafted - per product.
+    function materialSummaryHtml(record) {
+        const rows = asArray(record.materials).filter(function (row) {
+            if (!row || !row.id) return false;
+            return ((Number(row.queryCount) || 0) + (Number(row.automateCount) || 0) +
+                (Number(row.craftingCount) || 0)) > 0;
+        });
+        if (rows.length === 0) return '';
+        return rows.map(function (row) {
+            return '<span class="muted" title="' + escapeHtml(t('materialCountsHint')) + '">' +
+                escapeHtml(String(row.id)) + ' ' + escapeHtml(t('materialCounts', {
+                    query: fmtCount(row.queryCount || 0),
+                    automate: fmtCount(row.automateCount || 0),
+                    crafting: fmtCount(row.craftingCount || 0)
+                })) + '</span>';
+        }).join(' ');
+    }
+
+    // Searchable texts of one process: its machine (the running instance and the
+    // machine type), every produced resource (registry name plus display name) and
+    // the process name / product title. Chinese labels ride along as pinyin pairs
+    // so a player can type latin syllables, exactly like the resource panel does.
+    function processSearchTexts(process, record) {
+        const texts = [];
+        const pinyin = [];
+        const push = function (value) {
+            const text = String(value === undefined || value === null ? '' : value).trim().toLowerCase();
+            if (text) texts.push(text);
+        };
+        const addPinyin = function (zh, en) {
+            // Pinyin search is a Chinese-UI feature only: pinyinSearchHit refuses in other
+            // languages anyway, so do not even build the pairs there.
+            if (lang !== 'zh') return;
+            const label = String(zh === undefined || zh === null ? '' : zh);
+            if (label) pinyin.push({ zh: label, en: String(en === undefined || en === null ? '' : en) });
+        };
+        push(process && process.name);
+        const machine = (record && record.machine) ? unescapeAsciiText(String(record.machine)) : '';
+        push(machine);
+        const typeName = String((process && process.machineType) || '');
+        push(typeName);
+        if (typeName) {
+            try {
+                const label = machineTypeLabel(typeName);
+                push(label);
+                addPinyin(label, '');
+            } catch (err) {  }
+        }
+        try {
+            const title = processTitleText(process);
+            push(title);
+            addPinyin(title, '');
+        } catch (err) {  }
+        asArray(process && process.outputs).forEach(function (element) {
+            if (!element || elementIsAbstract(element)) return;
+            if (element.kind === 'item' || element.kind === 'fluid' || element.kind === 'filter') {
+                const name = String(element.id || '');
+                push(name);
+                if (name) {
+                    try {
+                        const label = displayName(element.kind, name);
+                        push(label);
+                        addPinyin(label, englishName(element.kind, name));
+                    } catch (err) {  }
+                }
+                return;
+            }
+            if (element.kind === 'placeholder') {
+                const name = String(element.name || '');
+                const item = String(element.item || '');
+                push(name);
+                push(item);
+                addPinyin(name, name);
+                try { addPinyin(displayName('item', item), englishName('item', item)); } catch (err) {  }
+            }
+        });
+        return { texts: texts, pinyin: pinyin };
+    }
+
+    // A process is a hit when every search term matches one of its texts (or its
+    // Chinese label by pinyin).
+    function processSearchHit(process, record, query) {
+        const info = processSearchTexts(process, record);
+        for (let i = 0; i < query.terms.length; i += 1) {
+            const term = query.terms[i];
+            let hit = false;
+            for (let j = 0; j < info.texts.length && !hit; j += 1) {
+                if (info.texts[j].indexOf(term) >= 0) hit = true;
+            }
+            const pairs = info.pinyin;
+            for (let j = 0; j < pairs.length && !hit; j += 1) {
+                try {
+                    if (pinyinSearchHit(term, pairs[j].zh, pairs[j].en)) hit = true;
+                } catch (err) {
+                    // The optional pinyin dictionary is missing: keep the plain
+                    // substring behaviour instead of breaking the render.
+                    hit = false;
+                }
+            }
+            if (!hit) return false;
+        }
+        return true;
+    }
+
     function renderProcesses() {
-        // 只显示“有事可做”的流程（进行中 / 等待中 / 缺失）：服务端也只会下发这些（见 Recipe:idleRecord），
-        // 空闲流程占了绝大多数，网页与推送都不要再管它们；流程定义永远能在「流程依赖图」里看到。
+        const query = parseSearchQuery(processSearchText);
+        const filtering = !searchQueryEmpty(query);
         const processes = Array.from(stores.processes.values()).filter(function (process) {
             const record = stores.runtime.get(process.name);
             if (!record) return false;
             const state = record.state || 'idle';
-            const remaining = (record.userCount || 0) + (record.downstreamCount || 0);
-            return state !== 'idle' || (record.batch || 0) > 0 || remaining > 0;
+            const remaining = Math.max(0, Number(record.remaining) || 0);
+            const materials = asArray(record.materials);
+            return state !== 'idle' || (record.batch || 0) > 0 || remaining > 0 || materials.length > 0;
         });
         if (processes.length === 0) {
             el('processList').innerHTML = '<span class="muted">' + escapeHtml(t('noProcessRunning')) + '</span>';
             return;
         }
+        // Search never hides a process here: a hit moves to the front and everything
+        // that does not match stays below, dimmed (the visible set itself is unchanged).
+        const hitOf = new Map();
+        processes.forEach(function (process) {
+            hitOf.set(process.name, !filtering ||
+                processSearchHit(process, stores.runtime.get(process.name) || {}, query));
+        });
         processes.sort(function (a, b) {
+            if (filtering) {
+                const left = hitOf.get(a.name) ? 0 : 1;
+                const right = hitOf.get(b.name) ? 0 : 1;
+                if (left !== right) return left - right;
+            }
             return a.name.localeCompare(b.name);
         });
         el('processList').innerHTML = processes.map(function (process) {
@@ -104,44 +299,86 @@
             const bars = asArray(record.progress).map(progressBarHtml).join('');
             const batch = record.batch || 0;
             const phaseText = processPhaseText(record);
-            // 引擎里的计数单位是“批次”，这里同时换算成“大约多少产物”，与下单时填的产物数量对齐
             const remaining = Math.max(0, record.remaining || 0);
             const perBatch = processPerBatch(process);
-            return '<div class="flow-row">' +
+            const instances = asArray(record.instanceList);
+            const expanded = processInstancesExpanded(process.name);
+            const toggleHtml = instances.length === 0 ? '' :
+                '<button class="btn-pixel instance-toggle" data-process-toggle="' + escapeHtml(process.name) +
+                '" aria-expanded="' + (expanded ? 'true' : 'false') + '" title="' +
+                escapeHtml(t('instanceLabel')) + '"><i class="fa fa-chevron-' +
+                (expanded ? 'down' : 'right') + '"></i> ' + fmtCount(instances.length) + '</button>';
+            const rowHtml = '<div class="flow-row">' +
                 '<span class="state-tag ' + escapeHtml(state) + '">' + escapeHtml(stateLabel(state)) + '</span>' +
                 '<span class="grow">' +
                 '<strong>' + processTitle(process) + '</strong> ' +
-                (record.machine ? '<span class="muted">@' + escapeHtml(record.machine) + '</span> ' : '') +
+                (record.machine ? '<span class="muted">@' + escapeHtml(unescapeAsciiText(String(record.machine))) + '</span> ' : '') +
                 (batch > 0 ? '<span class="muted">' + escapeHtml(t('processBatch', { n: fmtCount(batch) })) + '</span>' : '') +
                 (phaseText ? '<div class="muted">' + escapeHtml(phaseText) + '</div>' : '') +
-                (record.lastError ? '<div class="muted">' + escapeHtml(record.lastError) + '</div>' : '') +
+                (record.lastError ? '<div class="muted">' + escapeHtml(describeMessage(record.lastError)) + '</div>' : '') +
                 bars +
                 '</span>' +
                 '<span>' + escapeHtml(t('processRemaining', {
                     batches: fmtCount(remaining),
-                    products: fmtCount(remaining * perBatch)
+                    products: fmtAmount(remaining * perBatch)
                 })) + '</span>' +
+                materialSummaryHtml(record) +
+                toggleHtml +
                 '<button class="btn-pixel danger" data-process-cancel="' + escapeHtml(process.name) + '" title="' +
-                escapeHtml(t('cancelProcess')) + '"><i class="fa fa-stop"></i></button>' +
+                escapeHtml(t('cancelProcess') + ' · ' + t('processAbortHint')) +
+                '"><i class="fa fa-stop"></i></button>' +
                 '</div>';
+            const instanceRows = instances.map(function (instance) {
+                return processInstanceRowHtml(process, instance);
+            }).join('');
+            const listHtml = instances.length === 0 ? '' :
+                '<div class="instance-list"' + (expanded ? '' : ' hidden') +
+                ' data-process-instances="' + escapeHtml(process.name) + '">' + instanceRows + '</div>';
+            const dim = filtering && !hitOf.get(process.name);
+            return '<div class="process-block' + (dim ? ' process-dim' : '') + '">' + rowHtml + listHtml + '</div>';
         }).join('');
     }
 
-    // ===================== 底部面板（待发送 / 发送中已取消显示） =====================
-    // 队列面板固定在窗口底部，用它的高度补偿 body 下内边距，避免遮住页面内容
-    // （待发送为空时面板整块隐藏，此时不需要任何补偿）
-    function syncDeliveryPanelSpacing() {
-        const panel = el('deliveryPanel');
-        if (!panel) return;
-        const hidden = panel.style.display === 'none' || panel.offsetHeight === 0;
-        // 只在真的变化时才写：同一个值反复写也可能触发无谓的重排（面板高度每帧都在变时最容易看出来）
-        const padding = hidden ? '' : ((panel.offsetHeight || 0) + 18) + 'px';
+    // Every fixed bottom bar (the page search toolbar and, on the resources page, the
+    // send / delivery toolbar of web/ifm-resources.js) reserves room at the bottom of
+    // the body, otherwise the last row would sit behind it. The search toolbar stacks
+    // on top of the delivery toolbar whenever both are on screen.
+    function syncBottomBars() {
+        const searchBar = el('searchToolbar');
+        const delivery = el('deliveryPanel');
+        const searchVisible = !!searchBar && searchBar.style.display !== 'none' && searchBar.offsetHeight > 0;
+        const deliveryVisible = !!delivery && delivery.style.display !== 'none' && delivery.offsetHeight > 0;
+        const searchHeight = searchVisible ? (searchBar.offsetHeight || 0) : 0;
+        const deliveryHeight = deliveryVisible ? (delivery.offsetHeight || 0) : 0;
+        if (searchBar && searchVisible) {
+            const bottom = deliveryHeight + 'px';
+            if (searchBar.style.bottom !== bottom) searchBar.style.bottom = bottom;
+        }
+        const total = searchHeight + deliveryHeight;
+        // The graph panel sizes itself from the room the bottom bars take (ifm.css:
+        // section.panel[data-panel-page="graph"]).
+        const root = document.documentElement;
+        if (root && root.style && root.style.setProperty) {
+            root.style.setProperty('--ifm-bottom-bars', (total > 0 ? total : 0) + 'px');
+        }
+        // The graph page sizes its own panel from --ifm-bottom-bars and must not also
+        // carry the body reserve (stylesheet default 48px included): pin it to 0.
+        const padding = graphPageActive() ? '0px' : (total > 0 ? (total + 18) + 'px' : '');
         if (document.body.style.paddingBottom !== padding) {
             document.body.style.paddingBottom = padding;
         }
     }
 
-    // ===================== 外设与定义 =====================
+    // The graph panel sizes itself from --ifm-bottom-bars (ifm.css), so it must not also
+    // carry the body reserve: that would add a stray scrollbar under the graph.
+    function graphPageActive() {
+        return typeof currentPanel === 'function' && currentPanel() === 'graph';
+    }
+
+    function syncDeliveryPanelSpacing() {
+        syncBottomBars();
+    }
+
     function roleLabel(role) {
         if (role === 'storage') return t('storage');
         if (role === 'input') return t('inputRole');
@@ -150,14 +387,7 @@
         return role || '';
     }
 
-
-    // 外设卡片标题：主标题显示方块名（走 blocksitems 的方块接口，和物品一样），
-    // 拿不到元信息时回落成方块注册名；灰色小字显示外设名（minecraft:chest_13）——
-    // 定义、容器管理、诊断里用的都是这个名字，写方块注册名（minecraft:chest）对不上。
     function peripheralTitleHtml(peripheralName) {
-        // resolvedBlockIdOf：不带命名空间的外设名（redstone_relay_0）会先按 candidates 找到
-        // 真正存在的方块 id（computercraft:redstone_relay），这样标题与图标都正确
-        // （见 ifm-core.js 的 blockIdCandidates）。
         const blockId = resolvedBlockIdOf(peripheralName);
         if (blockId) queueMeta('block', blockId);
         const label = blockId ? displayName('block', blockId) : String(peripheralName || '');
@@ -166,37 +396,117 @@
             escapeHtml(String(peripheralName || '')) + '</span></h3>';
     }
 
-    // 外设搜索用的文本池：外设名 / 方块名 / 方块注册名 / 定义名（容器与信号）
+    // Texts + pinyin pairs of a peripheral block: the block name as registered, the
+    // derived block id / registry name and its (Chinese) display name, plus the names
+    // of the container / signal definitions it carries.
     function peripheralSearchTexts(block) {
         const raw = blockIdOf(block.name) || '';
         const blockId = resolvedBlockIdOf(block.name) || raw;
-        const texts = [
-            String(block.name || ''),
-            raw,
-            blockId,
-            displayName('block', blockId),
-            englishName('block', blockId)
-        ];
+        const texts = [String(block.name || ''), raw, blockId];
+        const pinyin = [];
+        try {
+            const label = displayName('block', blockId);
+            const english = englishName('block', blockId);
+            texts.push(label, english);
+            if (label) pinyin.push({ zh: label, en: english });
+        } catch (err) {  }
         asArray(block.containers).forEach(function (def) { texts.push(String(def.name || '')); });
         asArray(block.signals).forEach(function (def) { texts.push(String(def.name || '')); });
-        return texts.filter(function (text) { return !!text; })
-            .map(function (text) { return String(text).toLowerCase(); });
+        return normalizeSearchInfo(texts, pinyin);
+    }
+
+    // One place that answers "does this card match the query": a plain token hits any
+    // text (substring) or a Chinese label by pinyin; #tag / @mod work on the texts.
+    function normalizeSearchInfo(texts, pinyin) {
+        const clean = [];
+        asArray(texts).forEach(function (text) {
+            const value = String(text === undefined || text === null ? '' : text).trim().toLowerCase();
+            if (value) clean.push(value);
+        });
+        const pairs = [];
+        if (lang === 'zh') {
+            asArray(pinyin).forEach(function (pair) {
+                if (pair && pair.zh) pairs.push({ zh: pair.zh, en: pair.en || '' });
+            });
+        }
+        return { texts: clean, pinyin: pairs };
+    }
+
+    function searchInfoMatch(info, query) {
+        for (let i = 0; i < query.mods.length; i += 1) {
+            if (!info.texts.some(function (text) { return modOfName(text) === query.mods[i]; })) return false;
+        }
+        for (let i = 0; i < query.tags.length; i += 1) {
+            if (!info.texts.some(function (text) { return text.indexOf(query.tags[i]) >= 0; })) return false;
+        }
+        for (let i = 0; i < query.terms.length; i += 1) {
+            const term = query.terms[i];
+            let hit = info.texts.some(function (text) { return text.indexOf(term) >= 0; });
+            for (let j = 0; j < info.pinyin.length && !hit; j += 1) {
+                try {
+                    if (pinyinSearchHit(term, info.pinyin[j].zh, info.pinyin[j].en)) hit = true;
+                } catch (err) {
+                    // The optional pinyin dictionary is missing: keep the plain
+                    // substring behaviour instead of breaking the render.
+                    hit = false;
+                }
+            }
+            if (!hit) return false;
+        }
+        return true;
     }
 
     function peripheralMatchesSearch(block, query) {
         if (searchQueryEmpty(query)) return true;
-        const texts = peripheralSearchTexts(block);
-        for (let i = 0; i < query.mods.length; i += 1) {
-            if (!texts.some(function (text) { return modOfName(text) === query.mods[i]; })) return false;
+        return searchInfoMatch(peripheralSearchTexts(block), query);
+    }
+
+    // Searchable texts of a machine type: its own name (and Chinese label) plus the
+    // name / registry name of the icon it was configured with (an item registry name).
+    function machineTypeSearchTexts(item) {
+        const texts = [String(item.name || '')];
+        const pinyin = [];
+        try {
+            const label = machineTypeLabel(item.name);
+            texts.push(label);
+            if (label) pinyin.push({ zh: label, en: '' });
+        } catch (err) {  }
+        const icon = machineTypeIconName(item.name, item.icon);
+        if (icon) {
+            texts.push(icon);
+            try {
+                texts.push(displayName('item', icon), englishName('item', icon));
+                pinyin.push({ zh: displayName('item', icon), en: englishName('item', icon) });
+            } catch (err) {  }
         }
-        for (let i = 0; i < query.tags.length; i += 1) {
-            // 外设/方块没有标签数据：#xxx 就按“名称里包含”处理（与资源搜索的标签匹配保持一致）
-            if (!texts.some(function (text) { return text.indexOf(query.tags[i]) >= 0; })) return false;
-        }
-        for (let i = 0; i < query.terms.length; i += 1) {
-            if (!texts.some(function (text) { return text.indexOf(query.terms[i]) >= 0; })) return false;
-        }
-        return true;
+        return normalizeSearchInfo(texts, pinyin);
+    }
+
+    function machineTypeMatchesSearch(item, query) {
+        if (searchQueryEmpty(query)) return true;
+        return searchInfoMatch(machineTypeSearchTexts(item), query);
+    }
+
+    // Searchable texts of a container / signal definition card (storage / input /
+    // output): the definition name and the peripheral block it points at.
+    function containerDefSearchTexts(def) {
+        const name = String((def && def.name) || '');
+        const peripheral = String((def && def.peripheral) || '');
+        const kind = (def && def.kind === 'fluid') ? 'fluid' : 'item';
+        const texts = [name, peripheral];
+        const pinyin = [];
+        try {
+            const label = displayName(kind, name);
+            const english = englishName(kind, name);
+            texts.push(label, english);
+            if (label) pinyin.push({ zh: label, en: english });
+        } catch (err) {  }
+        return normalizeSearchInfo(texts, pinyin);
+    }
+
+    function containerDefMatchesSearch(def, query) {
+        if (searchQueryEmpty(query)) return true;
+        return searchInfoMatch(containerDefSearchTexts(def), query);
     }
 
     function peripheralSortLabelText() {
@@ -205,7 +515,6 @@
         return t('sortPeripheralPeripheral');
     }
 
-    // 排序：外设名（默认，字典序）| 方块名 | 定义数量（多→少）；同值都回落到外设名
     function sortPeripheralList(list) {
         const byName = function (a, b) { return String(a.name).localeCompare(String(b.name)); };
         if (peripheralSortMode === 'block') {
@@ -226,7 +535,6 @@
         return list.sort(byName);
     }
 
-    // 缺失外设的搜索匹配：定义名 或 期望的外设名 命中即可
     function missingMatchesSearch(item, query) {
         if (searchQueryEmpty(query)) return true;
         const texts = [String(item.name || ''), String(item.peripheral || '')]
@@ -240,19 +548,11 @@
         return true;
     }
 
-    // 缺失外设的条目：定义名 → 期望的外设名 + 类型 + 「删除该定义」按钮
-    // （外设缺失时以前只能干看着：这里允许直接把背后的定义删掉）
-    // 用户第 3 项（本轮）：机器直接引用的外设没有"定义"可删，所以那条只显示
-    // "哪台机器在引用它"（提示用户去把机器的容器换成新的外设名 / 重新拖一次）。
     function missingChipHtml(item) {
         if (item.kind === 'machine') {
-            // 用户第 3 项（本轮）：机器名/外设名在传输层是 \uXXXX 字面量（非 ASCII），
-            // 这里必须解码后再显示（否则网页上直接看到 "\u6405\u62CC"）。
             const machine = unescapeAsciiText(String(item.machine || ''));
             const name = unescapeAsciiText(String(item.name || ''));
             const hint = t('missingMachineRef', { machine: machine || '?' });
-            // 用户第 4 项（本轮）：这条也有删除按钮 —— 删的是"机器里对这个外设的引用"
-            // （机器输入/输出/信号列表里的那一项），这样"一键删除"才能把面板收干净。
             return '<span class="chip missing" title="' + escapeHtml(hint) + '">' +
                 escapeHtml(name) +
                 ' <span class="muted">' + escapeHtml(hint) + '</span>' +
@@ -264,7 +564,6 @@
                 '<i class="fa fa-trash"></i></button></span>';
         }
         const isSignal = item.kind === 'signal';
-        // 定义名 / 外设名同样要解码（用户第 3 项：中文定义名在传输层是 \uXXXX）
         const defName = unescapeAsciiText(String(item.name || ''));
         const peripheralName = unescapeAsciiText(String(item.peripheral || ''));
         return '<span class="chip missing" title="' + escapeHtml(peripheralName) + '">' +
@@ -277,21 +576,40 @@
             '<i class="fa fa-trash"></i></button></span>';
     }
 
-    // ===== 未分配功能 / 孤立定义 =====
-    // “已分配”= 这个外设的这个功能已经有对应定义，而且被用起来了：
-    // 存储容器归到存储卡片、机器容器/信号归到机器卡片。这里算出：
-    //   * 还没定义的功能（未分配）——
-    //   * 有定义但谁也不引用的（孤立：output 容器、没进机器的 interaction 容器）——
-    // 两者都要能在方块卡片上找到，否则用户没法再操作它们。
-    function machineUsedContainerNames() {
+    // Which (peripheral, kind) pairs the machines already use. A machine stores
+    // the name of a container definition, and a definition defaults to the
+    // peripheral name, so both spellings are resolved back to the peripheral -
+    // but per kind: a work pot that offers item *and* fluid storage must stay
+    // listed while one of its two sides is still free.
+    function machineUsedPeripheralRefs() {
+        const defs = new Map();
+        Array.from(stores.containers.values()).forEach(function (def) {
+            defs.set(containerKeyOf(def), def);
+        });
         const used = {};
+        const mark = function (kind, rawName) {
+            const text = String(rawName === undefined || rawName === null ? '' : rawName);
+            if (text === '') return;
+            const prefixed = /^(item|fluid):(.*)$/.exec(text);
+            const refKind = prefixed ? prefixed[1] : kind;
+            const plain = prefixed ? prefixed[2] : text;
+            if (plain === '') return;
+            used[refKind + ':' + plain] = true;
+            const def = defs.get(refKind + ':' + plain);
+            if (def) used[refKind + ':' + String(def.peripheral || '')] = true;
+        };
         Array.from(stores.machines.values()).forEach(function (machine) {
-            [machine.itemInputs, machine.fluidInputs, machine.itemOutputs, machine.fluidOutputs]
-                .forEach(function (list) {
-                    asArray(list).forEach(function (name) { used[String(name)] = true; });
-                });
+            [['item', machine.itemInputs], ['fluid', machine.fluidInputs],
+             ['item', machine.itemOutputs], ['fluid', machine.fluidOutputs]].forEach(function (pair) {
+                asArray(pair[1]).forEach(function (name) { mark(pair[0], name); });
+            });
         });
         return used;
+    }
+
+    function peripheralUsedByMachine(refs, kind, peripheral) {
+        const name = String(peripheral === undefined || peripheral === null ? '' : peripheral);
+        return name !== '' && refs[kind + ':' + name] === true;
     }
 
     function machineUsedSignalNames() {
@@ -304,12 +622,6 @@
 
     function peripheralUnassignedChips(block) {
         const blockName = String(block.name || '');
-        // 定义以 stores.containers / stores.signals 为准：乐观更新后界面立刻正确，
-        // 不必等服务端把 peripherals（含定义）推回来
-        // 用户第 5 项（本轮）：匹配放宽 —— 有的定义里 peripheral 是空的（早期数据只写了 name），
-        // 以前这种定义匹配不上，于是"已经设为存储容器"的方块仍然会冒出一张"未分配功能"卡片
-        // （现场：21 个箱子定义里 14 个仍单独出卡）。peripheral 缺失时按定义名兜底，
-        // 与服务端 containerNameFor 的规则一致。
         const defs = Array.from(stores.containers.values()).filter(function (def) {
             const peripheral = String(def.peripheral || '');
             const name = String(def.name || '');
@@ -324,24 +636,15 @@
         defs.forEach(function (def) {
             definedByKind[def.kind === 'fluid' ? 'fluid' : 'item'] = def;
         });
-        const usedByMachine = machineUsedContainerNames();
+        const usedByMachine = machineUsedPeripheralRefs();
         const chips = [];
-        // 用户第 5 项（本轮）：把"这张卡片为什么会出现"记下来，F12 里能直接看到
-        // （reportUnassignedBlocks 打印；只在方块名集合变化时打一次，不会刷屏）。
         const reasons = [];
-        // 用户第 5 项（本轮）：机器**直接**引用了这个外设（例如输入列表里写着 minecraft:chest_109）时，
-        // 它已经在用了 —— 以前这里还会画一张"未分配功能"的方块卡片，看起来像什么都没配。
-        // （引用坏了的情况由"外设缺失"面板负责提示，见 Containers:missingPeripherals。）
-        const referencedByMachine = usedByMachine[blockName] === true;
-        // 1) 功能还没定义 → 未分配。
-        //    chip 自己可拖拽（拖到存储卡片 / 机器位置 = 把这个功能分配过去），
-        //    方块卡片本身不再整体可拖拽（否则拖里面任何地方都会带动整张卡片）。
         [['item', 'inventory', 'itemContainer', 'fa-archive'],
          ['fluid', 'fluid_storage', 'fluidContainer', 'fa-tint']].forEach(function (info) {
-            if (referencedByMachine) return;
+            if (peripheralUsedByMachine(usedByMachine, info[0], blockName)) return;
             if (block.kinds.indexOf(info[1]) < 0 || definedByKind[info[0]]) return;
             reasons.push(info[0] + '-unassigned');
-            chips.push('<span class="chip unassigned" draggable="true"' +
+            chips.push('<span class="chip unassigned"' +
                 ' data-drag-peripheral="' + escapeHtml(block.name) + '"' +
                 ' data-drag-kind="' + info[0] + '"' +
                 ' title="' + escapeHtml(t('unassignedHint')) + '">' +
@@ -351,35 +654,27 @@
                 '" data-container-kind="' + info[0] + '" title="' + escapeHtml(t('createDefinition')) +
                 '"><i class="fa fa-plus"></i></button></span>');
         });
-        // 红石中继器：一个可拖拽的“信号”芯片（拖到机器的红石信号卡片 = 让那台机器用它）。
-        // 已经被机器引用的中继器不再显示方块卡片——被机器引用后卡片应当消失；
-        // 想再给别的机器用，就从已引用它的那台机器的信号卡片拖过去（拖拽=复制归属）。
         const usedSignals = machineUsedSignalNames();
         if (block.kinds.indexOf('redstone_relay') >= 0 && !usedSignals[blockName] &&
             !usedSignals[String(signalDefs.length ? signalDefs[0].name : '')]) {
             const legacy = signalDefs[0] || null;
             reasons.push('signal-unassigned');
-            // 有旧定义时可点击编辑（def-chip 的样式）；没有定义时就是一个纯拖拽源。
-            chips.push('<span class="chip' + (legacy ? ' def-chip' : '') + ' def-signal" draggable="true"' +
+            chips.push('<span class="chip' + (legacy ? ' def-chip' : '') + ' def-signal"' +
                 ' data-drag-peripheral="' + escapeHtml(block.name) + '" data-drag-kind="signal"' +
                 (legacy ? ' data-edit-signal="' + escapeHtml(legacy.name) + '"' : '') +
                 ' title="' + escapeHtml(t('signalChipHint')) + '">' +
                 '<i class="fa fa-bolt"></i> ' + escapeHtml(block.name) +
                 ' <span class="muted">' + escapeHtml(t('signal')) + '</span></span>');
         }
-        // 2) 有定义、但谁也不引用（output 容器 / 没进机器的 interaction 容器）：不能让它从界面上消失
         defs.forEach(function (def) {
-            // 用户第 5 项（本轮）：role 缺省按 storage 处理 —— 与服务端 Containers:defRole 一致。
-            // 以前 `def.role === 'storage'` 对"没有 role 字段"的旧定义不成立 ⇒ 会落到下面当"孤立定义"
-            // 再生成一张卡片（现场：21 个箱子定义里 14 个仍单独出卡）。
             const role = String(def.role || 'storage');
-            if (role === 'storage') return;                                             // 在存储卡片里
-            if (role === 'input') return;                                               // 在输入卡片里
-            if (role === 'output') return;                                              // 在输出卡片里（1.8.0）
-            if (role === 'interaction' && usedByMachine[String(def.name)]) return;       // 在机器卡片里
+            if (role === 'storage') return;
+            if (role === 'input') return;
+            if (role === 'output') return;
+            if (role === 'interaction' && usedByMachine[containerKeyOf(def)] === true) return;
             reasons.push('isolated-def:' + String(def.name) + ' role=' + role);
             const kind = def.kind === 'fluid' ? 'fluid' : 'item';
-            chips.push('<span class="chip def-chip def-' + kind + '" draggable="true"' +
+            chips.push('<span class="chip def-chip def-' + kind + '"' +
                 ' data-edit-container="' + escapeHtml(containerKeyOf(def)) + '"' +
                 ' data-drag-peripheral="' + escapeHtml(String(def.peripheral || '')) + '"' +
                 ' data-drag-kind="' + kind + '"' +
@@ -390,8 +685,6 @@
                 ' <span class="muted">' + escapeHtml(roleLabel(role)) + '</span>' +
                 '</span>');
         });
-        // 3) 多余的旧信号定义（同一个中继器只该有一个定义）：万一旧配置里留了多个，
-        //    仍然显示出来以便编辑/删除（第一个已经在上面的可拖拽芯片里了）。
         signalDefs.slice(1).forEach(function (def) {
             chips.push('<span class="chip def-chip def-signal" data-edit-signal="' + escapeHtml(def.name) +
                 '" title="' + escapeHtml(t('clickToEdit')) + '">' +
@@ -401,8 +694,6 @@
         return chips;
     }
 
-    /// 用户第 5 项（本轮）：还有方块卡片残留时，在 F12（网页控制台）里说清"它为什么会出现"。
-    /// 只在出现的方块名集合变化时打印一次，所以不会刷屏。
     let lastUnassignedReport = '';
     function reportUnassignedBlocks(blocks) {
         const signature = blocks.map(function (block) { return String(block.name || ''); }).join(',');
@@ -415,12 +706,50 @@
             }).join('  '));
     }
 
-    // 存储 / 输入 / 输出 容器卡片（用户第 5/6 项）：
-    //   一**张**卡片按角色聚合（物品容器与流体容器不再分成两张），拖外设卡片进来的含义：
-    //     role=storage / input → 直接把它设成该角色的容器（种类按芯片/能力判定）；
-    //     role=output          → 弹出"已经填好外设与角色"的容器定义卡片，名称留给用户填。
-    //   拖出去（或点 ×）= 删掉这条定义。
-    function containerRoleCardsHtml(role, config) {
+    // Peripherals whose slot information (slot count or slot capacity) has not been read
+    // yet, straight from the server status. Cached per status object: the chip builders
+    // below run once per container card.
+    let capacityPendingSrc = null;
+    let capacityPendingIssueSrc = null;
+    let capacityPendingSet = new Set();
+    let containerIssueSrc = null;
+    let containerIssueMap = new Map();
+    // Peripherals with a reported container problem (capability mismatch, missing
+    // snapshot on an always-scanned role, ...), keyed by peripheral name: the
+    // reason-aware half of the "needs attention" set below.
+    function containerIssueMapOf() {
+        const src = asArray(status && status.containerIssues);
+        if (containerIssueSrc !== src) {
+            containerIssueSrc = src;
+            containerIssueMap = new Map();
+            src.forEach(function (entry) {
+                if (entry && entry.peripheral) containerIssueMap.set(String(entry.peripheral), entry);
+            });
+        }
+        return containerIssueMap;
+    }
+    function capacityPendingPeripherals() {
+        const src = asArray(status && status.capacityPending);
+        const issues = containerIssueMapOf();
+        if (capacityPendingSrc !== src || capacityPendingIssueSrc !== containerIssueSrc) {
+            capacityPendingSrc = src;
+            capacityPendingIssueSrc = containerIssueSrc;
+            capacityPendingSet = new Set(src.map(String));
+            issues.forEach(function (_entry, peripheral) { capacityPendingSet.add(peripheral); });
+        }
+        return capacityPendingSet;
+    }
+    // The reason text for one peripheral, or null when only the generic slot-scan tip
+    // applies (a pure capacity-pending peripheral carries no reason).
+    function containerIssueReasonText(peripheral) {
+        const entry = containerIssueMapOf().get(String(peripheral));
+        if (entry && entry.reason) {
+            try { return describeMessage(entry.reason); } catch (err) { return null; }
+        }
+        return null;
+    }
+
+    function containerRoleCardsHtml(role, config, query) {
         const defs = [];
         Array.from(stores.containers.values()).forEach(function (def) {
             if (def.role === role) defs.push(def);
@@ -432,27 +761,38 @@
             return (Number(b.priority || 0) - Number(a.priority || 0)) ||
                 String(a.name).localeCompare(String(b.name));
         });
+        const pendingSet = capacityPendingPeripherals();
         const chips = defs.map(function (def) {
             const peripheral = String(def.peripheral || '');
             const kind = def.kind === 'fluid' ? 'fluid' : 'item';
             const priority = Number(def.priority || 0);
-            // 用户第 2 项：输出容器可以自己命名（存储 / 输入容器的定义名就是外设名）——
-            // 名字和外设名不同时额外显示，一眼认出这条定义。
             const defLabel = String(def.name || '');
             const hasLabel = defLabel !== '' && defLabel !== peripheral;
             const badge = (role === 'storage' && priority !== 0)
                 ? ' <span class="muted" title="' + escapeHtml(t('containerPriority')) + '">P' +
                   escapeHtml(String(priority)) + '</span>'
                 : '';
-            return '<span class="chip pc-chip" draggable="true"' +
+            const scanPending = pendingSet.has(peripheral);
+            const issueText = scanPending
+                ? (containerIssueReasonText(peripheral) || t('peripheralCapacityScanning'))
+                : null;
+            return '<span class="chip pc-chip' + (scanPending ? ' capacity-pending' : '') + '"' +
                 ' data-pc-peripheral="' + escapeHtml(peripheral) + '"' +
                 ' data-pc-def="' + escapeHtml(def.name) + '"' +
                 ' data-pc-kind="' + escapeHtml(kind) + '"' +
                 ' data-pc-role="' + escapeHtml(role) + '"' +
                 ' data-edit-container="' + escapeHtml(containerKeyOf(def)) + '"' +
+                (issueText
+                    ? ' data-tip-text="' + escapeHtml(issueText) + '"'
+                    : '') +
                 ' title="' + escapeHtml(peripheral + (hasLabel ? ' (' + defLabel + ')' : '') + ' · ' +
                     t(config.roleLabelKey) + ' · ' + t('clickToEdit')) + '">' +
-                '<i class="fa ' + (kind === 'fluid' ? 'fa-tint' : 'fa-archive') + '"></i>' +
+                // Same shape as a machine peripheral chip: the container-type badge
+                // and the block icon together, then the peripheral name.
+                '<span class="chip-badge kind-' + escapeHtml(kind) + '-' + escapeHtml(role) + '" title="' +
+                escapeHtml(kind === 'fluid' ? t('fluidKind') : t('itemKind')) + '">' +
+                '<i class="fa ' + (kind === 'fluid' ? 'fa-tint' : 'fa-cube') + '"></i></span>' +
+                (peripheral ? blockIconHtml(peripheral) : '') +
                 ' <span class="chip-text">' + escapeHtml(peripheral || def.name) + '</span>' +
                 (hasLabel ? '<span class="muted"> ' + escapeHtml(defLabel) + '</span>' : '') + badge +
                 '<button class="btn-pixel danger chip-del" type="button" data-pc-role-remove="' + escapeHtml(role) + '" title="' +
@@ -460,7 +800,10 @@
                 '</span>';
         }).join('');
         const dropAttr = ' data-' + role + '-drop="any"';
-        return '<div class="card-block storage-card"' + dropAttr + '>' +
+        const filtering = !searchQueryEmpty(query);
+        const hit = filtering && defs.some(function (def) { return containerDefMatchesSearch(def, query); });
+        return '<div class="card-block storage-card' +
+            (filtering ? (hit ? ' ifm-search-hit' : ' ifm-search-dim') : '') + '"' + dropAttr + '>' +
             '<div class="card-head">' +
             '<h3><i class="fa ' + (config.icon || 'fa-archive') + '"></i> ' + escapeHtml(t(config.cardKey)) +
             ' <span class="muted">' + defs.length + '</span></h3>' +
@@ -470,38 +813,27 @@
             '</div></div>';
     }
 
-    function storageCardsHtml() {
+    function storageCardsHtml(query) {
         return containerRoleCardsHtml('storage', {
             cardKey: 'storageCard', icon: 'fa-archive',
             hintKey: 'storageDropHint', removeKey: 'storageRemove', roleLabelKey: 'storage',
-        });
+        }, query);
     }
 
-    // 输入容器卡片（1.6.10）：与存储卡片同构，但角色是 input
-    function inputCardsHtml() {
+    function inputCardsHtml(query) {
         return containerRoleCardsHtml('input', {
             cardKey: 'inputCard', icon: 'fa-download',
             hintKey: 'inputDropHint', removeKey: 'inputRemove', roleLabelKey: 'inputRole',
-        });
+        }, query);
     }
 
-    // 输出容器卡片（1.8.0，用户第 6 项）：所有 role=output 的容器外设。
-    // 拖外设进来不直接建定义，而是打开容器定义弹窗（外设/种类/角色=输出已填好，名称等用户填）。
-    function outputCardsHtml() {
+    function outputCardsHtml(query) {
         return containerRoleCardsHtml('output', {
             cardKey: 'outputCard', icon: 'fa-upload',
             hintKey: 'outputDropHint', removeKey: 'outputRemove', roleLabelKey: 'outputRole',
-        });
+        }, query);
     }
 
-    // ===================== 外设卡片的批量选择（用户第 6 项） =====================
-    //   * Ctrl / Cmd + 左键点**外设芯片**（方块卡片里的"未分配功能"芯片 / 机器卡片里的外设芯片）= 加入或移出选择；
-    //   * 在外设面板或机器面板里按住**右键拖动** = 框选（松开时把框到的芯片设为选择；按住 Ctrl 则追加）；
-    //   * 选中多个时，拖其中任意一个 = 把选中的全部一起拖过去（类型不匹配的自动忽略并汇总提示）；
-    //   * 点面板空白处 / Esc = 清空选择。
-    // 本轮第 3 项：命中目标是**外设卡片（芯片）**而不是方块卡片 —— 这样能只选某个方块的某个外设；
-    // 并且机器卡片里的外设芯片也能框选（以前不行）。
-    // 选择只按外设名记在内存里：重画（每秒都可能发生）后依然保留，卡片不在了就自动移出。
     const selectedPeripheralCards = new Set();
 
     function peripheralSelected(name) {
@@ -523,7 +855,6 @@
         renderPeripherals();
     }
 
-    /// 整体替换选择（框选用）
     function setPeripheralSelection(names, additive) {
         if (!additive) selectedPeripheralCards.clear();
         asArray(names).forEach(function (name) {
@@ -538,8 +869,6 @@
         renderPeripherals();
     }
 
-    /// 机器卡片里当前看得见的外设名（本轮第 3 项：机器内的外设卡片也参与框选，
-    /// 所以"选择清理"必须把它们算作仍然可见，否则选完下一秒重画就被清掉）
     function machinePeripheralNames() {
         const present = {};
         Array.from(stores.machines.values()).forEach(function (machine) {
@@ -555,8 +884,6 @@
         return present;
     }
 
-    /// 卡片已经不在面板里（被分配进机器/容器、或外设拔出）→ 从选择里去掉，别"看不见却被拖着走"。
-    /// 机器卡片里的外设芯片也是"看得见的外设卡片"（本轮第 3 项），所以一并算进 present。
     function prunePeripheralSelection(blocks) {
         if (selectedPeripheralCards.size === 0) return;
         const present = machinePeripheralNames();
@@ -566,13 +893,78 @@
         });
     }
 
-    /// 面板标题旁的"已选 N 张外设卡片"提示（让用户知道拖一下会带走几张）
     function renderPeripheralSelectionHint() {
         const node = el('peripheralSelHint');
         if (!node) return;
         const count = selectedPeripheralCards.size;
         node.textContent = count > 0 ? t('peripheralSelected', { n: count }) : '';
         node.title = count > 0 ? t('peripheralSelectedHint') : '';
+    }
+
+    // Every card family the peripherals page can mark as a search hit, in the order
+    // they are drawn - Enter walks this list (focusPeripheralSearchHit).
+    const PERIPHERAL_SEARCH_CONTAINERS =
+        ['machineTypeList', 'storageList', 'inputList', 'outputList', 'peripheralList'];
+
+    let peripheralSearchHitNodes = [];
+    let peripheralSearchFocusIndex = -1;
+
+    function collectPeripheralSearchHits() {
+        const nodes = [];
+        PERIPHERAL_SEARCH_CONTAINERS.forEach(function (id) {
+            const box = el(id);
+            if (!box) return;
+            Array.prototype.forEach.call(box.querySelectorAll('.card-block.ifm-search-hit'), function (node) {
+                nodes.push(node);
+            });
+        });
+        peripheralSearchHitNodes = nodes;
+        peripheralSearchFocusIndex = -1;
+    }
+
+    function topBarsHeight() {
+        const header = document.querySelector ? document.querySelector('.app-header') : null;
+        return (header && header.offsetHeight) || 0;
+    }
+
+    function bottomBarsHeight() {
+        let total = 0;
+        ['searchToolbar', 'deliveryPanel'].forEach(function (id) {
+            const node = el(id);
+            if (node && node.style.display !== 'none' && node.offsetHeight > 0) total += node.offsetHeight;
+        });
+        return total;
+    }
+
+    // Bring a normal-flow card into the middle of the visible area, keeping clear of
+    // the sticky header and the bottom toolbar (this page scrolls with the document).
+    function scrollCardIntoView(node) {
+        if (!node || !node.getBoundingClientRect) return;
+        const top = topBarsHeight();
+        const bottom = Math.max(top + 40, (window.innerHeight || 0) - bottomBarsHeight());
+        const rect = node.getBoundingClientRect();
+        const delta = (rect.top + rect.height / 2) - (top + (bottom - top) / 2);
+        if (Math.abs(delta) <= 1 || typeof window.scrollBy !== 'function') return;
+        try {
+            window.scrollBy({ top: delta, behavior: 'smooth' });
+            return;
+        } catch (err) {  }
+        window.scrollBy(0, delta);
+    }
+
+    // Enter in the peripheral search walks through the highlighted cards: every press
+    // focuses the next one and scrolls it into view; it wraps around at the end.
+    function focusPeripheralSearchHit() {
+        if (peripheralSearchHitNodes.length === 0) return false;
+        peripheralSearchFocusIndex = (peripheralSearchFocusIndex + 1) % peripheralSearchHitNodes.length;
+        const node = peripheralSearchHitNodes[peripheralSearchFocusIndex];
+        if (!node) return false;
+        peripheralSearchHitNodes.forEach(function (other) {
+            if (other !== node) other.classList.remove('ifm-search-focus');
+        });
+        node.classList.add('ifm-search-focus');
+        scrollCardIntoView(node);
+        return true;
     }
 
     function renderPeripherals() {
@@ -593,52 +985,62 @@
             blocks.set(item.name, block);
         });
         const query = parseSearchQuery(peripheralSearchText);
-        // 只显示“还有未分配功能 / 还有孤立定义”的方块卡片（不再显示物品容器、流体容器那些单独的块）
         const allBlocks = Array.from(blocks.values())
             .map(function (block) {
                 block.chips = peripheralUnassignedChips(block);
                 return block;
             })
-            .filter(function (block) { return block.chips.length > 0; });
-        // 用户第 5 项（本轮）：还有卡片残留就在 F12 里说明原因（只在方块集合变化时打一次）
+            // Keep a card for a fully assigned peripheral as long as its slot information
+            // is still being read: that card is the only place the warning can be shown.
+            .filter(function (block) {
+                return block.chips.length > 0 ||
+                    capacityPendingPeripherals().has(String(block.name));
+            });
         reportUnassignedBlocks(allBlocks);
-        // 选择里已经不存在的卡片（被分配进机器/容器后卡片消失）→ 自动移出
         prunePeripheralSelection(allBlocks);
-        const list = sortPeripheralList(allBlocks.filter(function (block) {
-            return peripheralMatchesSearch(block, query);
-        }));
+        const filtering = !searchQueryEmpty(query);
+        // Search never hides a card on this page: matching cards keep their place with a
+        // highlight and the rest dim (Enter walks the hits, see focusPeripheralSearchHit).
+        const list = sortPeripheralList(allBlocks);
+        const pendingScan = capacityPendingPeripherals();
         const html = list.map(function (block) {
-            // 注意：卡片本身不可拖拽（用户反馈：拖卡片内部的外设芯片时会把整张卡片拖走）。
-            // 拖拽源是卡片里的每个芯片（未分配功能 / 孤立定义），见 peripheralUnassignedChips。
-            // 用户第 6 项：卡片支持批量选择（Ctrl+点击 / 右键框选），选中的卡片带 .selected 高亮，
-            // 它的芯片样式由 CSS（.card-block.selected .chip）统一处理。
             const selected = peripheralSelected(block.name);
-            return '<div class="card-block' + (selected ? ' selected' : '') + '"' +
-                ' data-peripheral-card="' + escapeHtml(block.name) + '">' +
-                // 标题行本身可拖（用户第 6 项）：拖卡片标题 = 把这张（或选中的那一批）外设拖到机器/容器卡片上；
-                // 卡片里的芯片仍然各自可拖（带各自的种类）。不写 data-drag-kind：种类按外设自己的能力推断。
-                '<div class="peripheral-card-head" draggable="true"' +
+            const hit = !filtering || peripheralMatchesSearch(block, query);
+            // A container peripheral whose slot information (slot count or slot capacity)
+            // has not been read yet: outline its card in the warn colour and explain why.
+            const scanPending = pendingScan.has(String(block.name));
+            const issueText = scanPending
+                ? (containerIssueReasonText(block.name) || t('peripheralCapacityScanning'))
+                : null;
+            const bodyChips = block.chips.length > 0 ? block.chips
+                : ['<span class="chip capacity-pending"><i class="fa fa-hourglass-half"></i> ' +
+                    escapeHtml(t('peripheralSlotScanPending')) + '</span>'];
+            return '<div class="card-block' + (selected ? ' selected' : '') +
+                (scanPending ? ' capacity-pending' : '') +
+                (filtering ? (hit ? ' ifm-search-hit' : ' ifm-search-dim') : '') + '"' +
+                ' data-peripheral-card="' + escapeHtml(block.name) + '"' +
+                (issueText
+                    ? ' data-tip-text="' + escapeHtml(issueText) + '"'
+                    : '') + '>' +
+                '<div class="peripheral-card-head"' +
                 ' data-drag-peripheral="' + escapeHtml(block.name) + '"' +
                 ' title="' + escapeHtml(t('peripheralDragHint')) + '">' +
                 peripheralTitleHtml(block.name) + '</div>' +
-                '<div class="chip-list">' + block.chips.join('') + '</div>' +
+                '<div class="chip-list">' + bodyChips.join('') + '</div>' +
                 '</div>';
         }).join('');
         el('peripheralList').innerHTML = html ||
             ('<span class="muted">' + escapeHtml(t('peripheralsAllAssigned')) + '</span>');
         renderPeripheralSelectionHint();
 
-        // 机器类型卡片、存储容器卡片、缺失外设：各自一块（显示顺序由 index.html 决定）
         const machineBox = el('machineTypeList');
-        if (machineBox) machineBox.innerHTML = machinesHtml();
+        if (machineBox) machineBox.innerHTML = machinesHtml(query);
         const storageBox = el('storageList');
-        if (storageBox) storageBox.innerHTML = storageCardsHtml();
-        // 输入容器卡片（1.6.10）：与存储卡片同构，角色是 input
+        if (storageBox) storageBox.innerHTML = storageCardsHtml(query);
         const inputBox = el('inputList');
-        if (inputBox) inputBox.innerHTML = inputCardsHtml();
-        // 输出容器卡片（1.8.0，用户第 6 项）：role=output —— 拖外设进来会弹出容器定义弹窗
+        if (inputBox) inputBox.innerHTML = inputCardsHtml(query);
         const outputBox = el('outputList');
-        if (outputBox) outputBox.innerHTML = outputCardsHtml();
+        if (outputBox) outputBox.innerHTML = outputCardsHtml(query);
         const missing = Array.from(stores.missing.values()).filter(function (item) {
             return missingMatchesSearch(item, query);
         }).sort(function (a, b) { return String(a.name).localeCompare(String(b.name)); });
@@ -649,7 +1051,6 @@
                     '<div class="card-head">' +
                     '<h3><i class="fa fa-exclamation-triangle"></i> ' + escapeHtml(t('missingPeripheral')) +
                     ' <span class="muted">' + missing.length + '</span></h3>' +
-                    // 用户第 2 项：一键删除 —— 所有缺失定义一次删掉（单条删除是 chip 里的垃圾桶按钮）
                     '<button class="btn-pixel danger" type="button" data-delete-missing-all="1" title="' +
                     escapeHtml(t('missingDeleteAllHint')) + '"><i class="fa fa-trash"></i> ' +
                     escapeHtml(t('missingDeleteAll')) + '</button>' +
@@ -657,23 +1058,18 @@
                     '<div class="chip-list">' + missing.map(missingChipHtml).join('') + '</div></div>')
                 : '';
         }
-        // 排序按钮上显示当前模式
         const sortLabel = el('peripheralSortLabel');
         if (sortLabel) sortLabel.textContent = peripheralSortLabelText();
+        // The cards just changed: rebuild the Enter-focus list from the fresh DOM.
+        collectPeripheralSearchHits();
     }
 
-    // ===================== 机器 =====================
-    // 机器卡片里的三个“位置卡片”：输入容器 / 输出容器 / 红石信号（每个位置内部放外设卡片）
     const MACHINE_SLOTS = [
         { id: 'in', icon: 'fa-sign-in', label: 'machineSlotIn' },
         { id: 'out', icon: 'fa-sign-out', label: 'machineSlotOut' },
         { id: 'signal', icon: 'fa-bolt', label: 'machineSlotSignal' },
     ];
 
-    // 用户第 3 项：机器槽位里的外设卡片要能标出"这个引用指向的外设已经不在了"（红框）。
-    // 判定来源是服务端的「外设缺失」列表（Containers:missingPeripherals）：它给出的条目是
-    // { kind = "container" | "signal", name = 定义名 } —— 卡片上的键与它一一对应。
-    // 用服务端下发的列表（而不是前端自己猜"定义没了/外设没了"）可以避免推送还没到时的闪烁。
     function missingReferenceSet() {
         const set = new Set();
         Array.from(stores.missing.values()).forEach(function (item) {
@@ -682,7 +1078,6 @@
         return set;
     }
 
-    // 某个位置上的外设卡片清单（容器定义 → 背后的外设；信号定义 → 背后的红石外设）
     function machineSlotEntries(machine, slotId, missingRefs) {
         const refs = missingRefs || missingReferenceSet();
         const out = [];
@@ -692,7 +1087,6 @@
                 out.push({
                     defName: name,
                     kind: 'signal',
-                    // 信号定义还没回推时用定义名兜底（信号定义名通常就是外设名）
                     peripheral: def ? String(def.peripheral || '') : String(name || ''),
                     missing: refs.has('signal:' + String(name || ''))
                 });
@@ -708,11 +1102,7 @@
                 out.push({
                     defName: name,
                     kind: pair[0],
-                    // 非输出容器的定义名就是外设名（服务端 Store:containerNameFor）：
-                    // 定义还没回推时也能直接显示成外设名，不会闪一下“缺失外设”
                     peripheral: def ? String(def.peripheral || '') : String(name || ''),
-                    // 用户第 2 项（本轮）：服务端现在也会把"机器直接引用、但外设已经不在了"的名字
-                    // 放进缺失列表（kind = "machine"）—— 有线调制解调器重连后外设重新编号时就是它。
                     missing: refs.has('container:' + String(name || '')) ||
                         refs.has('machine:' + String(name || ''))
                 });
@@ -721,9 +1111,6 @@
         return out;
     }
 
-    // 位置卡片里的外设卡片：可拖拽 —— 拖到别的位置 = 换位置，拖到机器卡片外 = 从这台机器移出。
-    // 只读机器（用户第 3 项：海龟合成器）里的卡片例外：不能拖、也没有 × 删除按钮 ——
-    // 这些外设是后端按海龟自动生成/收回的归属，人工删掉没有意义。
     function machinePeripheralCardHtml(machine, slotId, entry, readOnly) {
         const kind = entry.kind;
         const badgeTitle = kind === 'signal' ? t('machineSlotSignal')
@@ -733,22 +1120,21 @@
         const badgeClass = kind === 'signal' ? 'chip-badge kind-signal' : 'chip-badge kind-' + kind + '-' + slotId;
         const badgeIcon = kind === 'fluid' ? 'fa-tint' : (kind === 'signal' ? 'fa-bolt' : 'fa-cube');
         const peripheral = String(entry.peripheral || '');
-        // 用户第 3 项：这条引用指向的外设不在了（服务端的缺失列表里有它）→ 卡片加红框
         const missing = peripheral === '' || entry.missing === true;
         const text = missing ? entry.defName : peripheral;
-        // 用户第 2 项：输出容器允许自己命名 —— 名字和外设名不一样时补一个灰色标签，
-        // 机器卡片里也能一眼看出这个位置接的是哪条定义。
         const defLabel = String(entry.defName || '');
         const hasLabel = !missing && defLabel !== '' && defLabel !== peripheral;
-        // 标题里写清“哪个外设 / 哪条定义 + 在机器的哪个位置”：名字太长被省略号截断时靠它看全
         const title = (missing ? t('missingPeripheral') + ': ' + entry.defName : peripheral) +
             (hasLabel ? ' (' + defLabel + ')' : '') + ' · ' + badgeTitle;
-        // 本轮第 3 项：机器卡片里的外设芯片也能被选中（框选 / Ctrl+点击）—— 选中的带 .selected
         const selectedChip = peripheral !== '' && peripheralSelected(peripheral);
+        const scanPending = peripheral !== '' && capacityPendingPeripherals().has(peripheral);
         return '<span class="chip pc-chip' + (readOnly ? ' chip-readonly' : '') +
             (missing ? ' chip-missing' : '') +
+            (scanPending ? ' capacity-pending' : '') +
             (selectedChip ? ' selected' : '') + '"' +
-            (readOnly ? '' : ' draggable="true"') +
+            (scanPending
+                ? ' data-tip-text="' + escapeHtml(t('peripheralCapacityScanning')) + '"'
+                : '') +
             ' data-pc-peripheral="' + escapeHtml(peripheral) + '"' +
             ' data-pc-machine="' + escapeHtml(machine.name) + '"' +
             ' data-pc-slot="' + escapeHtml(slotId) + '"' +
@@ -766,14 +1152,13 @@
                 escapeHtml(t('machineRemove')) + '"><i class="fa fa-times"></i></button>') +
             '</span>';
     }
-    // 机器类型卡片（含机器卡片）+ 没有归属类型的机器：拼进「外设与定义」板块的末尾
-    // 层级：机器类型卡片 → 机器卡片 → 输入容器 / 输出容器 / 红石信号 → 外设卡片
-    // 预设机器类型（后端 Store.TURTLE_CRAFTER_TYPE）：机器由海龟自动出现
     const TURTLE_CRAFTER_TYPE = 'turtle_crafter';
+    const TYPE_CONVERSION_TYPE = 'type_conversion';
 
-    /// 机器类型显示名（用户第 1 项）：预设类型在网页上本地化（turtle_crafter → 海龟合成器），
-    /// 用户自定义类型原样显示（没有译文就退回原始类型名）。
-    const MACHINE_TYPE_LABEL_KEYS = { turtle_crafter: 'machineTypeTurtleCrafter' };
+    const MACHINE_TYPE_LABEL_KEYS = {
+        turtle_crafter: 'machineTypeTurtleCrafter',
+        type_conversion: 'machineTypeTypeConversion'
+    };
     function machineTypeLabel(name) {
         const key = MACHINE_TYPE_LABEL_KEYS[String(name)];
         if (!key) return String(name);
@@ -781,19 +1166,44 @@
         return (text && text !== key) ? text : String(name);
     }
 
-    function machinesHtml() {
+    // The icon a machine type defines (an item registry name), or '' when it has
+    // none - then the machine type card and the flow graph show no icon at all.
+    // The turtle crafter is the exception: a turtle running IFMCrafter is a
+    // crafting table on wheels, so it shows that icon unless one is set explicitly.
+    // Type conversion is a virtual chest-like bridge, so it shows a chest.
+    const DEFAULT_MACHINE_TYPE_ICONS = {
+        turtle_crafter: 'minecraft:crafting_table',
+        type_conversion: 'minecraft:chest'
+    };
+
+    function machineTypeIconName(typeName, icon) {
+        const own = String(icon === undefined || icon === null ? '' : icon).trim();
+        if (own) return own;
+        return DEFAULT_MACHINE_TYPE_ICONS[String(typeName || '')] || '';
+    }
+
+    function machineIconNameOf(typeName) {
+        const def = stores.machineTypes.get(String(typeName || ''));
+        return machineTypeIconName(typeName, def ? def.icon : '');
+    }
+
+    // The generic "cubes" glyph and a real machine icon are alternatives, not a
+    // pair: rendering both put two icons left of the machine type name.
+    function machineTypeCardIconHtml(typeName, icon) {
+        const name = machineTypeIconName(typeName, icon);
+        if (name) return machineIconHtml(name);
+        return '<i class="fa fa-cubes"></i> ';
+    }
+
+    function machinesHtml(query) {
+        const filtering = !searchQueryEmpty(query);
         const machines = Array.from(stores.machines.values());
         machines.sort(function (a, b) { return a.name.localeCompare(b.name); });
-        // 用户第 3 项：机器卡片里的外设卡片 / 位置框靠它标红（= 服务端「缺失外设」列表里的定义）
         const missingRefs = missingReferenceSet();
         const machineCard = function (machine) {
             const parallel = machine.parallel || 1;
             const running = machine.running || 0;
             const percent = Math.min(100, Math.round(running / Math.max(1, parallel) * 100));
-            // 只读机器（用户第 5 项 / 本轮第 1 项）：自动生成的机器（virtual = true，海龟合成器）
-            // **以及预设类型的机器**都只读 —— 不能点开编辑、不给红石信号位置
-            //（信号只能人工配置；海龟机器的输入/输出就是海龟自己）。
-            // 以前只按 virtual 判定：手工建的 / 旧配置里的同类型机器照样显示红石信号。
             const readOnly = machine.virtual === true || machineTypeIsReadOnly(machine.type);
             const slotInfos = readOnly ? MACHINE_SLOTS.filter(function (info) {
                 return info.id !== 'signal';
@@ -803,7 +1213,6 @@
                 const cards = entries.map(function (entry) {
                     return machinePeripheralCardHtml(machine, info.id, entry, readOnly);
                 }).join('');
-                // 用户第 3 项：这个位置里有"外设已缺失"的卡片 → 位置框也标红
                 const slotMissing = entries.some(function (entry) {
                     return String(entry.peripheral || '') === '' || entry.missing === true;
                 });
@@ -830,9 +1239,6 @@
                 '</div>';
         };
 
-        // 机器类型卡片右上角的「+ 机器」：新建的机器自动属于该类型（机器名仍按类型自动推导）。
-        // 预设类型 turtle_crafter 例外（用户第 1 项）：它的机器由海龟自己出现（后端 syncTurtleCrafters），
-        // 手工加机器没有意义 —— 这里只显示一句说明，不给按钮。
         const addMachineButton = function (type) {
             if (type === TURTLE_CRAFTER_TYPE) {
                 return '<span class="muted">' + escapeHtml(t('machineAutoTurtle')) + '</span>';
@@ -841,22 +1247,26 @@
                 '" title="' + escapeHtml(t('addMachineHint')) + '"><i class="fa fa-plus"></i> ' +
                 escapeHtml(t('machine')) + '</button>';
         };
-        const types = Array.from(stores.machineTypes.values());
+        // The type conversion type is virtual (no machine, no peripheral): it is not
+        // a card of its own here.
+        const types = Array.from(stores.machineTypes.values()).filter(function (item) {
+            return String(item.name) !== TYPE_CONVERSION_TYPE;
+        });
         types.sort(function (a, b) { return a.name.localeCompare(b.name); });
         const usedTypes = {};
         let html = types.map(function (item) {
             const children = machines.filter(function (machine) { return machine.type === item.name; });
             if (children.length > 0) usedTypes[item.name] = true;
             const typeLabel = machineTypeLabel(item.name);
-            // 用户第 3 项：预设类型（海龟合成器）的卡片不给编辑入口 —— 它没有人工可配的东西
-            //（机器由海龟自动出现）。属性不写，点击委托里也再挡一次（见 ifm-app.js）。
             const typeEditable = !machineTypeIsReadOnly(item.name);
-            return '<div class="card-block"' + (typeEditable
+            const hit = !filtering || machineTypeMatchesSearch(item, query);
+            return '<div class="card-block' +
+                (filtering ? (hit ? ' ifm-search-hit' : ' ifm-search-dim') : '') + '"' + (typeEditable
                 ? ' data-edit-machine-type="' + escapeHtml(item.name) + '"'
                 : ' data-machine-type-card="' + escapeHtml(item.name) + '"') +
                 '>' +
                 '<div class="card-head">' +
-                '<h3><i class="fa fa-cubes"></i> ' + escapeHtml(typeLabel) +
+                '<h3>' + machineTypeCardIconHtml(item.name, item.icon) + escapeHtml(typeLabel) +
                 (typeLabel === item.name ? '' :
                     ' <span class="muted">(' + escapeHtml(item.name) + ')</span>') +
                 ' <span class="muted">' + children.length + ' ' + escapeHtml(t('machine')) + '</span></h3>' +
@@ -869,7 +1279,8 @@
         }).join('');
         const orphans = machines.filter(function (machine) { return !usedTypes[machine.type]; });
         if (orphans.length > 0) {
-            html += '<div class="card-block" style="border-color:var(--warn)">' +
+            html += '<div class="card-block' + (filtering ? ' ifm-search-dim' : '') +
+                '" style="border-color:var(--warn)">' +
                 '<div class="card-head">' +
                 '<h3><i class="fa fa-cubes"></i> ' + escapeHtml(t('machineTypeField')) + ' ?</h3>' +
                 addMachineButton('') +
@@ -879,9 +1290,6 @@
         return html;
     }
 
-    // ===================== 过滤器 =====================
-    // 过滤器芯片的图标与资源网格里的“过滤器”项完全一致：用它自己的 samples 轮流显示
-    // （data-filter-icon / data-samples 会被 rotateFilterIcons 定时轮换）
     function filterPanelIconHtml(filterName) {
         const entry = stores.resources.get(resourceKey('filter', filterName));
         return filterIconHtml({ name: filterName, samples: entry ? asArray(entry.samples) : [] });
@@ -899,61 +1307,55 @@
         el('filterList').innerHTML = filtersHtml || ('<span class="muted">' + escapeHtml(t('noData')) + '</span>');
     }
 
-    // ===================== 流程依赖图（mermaid） =====================
-    // 某个材料（kind:id）由哪些流程产出 → 这台材料“正在合成 / 剩余目标”的合计。
-    //   正在合成 = 各产出流程当前批次里材料已送到机器的份数（后端 record.active）
-    //   剩余目标 = 各产出流程还需要合成的份数（后端 record.remaining）
-    // 例：下游流程要 10 份 + 用户手动要 15 份、已合成 3 份 → 剩余 22；当前已送料 9 份 → 显示 9/22
-    function materialCraftCounts(kind, id) {
-        let active = 0;
-        let target = 0;
-        Array.from(stores.processes.values()).forEach(function (process) {
-            const produces = asArray(process.outputs).some(function (element) {
-                const elementKind = element.kind === 'placeholder' ? 'item' : element.kind;
-                const elementId = element.kind === 'placeholder' ? element.item : element.id;
-                return elementKind === kind && String(elementId || '') === String(id || '');
-            });
-            if (!produces) return;
-            const record = stores.runtime.get(process.name);
-            if (!record) return;
-            active += Number(record.active) || 0;
-            target += Number(record.remaining) || 0;
-        });
-        return { active: active, target: target };
-    }
-
     function materialNodeLabel(kind, id) {
         if (kind === 'filter') return t('filterKind2') + ' ' + id;
         return displayName(kind, id);
     }
 
-    // 材料节点的图标：在 mermaid 渲染完成后再写进 DOM（见 applyGraphIcons）。
-    // 为什么不直接写在 mermaid 的节点标签里：节点标签会被 mermaid 自己加工（HTML 标签在它手里
-    // 不可靠：实测 <img> 到不了最终 SVG 里），于是标签只剩一个定尺占位符，
-    // 渲染完拿到真正的 DOM 之后再把图标塞进去 —— 和资源网格用的是同一套图标逻辑
-    // （乐观图片 + 加载失败时换成名称兜底）。
-    //
-    // 占位符自带 inline 宽高：mermaid 量节点尺寸时看得到它（CSS 里的 #graph svg ... 选择器
-    // 在量尺寸的临时容器里不生效），所以节点大小仍然按 26×26 的图标算。
-    // 同时图里用 %%{init}%% 强制 htmlLabels：这样占位符是 HTML 元素、量出来的尺寸才准。
     const GRAPH_ICON_HOLDER =
         "<span class='ifm-graph-icon' style='display:inline-block;width:26px;height:26px'></span>";
 
-    // 图标内容（写进占位符里的东西）：物品/流体用接口图片，其它用类型字形
     function graphIconContentHtml(kind, id) {
+        if (kind === 'filter') {
+            // Same idea as the resource panel: cycle through the matching
+            // resources (the shared iconIndex keeps graph and panel in step).
+            // The rotating holder is emitted even before the samples are known
+            // (with the generic glyph inside): rotateFilterIcons() later pulls the
+            // freshest samples from the resource store, which a plain glyph could
+            // never start doing.
+            const entry = stores.resources.get(resourceKey('filter', id));
+            const samples = entry ? asArray(entry.samples) : [];
+            if (samples.length === 0) {
+                return "<span data-filter-icon='" + escapeHtml(id) + "' data-samples='[]'>" +
+                    "<i class='fa " + iconGlyphClass(kind) + "' style='font-size:20px'></i></span>";
+            }
+            const sample = samples[(iconIndex.get(id) || 0) % samples.length];
+            queueMeta(sample.kind, sample.name);
+            return "<span data-filter-icon='" + escapeHtml(id) + "' data-samples='" +
+                escapeHtml(JSON.stringify(samples)) + "'>" +
+                plainIconImg(sample.kind, sample.name) + '</span>';
+        }
         if (kind !== 'item' && kind !== 'fluid') {
             return "<i class='fa " + iconGlyphClass(kind) + "' style='font-size:20px'></i>";
         }
         queueMeta(kind, id);
-        // plainIconImg：单张图片 + data-icon-key + onerror → ifmIconFallback（名称兜底），
-        // 与资源网格、库存选择弹窗完全一致
         return plainIconImg(kind, id);
     }
 
-    // 渲染后把图标写进材料节点：先找占位符（能保住 class 时最省事），找不到就退回到标签容器
     function applyGraphIcons(container) {
         Array.prototype.forEach.call(container.querySelectorAll('g.node'), function (node) {
-            const match = /(^|-)M(\d+)(-|$)/.exec(node.id || '');
+            const id = String(node.id || '');
+            const processMatch = /(^|-)P(\d+)(-|$)/.exec(id);
+            if (processMatch) {
+                // The process node shows its machine type icon instead of the dot;
+                // without an icon (or while the icon is not known yet) the dot stays.
+                const icon = nodeMachineIcon.get('P' + processMatch[2]);
+                if (!icon) return;
+                const iconHolder = node.querySelector('.ifm-graph-machine-icon');
+                if (iconHolder) iconHolder.innerHTML = machineIconHtml(icon);
+                return;
+            }
+            const match = /(^|-)M(\d+)(-|$)/.exec(id);
             if (!match) return;
             const material = nodeMaterial.get('M' + match[2]);
             if (!material) return;
@@ -961,7 +1363,6 @@
                 node.querySelector('.label');
             if (!holder) return;
             if (holder.classList && holder.classList.contains('ifm-graph-icon')) {
-                // 占位符还在：只换里面的内容（外面的定尺样式保留）
                 holder.innerHTML = graphIconContentHtml(material.kind, material.id);
                 return;
             }
@@ -970,29 +1371,899 @@
         });
     }
 
-    // 依赖图：材料节点 ↔ 流程节点交替连接（流程之间不直连、材料之间也不直连）
-    //   材料节点：正方形，只显示物品图标       流程节点：圆形，不带文本
-    // 两类节点的详细信息（名称 / 库存 / 状态 / 批次…）都在鼠标悬停时显示。
-    const GRAPH_DOT = "<span class='ifm-graph-dot'></span>";
+    // --- flow graph search --------------------------------------------------
+    // A node is a hit when *every* token matches one of its searchable texts:
+    //   plain token -> registry name / display name / machine type name
+    //   @token      -> the namespace (mod) of a registry name
+    function graphNodeSearchTexts(nodeId) {
+        const id = String(nodeId || '');
+        const texts = [];
+        const mods = [];
+        // Pinyin is matched against the *displayed* (Chinese) label, so it is kept
+        // apart from the lowercased substring texts above.
+        const pinyin = [];
+        const addPinyin = function (zh, en) {
+            const label = String(zh === undefined || zh === null ? '' : zh);
+            if (label) pinyin.push({ zh: label, en: String(en === undefined || en === null ? '' : en) });
+        };
+        const material = nodeMaterial.get(id);
+        if (material) {
+            const name = String(material.id || '');
+            if (name) {
+                texts.push(name.toLowerCase());
+                mods.push(modOfName(name));
+            }
+            const placeholder = String(material.placeholder || '');
+            const label = placeholder
+                ? t('placeholderKind') + ' ' + placeholder
+                : materialNodeLabel(material.kind, name);
+            try {
+                texts.push(String(label).toLowerCase());
+                if (placeholder) {
+                    // Both names are searchable: the placeholder's own and the item
+                    // it stands for (the node itself is drawn with the item's icon).
+                    texts.push(placeholder.toLowerCase());
+                    addPinyin(placeholder, placeholder);
+                    addPinyin(displayName('item', name), englishName('item', name));
+                } else {
+                    addPinyin(displayName(material.kind, name), englishName(material.kind, name));
+                }
+            } catch (err) {  }
+            return { texts: texts, mods: mods, pinyin: pinyin };
+        }
+        const processName = nodeProcess.get(id);
+        if (!processName) return { texts: texts, mods: mods, pinyin: pinyin };
+        const process = stores.processes.get(processName) || {};
+        texts.push(String(processName).toLowerCase());
+        const typeName = String(process.machineType || '');
+        if (typeName) {
+            texts.push(typeName.toLowerCase());
+            texts.push(String(machineTypeLabel(typeName)).toLowerCase());
+            mods.push(modOfName(typeName));
+            try { addPinyin(machineTypeLabel(typeName), ''); } catch (err) {  }
+        }
+        try {
+            texts.push(String(processTitleText(process)).toLowerCase());
+            addPinyin(processTitleText(process), '');
+        } catch (err) {  }
+        return { texts: texts, mods: mods, pinyin: pinyin };
+    }
 
-    // 材料节点 id（M0 / M1 …）→ { kind, id }：渲染完成后点节点图标时用它弹「合成 N 个」
+    function graphNodeMatches(nodeId, query) {
+        const info = graphNodeSearchTexts(nodeId);
+        const allHit = function (list, terms) {
+            for (let i = 0; i < terms.length; i += 1) {
+                let found = false;
+                for (let j = 0; j < list.length && !found; j += 1) {
+                    if (list[j].indexOf(terms[i]) >= 0) found = true;
+                }
+                if (!found) return false;
+            }
+            return true;
+        };
+        const termHit = function (term) {
+            for (let i = 0; i < info.texts.length; i += 1) {
+                if (info.texts[i].indexOf(term) >= 0) return true;
+            }
+            // Pinyin (Chinese mode only): the node shows a Chinese name while the
+            // player types its latin initials/syllables.
+            const pairs = info.pinyin || [];
+            for (let i = 0; i < pairs.length; i += 1) {
+                try {
+                    if (pinyinSearchHit(term, pairs[i].zh, pairs[i].en)) return true;
+                } catch (err) {
+                    // The optional pinyin dictionary is missing: keep the plain
+                    // substring behaviour instead of breaking the graph render.
+                    return false;
+                }
+            }
+            return false;
+        };
+        for (let i = 0; i < query.terms.length; i += 1) {
+            if (!termHit(query.terms[i])) return false;
+        }
+        return allHit(info.mods, query.mods);
+    }
+
+    // The nodes the last applyGraphSearch marked as hits, in document order: Enter in
+    // the search box walks through them (focusGraphSearchHit).
+    let graphSearchHitNodes = [];
+    let graphSearchFocusIndex = -1;
+
+    // Returns the number of hits, or -1 while the search box is empty (then every
+    // node is shown undimmed).
+    function applyGraphSearch(container) {
+        const root = container || el('graph');
+        if (!root || !root.querySelectorAll) return -1;
+        const query = parseSearchQuery(graphSearchText);
+        const empty = searchQueryEmpty(query);
+        graphSearchHitNodes = [];
+        graphSearchFocusIndex = -1;
+        Array.prototype.forEach.call(root.querySelectorAll('g.node'), function (node) {
+            const match = /(^|-)([PM]\d+)(-|$)/.exec(String(node.id || ''));
+            const nodeId = match ? match[2] : '';
+            const hit = !empty && nodeId !== '' && graphNodeMatches(nodeId, query);
+            if (node.classList) {
+                node.classList.remove('ifm-graph-focus');
+                node.classList.toggle('ifm-graph-hit', hit);
+                node.classList.toggle('ifm-graph-dim', !empty && !hit);
+            }
+            if (hit) graphSearchHitNodes.push(node);
+        });
+        return empty ? -1 : graphSearchHitNodes.length;
+    }
+
+    function scrollGraphNodeIntoView(node) {
+        const container = el('graph');
+        if (!container || !node || !node.getBoundingClientRect) return;
+        const box = container.getBoundingClientRect();
+        const rect = node.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) return;
+        const targetLeft = container.scrollLeft + (rect.left - box.left) - (box.width - rect.width) / 2;
+        const targetTop = container.scrollTop + (rect.top - box.top) - (box.height - rect.height) / 2;
+        const left = Math.max(0, targetLeft);
+        const top = Math.max(0, targetTop);
+        if (typeof container.scrollTo === 'function') {
+            try {
+                container.scrollTo({ left: left, top: top, behavior: 'smooth' });
+                return;
+            } catch (err) {  }
+        }
+        container.scrollLeft = left;
+        container.scrollTop = top;
+    }
+
+    // Enter in the graph search walks through the hits: every press focuses the next
+    // match and scrolls #graph so the node is centred; it wraps around at the end.
+    function focusGraphSearchHit() {
+        if (graphSearchHitNodes.length === 0) return false;
+        graphSearchFocusIndex = (graphSearchFocusIndex + 1) % graphSearchHitNodes.length;
+        const node = graphSearchHitNodes[graphSearchFocusIndex];
+        if (!node) return false;
+        graphSearchHitNodes.forEach(function (other) {
+            if (other !== node) other.classList.remove('ifm-graph-focus');
+        });
+        node.classList.add('ifm-graph-focus');
+        scrollGraphNodeIntoView(node);
+        return true;
+    }
+
+    // --- flow graph SVG export ----------------------------------------------
+    const GRAPH_FONT_CSS_URL =
+        'https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.5.2/css/all.min.css';
+    let graphFontCssPromise = null;
+
+    function mimeOfUrl(url) {
+        const match = /\.([a-z0-9]+)(?:[?#]|$)/i.exec(String(url));
+        const ext = match ? match[1].toLowerCase() : '';
+        if (ext === 'woff2') return 'font/woff2';
+        if (ext === 'woff') return 'font/woff';
+        if (ext === 'ttf') return 'font/ttf';
+        if (ext === 'otf') return 'font/otf';
+        if (ext === 'eot') return 'application/vnd.ms-fontobject';
+        if (ext === 'svg') return 'image/svg+xml';
+        if (ext === 'png') return 'image/png';
+        if (ext === 'gif') return 'image/gif';
+        if (ext === 'jpg' || ext === 'jpeg') return 'image/jpeg';
+        if (ext === 'webp') return 'image/webp';
+        return 'application/octet-stream';
+    }
+
+    function bytesToBase64(buffer) {
+        const bytes = new Uint8Array(buffer);
+        let binary = '';
+        const chunk = 0x8000;
+        for (let index = 0; index < bytes.length; index += chunk) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(index, index + chunk));
+        }
+        return btoa(binary);
+    }
+
+    // Downloads a referenced asset and returns it as a data: URI. A downloaded
+    // SVG is opened far away from this page, so every icon/font it references has
+    // to travel inside the file instead of pointing at a url.
+    function fetchAsDataUrl(url) {
+        return fetch(url).then(function (response) {
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            return response.arrayBuffer();
+        }).then(function (buffer) {
+            return 'data:' + mimeOfUrl(url) + ';base64,' + bytesToBase64(buffer);
+        });
+    }
+
+    // Font Awesome is a font: its CSS only carries url(...) references to the
+    // woff2 files, so they are fetched and embedded too (falling back to the
+    // absolute url if a fetch fails). The mermaid labels are HTML
+    // (<foreignObject>) and use those glyphs: without the embedded sheet a
+    // downloaded file shows empty boxes.
+    function embedCssAssets(css, cssUrl) {
+        const urls = [];
+        const tokens = {};
+        const withTokens = String(css).replace(/url\((['"]?)([^'")]+)\1\)/g, function (all, quote, url) {
+            if (/^(data:|#)/i.test(url)) return all;
+            let absolute = url;
+            try { absolute = new URL(url, cssUrl).href; } catch (err) {  }
+            let token = tokens[absolute];
+            if (!token) {
+                token = '__IFM_ASSET_' + urls.length + '__';
+                tokens[absolute] = token;
+                urls.push(absolute);
+            }
+            return 'url(' + quote + token + quote + ')';
+        });
+        if (urls.length === 0) return Promise.resolve(withTokens);
+        return Promise.all(urls.map(function (url) {
+            return fetchAsDataUrl(url).catch(function (err) {
+                serverLog('[IFM] graph export: cannot inline ' + url + ' (' +
+                    ((err && err.message) || err) + ')');
+                return url;
+            });
+        })).then(function (results) {
+            const map = {};
+            urls.forEach(function (url, index) { map['__IFM_ASSET_' + index + '__'] = results[index]; });
+            return withTokens.replace(/__IFM_ASSET_\d+__/g, function (token) {
+                return map[token] || token;
+            });
+        });
+    }
+
+    function inlineGraphFontCss(svgElement) {
+        if (!window.fetch) return Promise.resolve();
+        if (!graphFontCssPromise) {
+            graphFontCssPromise = fetch(GRAPH_FONT_CSS_URL)
+                .then(function (response) {
+                    if (!response.ok) throw new Error('HTTP ' + response.status);
+                    return response.text();
+                })
+                .then(function (css) {
+                    return embedCssAssets(css, GRAPH_FONT_CSS_URL);
+                })
+                .catch(function (err) {
+                    graphFontCssPromise = null;
+                    serverLog('[IFM] graph export: cannot inline the Font Awesome stylesheet (' +
+                        ((err && err.message) || err) + '): the exported SVG has no icons');
+                    return '';
+                });
+        }
+        return graphFontCssPromise.then(function (css) {
+            if (!css || !svgElement) return;
+            const style = document.createElementNS('http://www.w3.org/2000/svg', 'style');
+            style.textContent = css;
+            svgElement.insertBefore(style, svgElement.firstChild);
+        });
+    }
+
+    // The <img> icons (icon exports / blocksitems API) are embedded as data:
+    // URIs; a failed fetch falls back to the absolute url so the export still
+    // happens, just with a couple of remote references.
+    function inlineGraphImages(svgElement) {
+        if (!svgElement || !window.fetch) return Promise.resolve();
+        const jobs = [];
+        Array.prototype.forEach.call(svgElement.querySelectorAll('img'), function (img) {
+            const src = img.getAttribute('src');
+            if (!src || /^data:/i.test(src)) return;
+            let absolute = src;
+            try { absolute = new URL(String(src), document.baseURI).href; } catch (err) {  }
+            jobs.push(fetchAsDataUrl(absolute).then(function (dataUrl) {
+                img.setAttribute('src', dataUrl);
+            }).catch(function (err) {
+                img.setAttribute('src', absolute);
+                serverLog('[IFM] graph export: cannot inline ' + absolute + ' (' +
+                    ((err && err.message) || err) + ')');
+            }));
+        });
+        return Promise.all(jobs);
+    }
+
+    // The exported file is opened away from this page, so it does not carry
+    // ifm.css: the icon boxes (26px node icons, 20/24px machine icons, the pixel
+    // rendering) have to be frozen as inline styles, otherwise an <img> falls back
+    // to its intrinsic pixel size and the node label clips it (only the top-left
+    // part stays visible).
+    const GRAPH_BOX_SELECTOR =
+        'img, .ifm-graph-icon, .ifm-machine-icon, .ifm-graph-machine-icon, .ifm-graph-dot';
+
+    function freezeGraphBoxes(liveRoot, cloneRoot) {
+        if (!liveRoot || !cloneRoot || !window.getComputedStyle) return;
+        const liveNodes = liveRoot.querySelectorAll(GRAPH_BOX_SELECTOR);
+        const cloneNodes = cloneRoot.querySelectorAll(GRAPH_BOX_SELECTOR);
+        const count = Math.min(liveNodes.length, cloneNodes.length);
+        for (let index = 0; index < count; index += 1) {
+            const live = liveNodes[index];
+            const clone = cloneNodes[index];
+            if (!live || !clone) continue;
+            const computed = window.getComputedStyle(live);
+            if (!computed) continue;
+            const parts = [];
+            ['width', 'height', 'objectFit', 'display', 'imageRendering'].forEach(function (name) {
+                const value = computed[name];
+                if (!value) return;
+                parts.push(name.replace(/[A-Z]/g, function (ch) {
+                    return '-' + ch.toLowerCase();
+                }) + ':' + value);
+            });
+            if (parts.length === 0) continue;
+            const existing = clone.getAttribute('style');
+            clone.setAttribute('style',
+                (existing ? existing.replace(/;\s*$/, '') + ';' : '') + parts.join(';'));
+        }
+    }
+
+    // A safety net beside the frozen inline styles: the character fallback glyphs
+    // are sized by ifm.css too, and an unconstrained image must never overflow.
+    const GRAPH_EXPORT_FALLBACK_CSS = [
+        'img { max-width: 100%; max-height: 100%; object-fit: contain; }',
+        '.icon-text { line-height: 1; }',
+        '.icon-text[data-fallback-len="1"] { font-size: 20px; }',
+        '.icon-text[data-fallback-len="2"] { font-size: 16px; }',
+        '.icon-text[data-fallback-len="3"] { font-size: 12px; }',
+        '.icon-text[data-fallback-len="4"] { font-size: 10px; }',
+        '.ifm-graph-icon, .ifm-graph-machine-icon { display: inline-flex; align-items: center;' +
+            ' justify-content: center; }',
+        // Exported node backgrounds are transparent: on the page the panel colour is
+        // painted behind the graph, but a downloaded SVG is opened somewhere else, so
+        // a baked-in dark fill would show up as an unwanted box.
+        '.node .label-container, .node rect, .node circle, .node ellipse, .node polygon' +
+            ' { fill: transparent !important; }',
+    ].join('\n');
+
+    function injectExportStyle(svgElement, css) {
+        if (!svgElement || !css) return;
+        const style = document.createElementNS('http://www.w3.org/2000/svg', 'style');
+        style.textContent = css;
+        svgElement.insertBefore(style, svgElement.firstChild);
+    }
+
+    function graphSvgExportText() {
+        const container = el('graph');
+        const live = container ? container.querySelector('svg') : null;
+        if (!live) return Promise.resolve('');
+        const clone = live.cloneNode(true);
+        clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+        clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink');
+        freezeGraphBoxes(live, clone);
+        injectExportStyle(clone, GRAPH_EXPORT_FALLBACK_CSS);
+        return inlineGraphImages(clone).then(function () {
+            return inlineGraphFontCss(clone);
+        }).then(function () {
+            return new XMLSerializer().serializeToString(clone);
+        });
+    }
+
+    // Exported file name: "IFMGraph-<room hash>-<timestamp>.svg". The room name is
+    // hashed (djb2, 8 hex digits) so the file stays recognisable without leaking the
+    // room name itself into a shared download.
+    function graphExportFileName() {
+        const roomName = String((typeof room === 'string' && room) || '').trim() || 'room';
+        let hash = 5381;
+        for (let i = 0; i < roomName.length; i += 1) {
+            hash = ((hash * 33) ^ roomName.charCodeAt(i)) >>> 0;
+        }
+        const now = new Date();
+        const pad = function (value) { return (value < 10 ? '0' : '') + value; };
+        const stamp = String(now.getFullYear()) + pad(now.getMonth() + 1) + pad(now.getDate()) + '-' +
+            pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds());
+        return 'IFMGraph-' + hash.toString(16) + '-' + stamp + '.svg';
+    }
+
+    function downloadGraphSvg() {
+        // The export has to fetch and embed every icon/font, which takes a moment:
+        // answer the click right away (spinner on the button + a toast) instead of
+        // leaving the button looking dead until the file is ready.
+        const button = el('graphSvgBtn');
+        const setBusy = function (busy) {
+            if (button) setButtonBusyById('graphSvgBtn', busy);
+        };
+        setBusy(true);
+        toast(t('graphDownloading'), 'info');
+        return graphSvgExportText().then(function (svgText) {
+            if (!svgText) {
+                toast(t('graphDownloadEmpty'), 'error');
+                setBusy(false);
+                return;
+            }
+            const blob = new Blob(['<?xml version="1.0" encoding="UTF-8"?>\n' + svgText],
+                { type: 'image/svg+xml;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = graphExportFileName();
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+            toast(t('graphDownloaded'), 'success');
+            setBusy(false);
+        }, function (err) {
+            serverLog('[IFM] graph export failed: ' + ((err && err.message) || err));
+            toast(t('graphDownloadEmpty'), 'error');
+            setBusy(false);
+        });
+    }
+    window.ifmDownloadGraphSvg = downloadGraphSvg;
+
+    // The dot has no text, so its size must be inline (or globally styled): mermaid
+    // measures the label in a temporary container where #graph-scoped CSS does not
+    // apply, and a 0-size placeholder would make the measured node differ from the
+    // rendered one.
+    const GRAPH_DOT = "<span class='ifm-graph-dot' style='display:inline-block;width:9px;" +
+        "height:9px;border-radius:50%;background:var(--accent);vertical-align:middle'></span>";
+
+    // The synthetic node of an auto-discovered containment (an output material that
+    // is a subset of an input filter): a clickable "+" that opens the process editor
+    // prefilled with a type conversion process.
+    const GRAPH_BRIDGE = "<span class='ifm-graph-bridge' style='display:inline-block;width:20px;" +
+        "height:20px;line-height:18px;box-sizing:border-box;border:1px dashed #c9a4ff;" +
+        "border-radius:4px;color:#c9a4ff;vertical-align:middle'>+</span>";
+
+    // Same idea as the material icons, but for the process nodes of a machine type
+    // that carries an icon: the holder is filled after mermaid rendered the label
+    // (an inline onerror handler inside a mermaid label is not reliable).
+    const GRAPH_MACHINE_ICON_HOLDER = "<span class='ifm-graph-machine-icon' " +
+        "style='display:inline-block;width:24px;height:24px;vertical-align:middle'></span>";
+    const nodeMachineIcon = new Map();
+
     const nodeMaterial = new Map();
+    // Synthetic bridge node id -> { input, filter } for the prefilled editor.
+    const nodeConversion = new Map();
+
+    // ---- filter containment (mirrors backend/modules/filter.lua) --------------
+    // The dependency graph has to know when one process's output (item/fluid/filter)
+    // is a subset of another process's input filter. It is derived from the filter
+    // rules here, best effort: item tags come from the resources the server shipped,
+    // so a tag rule whose members are unknown simply never matches. The backend stays
+    // authoritative for the actual planning; this only draws the edges.
+    const FILTER_INCLUDE_TYPES = {
+        item_include: true, fluid_include: true, itemTag_include: true,
+        fluidTag_include: true, filter_include: true
+    };
+    let filterCache = { key: null, dnf: {}, subset: {}, active: {} };
+
+    function filtersSignature() {
+        const parts = [];
+        stores.filters.forEach(function (def) {
+            const rules = asArray(def.rules).map(function (rule) {
+                return [rule.type, rule.id, rule.nbt || '', rule.ignoreNbt ? 1 : 0].join('~');
+            }).join(',');
+            parts.push(String(def.name) + '=' + rules);
+        });
+        parts.sort();
+        return parts.join('|');
+    }
+
+    // Editing any filter changes the signature, which drops every memoised DNF and
+    // subset answer at once - the same "filter changed, cache cleared" rule as the
+    // backend revision key.
+    function ensureFilterCache() {
+        const key = filtersSignature();
+        if (key !== filterCache.key) {
+            filterCache = { key: key, dnf: {}, subset: {}, active: {} };
+        }
+    }
+
+    function resourceTagsOf(kind, name) {
+        if (kind !== 'item') return [];
+        const entry = stores.resources.get(resourceKey('item', name));
+        return entry ? asArray(entry.tags) : [];
+    }
+
+    function resourceHasTag(resource, tag) {
+        const own = asArray(resource.tags);
+        const tags = own.length ? own : resourceTagsOf(resource.kind, resource.name);
+        return tags.indexOf(tag) >= 0;
+    }
+
+    function filterSampleHit(filterName, resource) {
+        const entry = stores.resources.get(resourceKey('filter', filterName));
+        if (!entry) return false;
+        return asArray(entry.samples).some(function (sample) {
+            return sample.kind === resource.kind && sample.name === resource.name;
+        });
+    }
+
+    function filterLiteralOfRule(rule) {
+        let kind, literalType;
+        if (rule.type === 'item_include' || rule.type === 'item_exclude') {
+            kind = 'item'; literalType = 'item';
+        } else if (rule.type === 'fluid_include' || rule.type === 'fluid_exclude') {
+            kind = 'fluid'; literalType = 'item';
+        } else if (rule.type === 'itemTag_include' || rule.type === 'itemTag_exclude') {
+            kind = 'item'; literalType = 'tag';
+        } else if (rule.type === 'fluidTag_include' || rule.type === 'fluidTag_exclude') {
+            kind = 'fluid'; literalType = 'tag';
+        } else if (rule.type === 'filter_include' || rule.type === 'filter_exclude') {
+            kind = 'filter'; literalType = 'filter';
+        } else {
+            return null;
+        }
+        return { kind: kind, type: literalType, id: rule.id, nbt: rule.nbt, ignoreNbt: !!rule.ignoreNbt };
+    }
+
+    function filterRuleMatches(rule, resource, seen, depth) {
+        const type = rule.type;
+        if (type === 'item_include' || type === 'item_exclude') {
+            if (resource.kind !== 'item' || resource.name !== rule.id) return false;
+            if (rule.ignoreNbt) return true;
+            return String(rule.nbt || '') === String(resource.nbt || '');
+        }
+        if (type === 'fluid_include' || type === 'fluid_exclude') {
+            if (resource.kind !== 'fluid' || resource.name !== rule.id) return false;
+            if (rule.ignoreNbt) return true;
+            return String(rule.nbt || '') === String(resource.nbt || '');
+        }
+        if (type === 'itemTag_include' || type === 'itemTag_exclude') {
+            return resource.kind === 'item' && resourceHasTag(resource, rule.id);
+        }
+        if (type === 'fluidTag_include' || type === 'fluidTag_exclude') {
+            return resource.kind === 'fluid' && resourceHasTag(resource, rule.id);
+        }
+        if (type === 'filter_include' || type === 'filter_exclude') {
+            return filterMatches(rule.id, resource, seen, depth);
+        }
+        return false;
+    }
+
+    function filterMatches(filterName, resource, seen, depth) {
+        const def = stores.filters.get(String(filterName));
+        if (!def) return false;
+        seen = seen || {};
+        depth = depth || 0;
+        if (depth > 16 || seen[filterName]) return false;
+        seen[filterName] = true;
+        let hasInclude = false, matched = false, excluded = false;
+        asArray(def.rules).forEach(function (rule) {
+            const include = FILTER_INCLUDE_TYPES[rule.type] === true;
+            if (include) hasInclude = true;
+            if (filterRuleMatches(rule, resource, seen, depth + 1)) {
+                if (include) matched = true;
+                else excluded = true;
+            }
+        });
+        seen[filterName] = false;
+        if (!hasInclude) matched = true;
+        if (!(matched && !excluded) && filterSampleHit(filterName, resource)) {
+            // The server listed this stored resource as a match; trust it over a rule
+            // whose tag membership is simply not known on the client.
+            return true;
+        }
+        return matched && !excluded;
+    }
+
+    function filterLiteralImplies(l2, l1) {
+        if (!l2 || !l1) return false;
+        if (l2.type === 'filter' || l1.type === 'filter') {
+            if (l2.type === 'filter' && l1.type === 'filter') {
+                return l2.id === l1.id || filterIsSubset(l2.id, l1.id);
+            }
+            return false;
+        }
+        if (l2.kind !== l1.kind) return false;
+        if (l1.type === 'item') {
+            if (l2.type !== 'item' || l2.id !== l1.id) return false;
+            if (l1.ignoreNbt) return true;
+            if (l2.ignoreNbt) return false;
+            return String(l2.nbt || '') === String(l1.nbt || '');
+        }
+        if (l1.type === 'tag') {
+            if (l2.type === 'item') {
+                return resourceHasTag({ kind: l2.kind, name: l2.id }, l1.id);
+            }
+            if (l2.type === 'tag') return l2.id === l1.id;
+        }
+        return false;
+    }
+
+    function filterLiteralDisjoint(l2, l1) {
+        if (!l2 || !l1) return false;
+        if (l2.type === 'filter' || l1.type === 'filter') return false;
+        if (l2.kind !== l1.kind) return true;
+        if (l2.type === 'item' && l1.type === 'item') {
+            if (l2.id !== l1.id) return true;
+            if (l2.ignoreNbt || l1.ignoreNbt) return false;
+            return String(l2.nbt || '') !== String(l1.nbt || '');
+        }
+        let item = null, tag = null;
+        if (l2.type === 'item' && l1.type === 'tag') { item = l2; tag = l1; }
+        else if (l2.type === 'tag' && l1.type === 'item') { item = l1; tag = l2; }
+        if (item) return !resourceHasTag({ kind: item.kind, name: item.id }, tag.id);
+        return false;
+    }
+
+    function filterTermSubset(term, other) {
+        const otherPos = other.pos || [];
+        for (let i = 0; i < otherPos.length; i += 1) {
+            let ok = false;
+            const pos = term.pos || [];
+            for (let j = 0; j < pos.length; j += 1) {
+                if (filterLiteralImplies(pos[j], otherPos[i])) { ok = true; break; }
+            }
+            if (!ok) return false;
+        }
+        const otherNeg = other.neg || [];
+        for (let i = 0; i < otherNeg.length; i += 1) {
+            let covered = false;
+            const neg = term.neg || [];
+            for (let j = 0; j < neg.length; j += 1) {
+                if (filterLiteralImplies(otherNeg[i], neg[j])) { covered = true; break; }
+            }
+            if (!covered) {
+                const pos = term.pos || [];
+                if (pos.length === 0) return false;
+                for (let j = 0; j < pos.length; j += 1) {
+                    if (!filterLiteralDisjoint(otherNeg[i], pos[j])) return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    function filterAbsorbTerms(terms) {
+        if (terms.length <= 1) return terms;
+        const drop = {};
+        for (let i = 0; i < terms.length; i += 1) {
+            for (let j = 0; j < terms.length; j += 1) {
+                if (i === j || drop[j]) continue;
+                if (filterTermSubset(terms[i], terms[j])) {
+                    if (!filterTermSubset(terms[j], terms[i]) || j < i) { drop[i] = true; break; }
+                }
+            }
+        }
+        const kept = [];
+        for (let i = 0; i < terms.length; i += 1) {
+            if (!drop[i]) kept.push(terms[i]);
+        }
+        return kept.length ? kept : [terms[0]];
+    }
+
+    function filterDnfTerms(name, seen, depth) {
+        const def = stores.filters.get(String(name));
+        if (!def) return null;
+        seen = seen || {};
+        depth = depth || 0;
+        if (depth > 16 || seen[name]) return [];
+        seen[name] = true;
+        const includes = [], excludes = [];
+        asArray(def.rules).forEach(function (rule) {
+            if (FILTER_INCLUDE_TYPES[rule.type] === true) {
+                includes.push(rule);
+            } else {
+                const literal = filterLiteralOfRule(rule);
+                if (literal) excludes.push(literal);
+            }
+        });
+        const terms = [];
+        if (includes.length === 0) {
+            terms.push({ pos: [], neg: excludes.slice() });
+        } else {
+            includes.forEach(function (rule) {
+                if (rule.type === 'filter_include') {
+                    const nested = filterDnfTerms(rule.id, seen, depth + 1) || [];
+                    nested.forEach(function (nestedTerm) {
+                        terms.push({
+                            pos: (nestedTerm.pos || []).slice(),
+                            neg: (nestedTerm.neg || []).concat(excludes)
+                        });
+                    });
+                } else {
+                    const literal = filterLiteralOfRule(rule);
+                    if (literal) terms.push({ pos: [literal], neg: excludes.slice() });
+                }
+            });
+        }
+        seen[name] = false;
+        return filterAbsorbTerms(terms);
+    }
+
+    function filterDnf(name) {
+        ensureFilterCache();
+        if (filterCache.dnf[name]) return filterCache.dnf[name];
+        const terms = filterDnfTerms(name);
+        if (terms) filterCache.dnf[name] = terms;
+        return terms;
+    }
+
+    function filterIsSubset(subName, superName) {
+        if (subName === superName) return true;
+        ensureFilterCache();
+        const pair = String(subName) + '\u0001' + String(superName);
+        if (Object.prototype.hasOwnProperty.call(filterCache.subset, pair)) {
+            return filterCache.subset[pair];
+        }
+        if (filterCache.active[pair]) return false;
+        filterCache.active[pair] = true;
+        let result = false;
+        const subTerms = filterDnf(subName);
+        const superTerms = filterDnf(superName);
+        if (subTerms && superTerms) {
+            result = subTerms.every(function (subTerm) {
+                return superTerms.some(function (superTerm) {
+                    return filterTermSubset(subTerm, superTerm);
+                });
+            });
+        }
+        filterCache.active[pair] = false;
+        filterCache.subset[pair] = result;
+        return result;
+    }
+
+    // "That output material can feed an input filter." Items/fluids go through the
+    // matcher; a filter output has to be a subset of the input filter.
+    function materialSatisfiesFilter(element, filterName) {
+        if (!element) return false;
+        if (element.kind === 'item' || element.kind === 'fluid') {
+            return filterMatches(filterName, {
+                kind: element.kind, name: element.id, nbt: element.nbt,
+                ignoreNbt: element.ignoreNbt, tags: element.tags
+            });
+        }
+        if (element.kind === 'filter') {
+            return element.id === filterName || filterIsSubset(element.id, filterName);
+        }
+        if (element.kind === 'placeholder' && element.item) {
+            return filterMatches(filterName, { kind: 'item', name: element.item });
+        }
+        return false;
+    }
+
+    // Mermaid keeps the order in which nodes are declared, so declaring the
+    // processes in dependency order (a producer before the processes that consume
+    // its output) is what keeps the drawn graph from crossing itself: an
+    // alphabetical order puts unrelated chains next to each other and forces long
+    // back arrows across the whole panel.
+    function processGraphOrder(processes) {
+        const byName = new Map();
+        const edges = new Map();
+        const indegree = new Map();
+        const producers = new Map();
+        const materialKeyOf = function (element) {
+            if (elementIsAbstract(element)) return null;
+            if (element.kind === 'item' || element.kind === 'fluid') return element.kind + ':' + element.id;
+            if (element.kind === 'filter') return 'filter:' + element.id;
+            if (element.kind === 'placeholder' && element.item) return 'item:' + element.item;
+            return null;
+        };
+        processes.forEach(function (process) {
+            const name = String(process.name);
+            byName.set(name, process);
+            edges.set(name, {});
+            indegree.set(name, 0);
+        });
+        // The producer list keyed by material (identity) plus every output element, so
+        // an input filter can also be matched against the outputs that are a subset of
+        // it.
+        const outputElements = [];
+        processes.forEach(function (process) {
+            const name = String(process.name);
+            asArray(process.outputs).forEach(function (element) {
+                if (element.craft === false) return;
+                const key = materialKeyOf(element);
+                if (!key) return;
+                if (!producers.has(key)) producers.set(key, []);
+                producers.get(key).push(name);
+                outputElements.push({ producer: name, element: element });
+            });
+        });
+        const link = function (producer, consumer) {
+            // A process that feeds itself is not a dependency.
+            if (producer === consumer) return;
+            const out = edges.get(producer);
+            if (!out || out[consumer]) return;
+            out[consumer] = true;
+            indegree.set(consumer, indegree.get(consumer) + 1);
+        };
+        processes.forEach(function (process) {
+            const name = String(process.name);
+            asArray(process.inputs).forEach(function (element) {
+                const key = materialKeyOf(element);
+                if (!key) return;
+                asArray(producers.get(key)).forEach(function (producer) {
+                    link(producer, name);
+                });
+                // Filter containment: an item/fluid/filter output that is a subset of
+                // this input filter makes its producer an upstream dependency too.
+                if (element.kind === 'filter') {
+                    outputElements.forEach(function (entry) {
+                        if (materialSatisfiesFilter(entry.element, element.id)) {
+                            link(entry.producer, name);
+                        }
+                    });
+                }
+            });
+        });
+        const pending = processes.slice().sort(function (a, b) {
+            return String(a.name).localeCompare(String(b.name));
+        });
+        const ready = pending.filter(function (process) {
+            return indegree.get(String(process.name)) === 0;
+        });
+        const ordered = [];
+        const placed = {};
+        while (ready.length > 0) {
+            const next = ready.shift();
+            const name = String(next.name);
+            ordered.push(next);
+            placed[name] = true;
+            Object.keys(edges.get(name) || {}).sort().forEach(function (consumer) {
+                const left = indegree.get(consumer) - 1;
+                indegree.set(consumer, left);
+                if (left === 0) ready.push(byName.get(consumer));
+            });
+        }
+        // A dependency cycle leaves the rest without a zero indegree: append those
+        // in name order instead of dropping them from the graph.
+        pending.forEach(function (process) {
+            if (!placed[String(process.name)]) ordered.push(process);
+        });
+        return ordered;
+    }
+
+    // ---- graph layout (elk / dagre) -----------------------------------------
+    // The dependency graph can be laid out by the bundled ELK engine (default, since
+    // mermaid 12) or the classic dagre engine. The button in the panel header toggles
+    // it, and the choice is remembered per browser.
+    const GRAPH_LAYOUT_STORAGE = 'ifm.graphLayout';
+    const GRAPH_LAYOUTS = ['elk', 'dagre'];
+    let graphLayout = readSavedGraphLayout();
+
+    function readSavedGraphLayout() {
+        try {
+            const saved = localStorage.getItem(GRAPH_LAYOUT_STORAGE);
+            if (GRAPH_LAYOUTS.indexOf(saved) >= 0) return saved;
+        } catch (err) { }
+        return 'elk';
+    }
+
+    function graphLayoutLabelKey() {
+        return graphLayout === 'dagre' ? 'graphLayoutDagre' : 'graphLayoutElk';
+    }
+
+    function renderGraphLayoutButton() {
+        const label = el('graphLayoutLabel');
+        if (label) label.textContent = t(graphLayoutLabelKey());
+    }
+    window.ifmRenderGraphLayoutButton = renderGraphLayoutButton;
+
+    function setGraphLayout(next) {
+        if (GRAPH_LAYOUTS.indexOf(next) < 0 || next === graphLayout) return;
+        graphLayout = next;
+        try { localStorage.setItem(GRAPH_LAYOUT_STORAGE, next); } catch (err) { }
+        renderGraphLayoutButton();
+        graphCodeCache = null;
+        graphLangCache = null;
+        renderGraph();
+    }
+
+    window.ifmToggleGraphLayout = function () {
+        setGraphLayout(graphLayout === 'elk' ? 'dagre' : 'elk');
+    };
 
     function buildGraphCode() {
-        const processes = Array.from(stores.processes.values());
-        processes.sort(function (a, b) { return a.name.localeCompare(b.name); });
+        const processes = processGraphOrder(Array.from(stores.processes.values()));
+        // layout: ELK (default) places nodes with its layered algorithm and routes the
+        // edges itself; dagre is the classic engine, kept as a fallback the user can
+        // switch to. look classic + small padding/minNodeWidth keep the nodes tight.
+        // useMaxWidth off: mermaid must not squeeze a long chain down to the panel
+        // width, #graph scrolls horizontally instead.
+        const layoutInit = graphLayout === 'dagre'
+            ? '"layout": "dagre",'
+            : '"layout": "elk", "elk": {"nodePlacementStrategy": "BRANDES_KOEPF"},';
         const lines = [
-            // 强制 mermaid 用 HTML 标签：材料节点的标签是一个定尺 <span>（见 GRAPH_ICON_HOLDER），
-            // HTML 标签下量出来的尺寸才是 26×26；否则标签会被当成纯文本量尺寸，节点大小不对。
-            '%%{init: {"flowchart": {"htmlLabels": true}}}%%',
+            '%%{init: {"htmlLabels": true, "look": "classic", ' + layoutInit +
+                ' "flowchart": {"look": "classic", "useMaxWidth": false, "nodeSpacing": 45, "rankSpacing": 70,' +
+                ' "padding": 4, "wrappingWidth": 48, "minNodeWidth": 0}}}%%',
             'flowchart LR',
         ];
         nodeProcess.clear();
         nodeTooltip.clear();
         nodeMaterial.clear();
+        nodeMachineIcon.clear();
+        nodeConversion.clear();
         const materialIds = new Map();
         const materialLines = [];
         const edgeLines = [];
+        const inputLinks = [];
+        const outputLinks = [];
+        const subsetLinks = [];
 
         const materialKindOf = function (element) {
             return element.kind === 'placeholder' ? 'item' : element.kind;
@@ -1000,40 +2271,61 @@
         const materialIdOf = function (element) {
             return element.kind === 'placeholder' ? element.item : element.id;
         };
-        const materialNode = function (kind, id) {
+        // The tooltip of one material node. A placeholder-backed node is titled with
+        // the placeholder's own name and spells out the item it stands for; the icon
+        // and the craft request follow that item / that placeholder.
+        const materialTooltip = function (entry) {
+            const kind = entry.kind;
+            const id = entry.id;
+            const placeholder = entry.placeholder || '';
+            // No craft counters on materials: they describe the processes that
+            // produce this resource, so they are shown on those process nodes.
+            const details = [tipField(t('tipRegistry'), id)];
+            if (placeholder) {
+                details.push(tipField(t('tipKind'), resourceKindLabel('placeholder')));
+                details.push(tipField(t('tipPlaceholderItem'), displayName('item', id)));
+            } else {
+                details.push(tipField(t('tipKind'), resourceKindLabel(kind)));
+            }
+            // Filters show their stored total as well: the master sums every
+            // matching item/fluid into the filter's resource entry.
+            details.push(tipField(t('tipStored'), fmtCount(resourceStockByName(kind, id))));
+            if (kind === 'item' || kind === 'fluid' || kind === 'filter') {
+                details.push('', t('tipGraphCraft'));
+            }
+            return {
+                title: placeholder ? t('placeholderKind') + ' ' + placeholder : materialNodeLabel(kind, id),
+                lines: details,
+            };
+        };
+        const materialNode = function (kind, id, element) {
             if (!id) return null;
+            // A placeholder shares its node with the concrete item it stands for (the
+            // engine treats them as one material flow, so splitting them would break
+            // the drawn chain). The placeholder's own name is remembered on the node
+            // and wins for the label; the icon stays the item's.
+            const placeholder = (element && element.kind === 'placeholder' && element.name)
+                ? String(element.name) : '';
             const key = kind + ':' + id;
-            if (materialIds.has(key)) return materialIds.get(key);
+            if (materialIds.has(key)) {
+                const existing = materialIds.get(key);
+                const seen = nodeMaterial.get(existing);
+                if (placeholder && seen && !seen.placeholder) {
+                    seen.placeholder = placeholder;
+                    nodeTooltip.set(existing, materialTooltip(seen));
+                }
+                return existing;
+            }
             const nodeId = 'M' + materialIds.size;
             materialIds.set(key, nodeId);
-            // 记下这个节点代表哪个资源：渲染完成后点图标就能直接弹「合成 N 个」
-            nodeMaterial.set(nodeId, { kind: kind, id: id });
-            const entry = stores.resources.get(resourceKey(kind, id)) || {};
-            // 「正在合成 / 剩余目标」（例如 9/22）：只有真的有活时才显示，空闲的材料节点保持干净
-            const craft = materialCraftCounts(kind, id);
-            const showCount = craft.target > 0 || craft.active > 0;
-            const countHtml = showCount
-                ? "<span class='ifm-graph-count'>" + escapeHtml(fmtCount(craft.active) + '/' + fmtCount(craft.target)) + '</span>'
-                : '';
-            // 正方形材料节点里只放图标：详情（注册名 / 种类 / 库存）放进悬停信息
-            const details = [
-                tipField(t('tipRegistry'), id),
-                tipField(t('tipKind'), resourceKindLabel(kind)),
-            ];
-            if (kind !== 'filter') details.push(tipField(t('tipStored'), fmtCount(entry.count || 0)));
-            if (showCount) {
-                details.push(tipField(t('tipCrafting'), fmtCount(craft.active)));
-                details.push(tipField(t('tipCraftTarget'), fmtCount(craft.target)));
-            }
-            if (kind === 'item' || kind === 'fluid') details.push('', t('tipGraphCraft'));
-            nodeTooltip.set(nodeId, { title: materialNodeLabel(kind, id), lines: details });
-            // 标签里只放定尺占位符：真正的图标在渲染完成之后由 applyGraphIcons 写进去
-            materialLines.push('    ' + nodeId + '["' + GRAPH_ICON_HOLDER.replace(/"/g, '&quot;') +
-                countHtml.replace(/"/g, '&quot;') + '"]');
+            const node = { kind: kind, id: id };
+            if (placeholder) node.placeholder = placeholder;
+            nodeMaterial.set(nodeId, node);
+            nodeTooltip.set(nodeId, materialTooltip(node));
+            materialLines.push('    ' + nodeId + '["' + GRAPH_ICON_HOLDER.replace(/"/g, '&quot;') + '"]');
             return nodeId;
         };
         const isMaterial = function (element) {
-            // 抽象操作（注册名 = abstract 的物品/流体元素）不是真实资源：它在依赖图里连节点都不建
             if (elementIsAbstract(element)) return false;
             return element.kind === 'item' || element.kind === 'fluid' ||
                 element.kind === 'filter' || element.kind === 'placeholder';
@@ -1044,75 +2336,274 @@
             const nodeId = 'P' + index;
             nodeProcess.set(nodeId, process.name);
             const batch = record.batch || 0;
-            const remaining = (record.userCount || 0) + (record.downstreamCount || 0);
-            // 圆形流程节点不带文本：状态 / 批次 / 机器等详情放进悬停信息
+            const demand = Number(record.needCount) || 0;
+            const crafting = Number(record.activeCount) || 0;
+            const left = Math.max(0, Number(record.remaining) || 0);
             const details = [tipField(t('tipState'), stateLabel(record.state || 'idle'))];
+            // The tooltip title is the process's machine type (not the name the
+            // editor derives from its products); the process name stays visible as
+            // the first line so the node is still identifiable.
+            details.unshift(tipField(t('processName'), String(process.name)));
             if (batch > 0) details.push(tipField(t('tipBatch'), fmtCount(batch)));
             if (record.machine) details.push(tipField(t('tipMachine'), record.machine));
-            if (remaining > 0) details.push(tipField(t('tipRemaining'), fmtCount(remaining)));
+            if (crafting > 0) details.push(tipField(t('tipCrafting'), fmtCount(crafting)));
+            if (demand > 0) details.push(tipField(t('tipDemand'), fmtCount(demand)));
+            if (left > 0) details.push(tipField(t('tipRemaining'), fmtCount(left)));
             details.push('', t('tipGraphClick'));
-            nodeTooltip.set(nodeId, { title: processTitleText(process), lines: details });
-            lines.push('    ' + nodeId + '(("' + GRAPH_DOT + '"))');
-            // 用户第 1/2 项：同一种材料在同一个流程里可能出现在多条元素上（例如 9 条 1x Iron Nugget）。
-            //   ① **聚合**：材料 ↔ 流程之间每个材料只留一条连线（以前 N 条重复连线叠在一起）；
-            //   ② 连线两端都标注"这个流程合成一次消耗 / 产出的此项目总数"（Σ 各条数量）。
+            nodeTooltip.set(nodeId, { title: machineTypeLabel(process.machineType), lines: details });
+            // "crafting/demand" belongs to the process: how many craft units are
+            // running right now and how many the demand adds up to.
+            const countHtml = (crafting > 0 || demand > 0)
+                ? "<span class='ifm-graph-count'>" +
+                    escapeHtml(fmtCount(crafting) + '/' + fmtCount(demand)) + '</span>'
+                : '';
+            // A machine type may carry an icon: then its process nodes show that
+            // icon instead of the plain dot.
+            const machineIcon = machineIconNameOf(process.machineType);
+            if (machineIcon) nodeMachineIcon.set(nodeId, machineIcon);
+            const marker = machineIcon ? GRAPH_MACHINE_ICON_HOLDER : GRAPH_DOT;
+            lines.push('    ' + nodeId + '(("' + marker + countHtml.replace(/"/g, '&quot;') + '"))');
             const materialEdges = function (list, amountOf) {
                 const totals = new Map();
                 const order = [];
                 asArray(list).forEach(function (element) {
                     if (!isMaterial(element)) return;
-                    const materialId = materialNode(materialKindOf(element), materialIdOf(element));
+                    const materialId = materialNode(materialKindOf(element), materialIdOf(element), element);
                     if (!materialId) return;
+                    const amounts = amountOf(element);
                     if (!totals.has(materialId)) {
-                        totals.set(materialId, 0);
+                        totals.set(materialId, { min: 0, expect: 0, max: 0 });
                         order.push(materialId);
                     }
-                    totals.set(materialId, totals.get(materialId) + amountOf(element));
+                    const total = totals.get(materialId);
+                    total.min += amounts.min;
+                    total.expect += amounts.expect;
+                    total.max += amounts.max;
                 });
                 return order.map(function (materialId) {
-                    return { materialId: materialId, amount: totals.get(materialId) };
+                    return { materialId: materialId, amounts: totals.get(materialId) };
                 });
             };
             const inputAmount = function (element) {
-                return Math.max(1, Math.round(Number(element.count) || 1));
+                const count = Math.max(1, Math.round(Number(element.count) || 1));
+                return { min: count, expect: count, max: count };
+            };
+            // A probabilistic output (the three amounts differ) is labelled
+            // "expect(min~max)x", a plain one stays "expectx".
+            const amountNumber = function (value, fallback) {
+                const number = Number(value);
+                return isFinite(number) ? number : fallback;
             };
             const outputAmount = function (element) {
-                return Math.max(1, Math.round(Number(element.max) || 1));
+                const expectRaw = element.expect !== undefined && element.expect !== null
+                    ? element.expect : element.max;
+                const minRaw = element.min !== undefined && element.min !== null ? element.min : expectRaw;
+                const maxRaw = element.max !== undefined && element.max !== null ? element.max : expectRaw;
+                // decimals are kept on purpose: a chance craft may expect 1.5 and
+                // extract up to 2.5, and rounding here would misreport the recipe
+                return {
+                    min: Math.max(0, amountNumber(minRaw, 0)),
+                    expect: amountNumber(expectRaw, 0) > 0 ? amountNumber(expectRaw, 1) : 1,
+                    max: amountNumber(maxRaw, 0) > 0 ? amountNumber(maxRaw, 1) : 1
+                };
             };
-            // 用户第 2 项：连线两端都标注"这个流程合成一次消耗 / 产出的此项目总数"（Σ 各条数量）：
-            //   材料 → 流程  = 消耗总数（Σ count）        流程 → 产物 = 产出总数（Σ max）
+            const amountLabel = function (amounts) {
+                const expect = fmtAmount(amounts.expect);
+                if (amounts.min === amounts.expect && amounts.max === amounts.expect) return expect + 'x';
+                return expect + '(' + fmtAmount(amounts.min) + '~' + fmtAmount(amounts.max) + ')x';
+            };
             materialEdges(process.inputs, inputAmount).forEach(function (edge) {
-                edgeLines.push('    ' + edge.materialId + ' -->|"' + escapeHtml(fmtCount(edge.amount)) + 'x"| ' + nodeId);
+                inputLinks.push(edgeLines.length);
+                edgeLines.push('    ' + edge.materialId + ' -->|"' + escapeHtml(amountLabel(edge.amounts)) +
+                    '"| ' + nodeId);
             });
             materialEdges(process.outputs, outputAmount).forEach(function (edge) {
-                edgeLines.push('    ' + nodeId + ' -->|"' + escapeHtml(fmtCount(edge.amount)) + 'x"| ' + edge.materialId);
+                outputLinks.push(edgeLines.length);
+                edgeLines.push('    ' + nodeId + ' -->|"' + escapeHtml(amountLabel(edge.amounts)) +
+                    '"| ' + edge.materialId);
             });
         });
-        // mermaid 的 JS 回调必须写成 `click <id> call <fn>()`（写成 `click <id> <fn>` 会被当成链接）
+        // Auto-discovered containment: an output material that is a subset of an input
+        // filter is shown through a synthetic "bridge" node between the two material
+        // nodes (O -> C -> F). Clicking it opens the process editor prefilled with a
+        // type conversion process, so the relation becomes an explicit process instead
+        // of relying on tag matching. Same-process pairs are skipped (they would always
+        // close a two-node cycle).
+        const producerOutputs = [];
+        processes.forEach(function (process) {
+            asArray(process.outputs).forEach(function (element) {
+                if (element.craft === false || !isMaterial(element)) return;
+                producerOutputs.push({ process: String(process.name), element: element });
+            });
+        });
+        const bridgeKey = function (element, filterId) {
+            return materialKindOf(element) + ':' + materialIdOf(element) + '>' + String(filterId);
+        };
+        // An explicit type conversion process already covers this pair: no synthetic
+        // bridge node then.
+        const explicitBridges = {};
+        processes.forEach(function (process) {
+            if (String(process.machineType) !== TYPE_CONVERSION_TYPE) return;
+            const input = asArray(process.inputs)[0];
+            const output = asArray(process.outputs)[0];
+            if (!input || !output) return;
+            explicitBridges[bridgeKey(input, output.id)] = true;
+        });
+        const subsetSeen = {};
+        processes.forEach(function (process) {
+            const consumer = String(process.name);
+            asArray(process.inputs).forEach(function (element) {
+                if (element.kind !== 'filter' || !element.id) return;
+                const toNode = materialNode('filter', element.id, element);
+                if (!toNode) return;
+                producerOutputs.forEach(function (entry) {
+                    if (entry.process === consumer) return;
+                    if (!materialSatisfiesFilter(entry.element, element.id)) return;
+                    const fromNode = materialNode(materialKindOf(entry.element),
+                        materialIdOf(entry.element), entry.element);
+                    if (!fromNode || fromNode === toNode) return;
+                    const seenKey = fromNode + '>' + toNode;
+                    if (subsetSeen[seenKey]) return;
+                    subsetSeen[seenKey] = true;
+                    if (explicitBridges[bridgeKey(entry.element, element.id)]) return;
+                    const bridgeId = 'C' + nodeConversion.size;
+                    nodeConversion.set(bridgeId, { input: entry.element, filter: String(element.id) });
+                    nodeTooltip.set(bridgeId, {
+                        title: t('graphBridgeTitle'),
+                        lines: [t('graphBridgeHint')]
+                    });
+                    lines.push('    ' + bridgeId + '(["' +
+                        GRAPH_BRIDGE.replace(/"/g, '&quot;') + '"])');
+                    subsetLinks.push(edgeLines.length);
+                    edgeLines.push('    ' + fromNode + ' --> ' + bridgeId);
+                    subsetLinks.push(edgeLines.length);
+                    edgeLines.push('    ' + bridgeId + ' --> ' + toNode);
+                });
+            });
+        });
         processes.forEach(function (process, index) {
             lines.push('    click P' + index + ' call ifmEditProcess()');
         });
-        return lines.concat(materialLines, edgeLines).join('\n');
+        // Some crossings stay unavoidable in a factory graph (one material feeds
+        // several processes), so the two directions each get a colour: "blue goes
+        // in, green comes out" is what keeps such a crossing readable.
+        const styleLines = [];
+        if (inputLinks.length > 0) styleLines.push('    linkStyle ' + inputLinks.join(',') + ' stroke:#6fc3ff');
+        if (outputLinks.length > 0) styleLines.push('    linkStyle ' + outputLinks.join(',') + ' stroke:#8fd18f');
+        if (subsetLinks.length > 0) {
+            // A subset feed is a "virtual" edge between two material nodes: dashed and
+            // violet, so it is visibly different from a plain item/fluid flow.
+            styleLines.push('    linkStyle ' + subsetLinks.join(',') +
+                ' stroke:#c9a4ff,stroke-dasharray:5 3');
+        }
+        return lines.concat(materialLines, edgeLines, styleLines).join('\n');
     }
 
-    // 渲染完成后自己绑定点选（不依赖 mermaid 回调参数）：点流程节点即可编辑流程；
-    // 材料节点（正方形）与流程节点（圆形）都带上 data-tip-graph，悬停时用同一个悬浮框显示详情
+    // Pan the dependency graph by dragging empty space with the left button. The
+    // container scrolls (mermaid renders the svg at its own size, see useMaxWidth
+    // above), so a long chain stays readable instead of being scaled down. Node
+    // clicks are untouched: panning only starts when the pointer is not on a node
+    // and pointerdown is never default-prevented.
+    function bindGraphPan(container) {
+        if (container.dataset.panBound) return;
+        container.dataset.panBound = '1';
+        let panning = false;
+        let startX = 0;
+        let startY = 0;
+        let startLeft = 0;
+        let startTop = 0;
+        container.addEventListener('pointerdown', function (event) {
+            if (event.button !== 0) return;
+            if (event.target.closest && (event.target.closest('g.node') || event.target.closest('a'))) return;
+            panning = true;
+            startX = event.clientX;
+            startY = event.clientY;
+            startLeft = container.scrollLeft;
+            startTop = container.scrollTop;
+            container.classList.add('panning');
+            if (container.setPointerCapture) {
+                try { container.setPointerCapture(event.pointerId); } catch (err) { }
+            }
+        });
+        container.addEventListener('pointermove', function (event) {
+            if (!panning) return;
+            container.scrollLeft = startLeft - (event.clientX - startX);
+            container.scrollTop = startTop - (event.clientY - startY);
+            event.preventDefault();
+        });
+        const stopPan = function (event) {
+            if (!panning) return;
+            panning = false;
+            container.classList.remove('panning');
+            if (container.releasePointerCapture && event.pointerId !== undefined) {
+                try { container.releasePointerCapture(event.pointerId); } catch (err) { }
+            }
+        };
+        container.addEventListener('pointerup', stopPan);
+        container.addEventListener('pointercancel', stopPan);
+    }
+
+    function openConversionBridge(nodeId) {
+        const entry = nodeConversion.get(nodeId);
+        if (!entry) return;
+        const element = entry.input || {};
+        const input = (element.kind === 'placeholder')
+            ? { kind: 'item', id: element.item, count: 1, containerIndex: -1, slot: -1 }
+            : {
+                kind: element.kind, id: element.id, nbt: element.nbt,
+                ignoreNbt: element.ignoreNbt === undefined ? true : element.ignoreNbt,
+                count: 1, containerIndex: -1, slot: -1
+            };
+        if (!input.id) return;
+        // Prefill a type conversion process: high multiplier (one big batch instead of
+        // many tiny instances), unordered IO (streams the output while the input is
+        // still arriving), the discovered input and the input filter as the output.
+        openEditor('processes', null, {
+            machineType: TYPE_CONVERSION_TYPE,
+            maxMultiplier: 1000000,
+            ioMode: 'unordered',
+            inputs: [input],
+            outputs: [{ kind: 'filter', id: entry.filter, min: 1, expect: 1, max: 1,
+                containerIndex: -1, slot: -1 }]
+        });
+    }
+
     function bindGraphClicks(container) {
         Array.prototype.forEach.call(container.querySelectorAll('g.node'), function (node) {
             const match = /(^|-)P(\d+)(-|$)/.exec(node.id || '');
             const materialMatch = /(^|-)M(\d+)(-|$)/.exec(node.id || '');
-            const nodeId = match ? ('P' + match[2]) : (materialMatch ? ('M' + materialMatch[2]) : null);
+            const bridgeMatch = /(^|-)C(\d+)(-|$)/.exec(node.id || '');
+            const nodeId = match ? ('P' + match[2]) : (materialMatch ? ('M' + materialMatch[2])
+                : (bridgeMatch ? ('C' + bridgeMatch[2]) : null));
             if (!nodeId || !nodeTooltip.has(nodeId)) return;
             node.setAttribute('data-tip-graph', nodeId);
-            if (!match) {
-                // 材料节点（正方形）：点它 = 给这个物品填「合成 N 个」（与资源格里中键同一个弹窗）
-                const material = nodeMaterial.get(nodeId);
-                if (!material) return;
-                if (material.kind !== 'item' && material.kind !== 'fluid') return;   // 过滤器不能合成
+            if (bridgeMatch) {
                 node.style.cursor = 'pointer';
                 node.addEventListener('click', function (event) {
                     event.stopPropagation();
-                    openCraftPrompt({ kind: material.kind, name: material.id });
+                    openConversionBridge(nodeId);
+                });
+                return;
+            }
+            if (!match) {
+                const material = nodeMaterial.get(nodeId);
+                if (!material) return;
+                if (material.kind !== 'item' && material.kind !== 'fluid' && material.kind !== 'filter') return;
+                node.style.cursor = 'pointer';
+                node.addEventListener('click', function (event) {
+                    event.stopPropagation();
+                    // Always offer the prompt: a material with no stock is usually
+                    // just missing from the resource list (that list only holds what
+                    // a container really carries), so asking stores.resources for
+                    // "craftable" would answer no for resources the backend is
+                    // perfectly able to queue. A process that cannot produce it is
+                    // reported by the backend ("no process can produce it").
+                    // A placeholder-backed node asks for the placeholder itself: the
+                    // engine registers that key for the producing process, so the
+                    // request cannot land on a material nobody produces.
+                    openCraftPrompt(material.placeholder
+                        ? { kind: 'placeholder', name: material.placeholder }
+                        : { kind: material.kind, name: material.id });
                 });
                 return;
             }
@@ -1131,12 +2622,93 @@
         if (name) openEditor('processes', name);
     };
 
-    // 依赖图重画缓存：mermaid.render 会重建整块 SVG，内容没变的重画在网页上就是“闪烁”，
-    // 所以只有图内容（或界面语言）真的变了才重画。
     let graphCodeCache = null;
     let graphLangCache = null;
 
+    // One-shot diagnostic: prints the rendered SVG size, one node's shape size and its
+    // label's measured size, and whether the label's HTML leaked out as literal text
+    // (which is what makes nodes grow huge). Visible in the browser devtools console.
+    function logGraphDebug(container) {
+        try {
+            if (!container || !console || !console.log) return;
+            const svg = container.querySelector('svg');
+            if (!svg) return;
+            const node = container.querySelector('g.node');
+            let shape = null;
+            if (node) {
+                const el = node.querySelector('rect, circle, ellipse, polygon, path');
+                if (el) {
+                    shape = { tag: el.tagName, w: el.getAttribute('width'), h: el.getAttribute('height'),
+                        r: el.getAttribute('r') };
+                    if (el.getBBox) {
+                        const box = el.getBBox();
+                        shape.bbox = Math.round(box.width) + 'x' + Math.round(box.height);
+                    }
+                }
+            }
+            const label = container.querySelector('g.node .nodeLabel') ||
+                container.querySelector('g.node span.nodeLabel');
+            let labelInfo = null;
+            if (label && label.getBoundingClientRect) {
+                const rect = label.getBoundingClientRect();
+                labelInfo = { w: Math.round(rect.width), h: Math.round(rect.height),
+                    html: String(label.innerHTML || '').slice(0, 60) };
+            }
+            // The node is sized from the label's <foreignObject> div, not the span: show
+            // that div (and its <p>) so a mismatch is visible. Computed styles help.
+            let box = null;
+            if (node) {
+                const fo = node.querySelector('foreignObject');
+                const div = fo && fo.firstElementChild;
+                const p = div && div.querySelector('p');
+                const rectOf = function (el) {
+                    if (!el || !el.getBoundingClientRect) return null;
+                    const r = el.getBoundingClientRect();
+                    return Math.round(r.width) + 'x' + Math.round(r.height);
+                };
+                const cs = div && window.getComputedStyle ? window.getComputedStyle(div) : null;
+                box = {
+                    fo: fo ? (fo.getAttribute('width') + 'x' + fo.getAttribute('height')) : '?',
+                    div: rectOf(div), divDisplay: cs ? cs.display : '?',
+                    divMaxW: cs ? cs.maxWidth : '?', divWhiteSpace: cs ? cs.whiteSpace : '?',
+                    p: rectOf(p), pMargin: p && window.getComputedStyle
+                        ? window.getComputedStyle(p).margin : '?'
+                };
+            }
+            console.log('[IFM graph] svg=' + (svg.getAttribute('width') || '?') + 'x' +
+                (svg.getAttribute('height') || '?') + ' viewBox=' + (svg.getAttribute('viewBox') || '?') +
+                ' style=' + (svg.getAttribute('style') || '-'),
+                'node=' + (node ? (node.id || '?') : 'none'), 'shape=', shape, 'label=', labelInfo,
+                'box=', box, 'literalHtml=' + (String(svg.textContent || '').indexOf('<span') >= 0));
+        } catch (err) { }
+    }
+
+    // mermaid builds the svg in a temporary container that it appends to <body> itself -
+    // the third argument of its render() is that container. The node disappears only once
+    // the drawing is ready, and since the panels became pages the document is short enough
+    // for that spot to sit in view: it showed up as a blinking element at the bottom of
+    // the page (the svg is called ifmGraphSvg*). Handing mermaid an off-screen sink keeps
+    // its label measurement - and therefore the node sizes - exactly as it was while
+    // nothing of it can be seen; the stylesheet hides a stray container of a mermaid build
+    // that ignores the argument.
+    function graphRenderSink() {
+        let sink = document.getElementById('graphRenderSink');
+        if (!sink) {
+            sink = document.createElement('div');
+            sink.id = 'graphRenderSink';
+            sink.className = 'graph-render-sink';
+            document.body.appendChild(sink);
+        }
+        return sink;
+    }
+
+    function clearGraphRenderSink() {
+        const sink = document.getElementById('graphRenderSink');
+        if (sink) sink.innerHTML = '';
+    }
+
     function renderGraph() {
+        renderGraphLayoutButton();
         const processes = Array.from(stores.processes.values());
         const container = el('graph');
         if (processes.length === 0) {
@@ -1145,7 +2717,7 @@
             return;
         }
         if (!window.mermaid) {
-            container.innerHTML = '<span class="muted">mermaid 未加载</span>';
+            container.innerHTML = '<span class="muted">' + escapeHtml(t('graphMermaidMissing')) + '</span>';
             return;
         }
         if (graphRendering) return;
@@ -1155,7 +2727,6 @@
         } catch (err) {
             return;
         }
-        // 内容与语言都没变：直接返回（不再重建 SVG —— 这就是之前依赖图闪烁的原因）
         if (code === graphCodeCache && graphLangCache === lang) {
             return;
         }
@@ -1163,23 +2734,61 @@
         graphCodeCache = code;
         graphLangCache = lang;
         try {
-            mermaid.initialize({ startOnLoad: false, securityLevel: 'loose', theme: 'dark' });
-            mermaid.render('ifmGraphSvg', code).then(function (result) {
+            const initOptions = { startOnLoad: false, securityLevel: 'loose', theme: 'dark',
+                htmlLabels: true, look: 'classic', layout: graphLayout,
+                flowchart: { look: 'classic', useMaxWidth: false, nodeSpacing: 45, rankSpacing: 70,
+                    padding: 4, wrappingWidth: 48, minNodeWidth: 0 } };
+            if (graphLayout === 'elk') {
+                initOptions.elk = { nodePlacementStrategy: 'BRANDES_KOEPF' };
+            }
+            mermaid.initialize(initOptions);
+            graphRenderSeq += 1;
+            // Never reuse the id of an SVG that is still in the page (see
+            // graphRenderSeq): mermaid would find that older element instead of the
+            // one it is building and remove it, so the panel went blank until the
+            // new drawing was swapped in.
+            const renderId = 'ifmGraphSvg' + graphRenderSeq;
+            mermaid.render(renderId, code, graphRenderSink()).then(function (result) {
+                clearGraphRenderSink();
+                if (!result || !result.svg) {
+                    // Nothing drawable came back: keep the drawing that is already
+                    // there instead of wiping the panel.
+                    graphCodeCache = null;
+                    graphRendering = false;
+                    return;
+                }
+                // Capture the scroll the user has *right now*: mermaid took a while to
+                // draw and they may have panned (drag) or dragged the scrollbar since the
+                // render started. Restoring a position captured before the render is what
+                // made the graph snap back while processes kept running (running
+                // instances change resource stock -> renderGraph re-runs every tick).
+                const scrollLeft = container.scrollLeft;
+                const scrollTop = container.scrollTop;
                 container.innerHTML = result.svg;
                 applyGraphIcons(container);
+                applyGraphSearch(container);
+                bindGraphPan(container);
                 bindGraphClicks(container);
+                logGraphDebug(container);
+                const restoreScroll = function () {
+                    if (container.scrollLeft !== scrollLeft) container.scrollLeft = scrollLeft;
+                    if (container.scrollTop !== scrollTop) container.scrollTop = scrollTop;
+                };
+                restoreScroll();
+                if (typeof window.requestAnimationFrame === 'function') {
+                    window.requestAnimationFrame(restoreScroll);
+                }
                 graphRendering = false;
             }).catch(function (err) {
-                graphCodeCache = null;      // 失败：下次重新试
+                clearGraphRenderSink();
+                graphCodeCache = null;
                 container.innerHTML = '<span class="muted">' + escapeHtml(String((err && err.message) || err)) + '</span>';
                 graphRendering = false;
             });
         } catch (err) {
+            clearGraphRenderSink();
             graphCodeCache = null;
             container.innerHTML = '<span class="muted">' + escapeHtml(String(err.message || err)) + '</span>';
             graphRendering = false;
         }
     }
-
-
-    

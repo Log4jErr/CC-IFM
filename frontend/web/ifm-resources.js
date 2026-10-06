@@ -1,43 +1,36 @@
-// IFM :: web/ifm-resources.js
-// 资源网格 / 搜索语法 / 悬停详情 / 待发送面板
-// （由 index.html 拆分而来；所有文件按顺序在页面里加载，共享同一份全局作用域）
 'use strict';
 
-// ===================== 资源网格 =====================
-    // 正在合成的物品（运行中流程的产物）：排到最前面，并用彩色边框高亮
     let activeCraftKeys = new Set();
 
     function craftingKeys() {
         const keys = new Set();
-        stores.processes.forEach(function (process) {
-            const record = stores.runtime.get(process.name) || {};
-            const active = (record.state && record.state !== 'idle') || (record.batch || 0) > 0 ||
-                (record.remaining || 0) > 0 || (record.userCount || 0) > 0 || (record.downstreamCount || 0) > 0;
-            if (!active) return;
-            asArray(process.outputs).forEach(function (output) {
-                if ((output.kind === 'item' || output.kind === 'fluid') && output.id) {
-                    keys.add(resourceKey(output.kind, output.id));
-                } else if (output.kind === 'placeholder' && output.item) {
-                    keys.add(resourceKey('item', output.item));
-                }
-            });
+        // The ledger is per material now, so "is something being done about this
+        // resource" is a direct question to stores.materials.
+        stores.materials.forEach(function (material) {
+            if (!material || !material.id) return;
+            const pending = (Number(material.queryCount) || 0) + (Number(material.automateCount) || 0) +
+                (Number(material.craftingCount) || 0);
+            if (pending <= 0) return;
+            // A filter is its own resource kind; only placeholders fall back to item.
+            const kind = material.kind === 'placeholder' ? 'item' : material.kind;
+            keys.add(resourceKey(kind, material.id));
+            // A placeholder's own card pulses too: the request ("craft N of that
+            // placeholder") is made against the placeholder key, not the item.
+            if (material.kind === 'placeholder') {
+                keys.add(resourceKey('placeholder', material.id));
+            }
         });
         return keys;
     }
 
     function isCrafting(entry) {
         if (!entry) return false;
-        return activeCraftKeys.has(resourceKey(entry.kind === 'fluid' ? 'fluid' : 'item', entry.name));
+        // A filter is its own resource kind; only placeholders fall back to item.
+        const kind = entry.kind === 'placeholder' ? 'item' : entry.kind;
+        if (activeCraftKeys.has(resourceKey(kind, entry.name))) return true;
+        return entry.kind === 'placeholder' && activeCraftKeys.has(resourceKey('placeholder', entry.name));
     }
 
-    // 资源排序（1.6.11）：三种模式统一在 visibleResources() 里实现；
-    // 正在合成的资源仍然带 .crafting 高亮（这是视觉标记，不再参与排序）。
-
-    // ===================== 搜索语法：关键词 / @模组 / #标签 =====================
-    // 空格分隔的多个条件同时满足（AND）：
-    //   cobble           → 名称 / 显示名 / 标签里包含 cobble
-    //   @create          → 只看 create 这个模组的物品
-    //   #minecraft:logs  → 只看带该标签的物品（写 #logs 也能匹配 minecraft:logs）
     function parseSearchQuery(text) {
         const query = { terms: [], mods: [], tags: [] };
         String(text === undefined || text === null ? '' : text).trim().toLowerCase().split(/\s+/)
@@ -70,9 +63,6 @@
         return colon >= 0 ? value.slice(0, colon) : value;
     }
 
-    // 标签匹配：#ingot 既能匹配 minecraft:ingot / c:ingot，也能匹配 c:ingots/copper 这类
-    // “同一命名空间下更长的路径”，所以这里是包含匹配而不是只比相等；
-    // 反过来写完整标签（#c:ingots/copper、#minecraft:ingot）也照样能匹配。
     function tagMatches(tag, token) {
         const value = String(tag || '').toLowerCase();
         if (!value) return false;
@@ -82,12 +72,10 @@
         const path = colon >= 0 ? value.slice(colon + 1) : value;
         if (path === token || namespace === token) return true;
         if (value === 'minecraft:' + token) return true;
-        // 部分匹配：#ingot → c:ingots/copper、minecraft:ingot；#minecraft:ingot → minecraft:ingots
         if (path.indexOf(token) >= 0) return true;
         return value.indexOf(token) >= 0;
     }
 
-    // 标签文本（悬停详情用）：最多显示 limit 条，超出的用省略号
     function tagText(tags, limit) {
         const list = asArray(tags);
         const max = limit || 12;
@@ -95,30 +83,17 @@
         return list.length > max ? shown + ' …' : shown;
     }
 
-    // ===================== 中文拼音搜索（任务 7，1.6.11）=====================
-    // 只在中文界面 + pinyinlite 可用时生效。pinyinlite 由 index.html 里的
-    // <script src="dist/pinyinlite_full.min.js"> 提供：pinyinlite('增长') => [['ceng','zeng'],['zhang','chang']]
-    // 匹配规则（用户给出的例子，逐条实现）：
-    //   * 忽略声调（pinyinlite 给的就是无声调音节），任意读音都算（孳生读音全都要试）；
-    //   * 查询串按空格切成若干段，每段吃「1 个或多个连续音节」，每个音节可以只吃它读音的前缀
-    //     （所以 "g" 能匹配 gong、"zt" 能匹配 gong+zuo+tai 的第 2、3 个音节的声母）；
-    //   * 段与段之间必须紧挨（不许跳音节）："gt" ✗、"gong tai" ✗；但可以从中间开始："tai" ✓、"zt" ✓。
     const pinyinCache = new Map();
-
-    function pinyinAvailable() {
-        return typeof window.pinyinlite === 'function';
-    }
 
     function pinyinSyllables(text) {
         const key = String(text || '');
         if (!key) return [];
         if (pinyinCache.has(key)) return pinyinCache.get(key);
-        let rows = [];
-        try {
-            rows = window.pinyinlite(key) || [];
-        } catch (err) {
-            rows = [];
+        if (typeof window.pinyinlite !== 'function') {
+            throw new Error('[IFM] pinyinlite_full.min.js is missing: pinyin search cannot work. ' +
+                'There is no keyword fallback any more - put the dictionary into frontend/web/dist/.');
         }
+        const rows = window.pinyinlite(key) || [];
         const out = rows.map(function (row) {
             return (Array.isArray(row) ? row : []).map(function (item) {
                 return String(item || '').toLowerCase();
@@ -133,9 +108,6 @@
         return /[\u3400-\u4dbf\u4e00-\u9fff]/.test(String(text || ''));
     }
 
-    // 一段（seg）能否恰好由 syllables[start..start+count-1] 拼出来。
-    // 规则：每个音节只吃它读音的前缀（≥1 个字符），片与片之间紧挨着（不许跳音节）；
-    // 本音节吃过至少一个字符后，可以结束这一片、到下一个音节继续吃（这就是 "gzt" = g|z|t 的由来）。
     function pinyinSegmentFits(seg, syllables, start, count) {
         const limit = start + count;
         let states = [{ index: start, used: 0 }];
@@ -151,7 +123,6 @@
             };
             for (let s = 0; s < states.length; s += 1) {
                 const state = states[s];
-                // ① 继续在当前音节里吃字符
                 if (state.index < limit) {
                     const readings = syllables[state.index] || [];
                     for (let r = 0; r < readings.length; r += 1) {
@@ -160,7 +131,6 @@
                         else push({ index: state.index, used: state.used + 1 });
                     }
                 }
-                // ② 本音节已经吃过字符：可以结束这一片，转入下一个音节（下一个音节必须紧挨着）
                 if (state.used > 0 && state.index + 1 < limit) {
                     const readings = syllables[state.index + 1] || [];
                     for (let r = 0; r < readings.length; r += 1) {
@@ -173,8 +143,6 @@
             states = next;
             if (states.length === 0) return false;
         }
-        // 必须吃满 count 个音节（最后一个可以只吃一半，但必须至少吃了一个字符）：
-        // 否则片段会“假装”跨过中间音节，出现 "gong tai" 这种越位匹配。
         return states.some(function (state) {
             if (state.index === limit) return true;
             return state.index === limit - 1 && state.used > 0;
@@ -182,7 +150,6 @@
     }
 
     function pinyinMatches(text, query) {
-        if (!pinyinAvailable()) return false;
         const syllables = pinyinSyllables(text);
         if (syllables.length === 0) return false;
         const segments = String(query || '').toLowerCase().split(/\s+/).filter(Boolean);
@@ -207,9 +174,8 @@
         return false;
     }
 
-    // 中/英任何一个名字命中拼音都算（只在中文界面开启）
     function pinyinSearchHit(query, label, englishLabel) {
-        if (lang !== 'zh' || !pinyinAvailable()) return false;
+        if (lang !== 'zh') return false;
         const text = String(query || '').trim();
         if (!text) return false;
         const targets = [label, englishLabel].filter(function (value) {
@@ -224,12 +190,9 @@
     function matchesSearch(entry, query) {
         if (searchQueryEmpty(query)) return true;
         const name = String(entry.name || '').toLowerCase();
-        // 注册名的路径部分（去掉模组命名空间）：搜索 "create" 不该命中所有 create 模组的物品，
-        // 想按模组搜请写 @create（用户第 5 项要求）；标签同理，必须写 #tag。
         const colon = name.indexOf(':');
         const namePath = colon >= 0 ? name.slice(colon + 1) : name;
         const label = displayName(entry.kind, entry.name).toLowerCase();
-        // 翻译开关打开时：中文译名与英文原名都能搜到
         const englishLabel = englishName(entry.kind, entry.name).toLowerCase();
         const tags = entryTags(entry);
         for (let i = 0; i < query.mods.length; i += 1) {
@@ -249,14 +212,93 @@
         return true;
     }
 
+    // Something the storage is empty of is still craftable, so the panel lists it
+    // with a count of 0 instead of hiding it (the old behaviour made a product
+    // disappear exactly when the player was about to ask for it). The entries are
+    // derived from the processes on every render - nothing to keep in sync - and a
+    // resource that really sits in a container always wins over the synthesised one.
+    function craftableMaterials() {
+        const out = new Map();
+        Array.from(stores.processes.values()).forEach(function (process) {
+            if (processIsAbstract(process)) return;
+            asArray(process.outputs).forEach(function (element) {
+                let kind = null;
+                let name = '';
+                if (element.kind === 'item' || element.kind === 'fluid' || element.kind === 'filter') {
+                    kind = element.kind;
+                    name = String(element.id || '');
+                } else if (element.kind === 'placeholder') {
+                    // A placeholder outputs the concrete item it stands for.
+                    kind = 'item';
+                    name = String(element.item || '');
+                }
+                // "Craft reference" off: that output of the process is not an offer.
+                if (!kind || !name || element.craft === false) return;
+                const key = resourceKey(kind, name);
+                if (out.has(key)) return;
+                out.set(key, {
+                    kind: kind,
+                    name: name,
+                    nbt: '',
+                    count: 0,
+                    craftable: true,
+                    samples: [],
+                    tags: [],
+                });
+            });
+        });
+        return out;
+    }
+
+    // One lookup for "what does this key mean to the panel": storage first, then the
+    // synthesised craftable entry. Everything that resolves a resource key has to
+    // ask this, otherwise a listing that the panel shows would be refused by the
+    // click / send / tooltip code as "not craftable, nothing in stock".
+    function resourceView(key) {
+        const stored = stores.resources.get(key);
+        if (stored) return stored;
+        return craftableMaterials().get(key) || null;
+    }
+
     function visibleResources() {
         let list = Array.from(stores.resources.values());
+        // Any hash variant in storage counts as "we have this resource": listing the
+        // bare name next to it would show the same item twice.
+        const stocked = new Set();
+        stores.resources.forEach(function (entry) {
+            stocked.add(resourceKey(entry.kind, entry.name));
+        });
+        craftableMaterials().forEach(function (entry, key) {
+            if (stocked.has(key)) return;
+            list.push(entry);
+        });
+        // A material that was set for stock keeping but is neither stocked nor
+        // craftable any more still has to be listed: its grey target stays visible
+        // (and can be cleared with K, which needs the card to be hoverable).
+        if (status && status.keepStock) {
+            Object.keys(status.keepStock).forEach(function (keepKey) {
+                if (stocked.has(keepKey)) return;
+                const parts = splitKey(keepKey);
+                if (parts[0] !== 'item' && parts[0] !== 'fluid' && parts[0] !== 'filter' &&
+                    parts[0] !== 'placeholder') return;
+                if (!parts[1]) return;
+                const key = resourceKey(parts[0], parts[1]);
+                if (list.some(function (entry) { return resourceKey(entry.kind, entry.name) === key; })) return;
+                list.push({
+                    kind: parts[0],
+                    name: parts[1],
+                    nbt: '',
+                    count: 0,
+                    craftable: false,
+                    samples: [],
+                    tags: [],
+                });
+            });
+        }
         if (searchText) {
             const query = parseSearchQuery(searchText);
             list = list.filter(function (entry) { return matchesSearch(entry, query); });
         }
-        // 用户第 1 项：主键顺序 = 占位符 > 过滤器 > 可合成 > 其他（次键才看排序模式）。
-        // 这样待发送网格里"能现造出来"的东西永远排在最上面。
         const rank = function (entry) {
             if (entry.kind === 'placeholder') return 0;
             if (entry.kind === 'filter') return 1;
@@ -270,7 +312,6 @@
                 return displayName(a.kind, a.name).localeCompare(displayName(b.kind, b.name), undefined,
                     { numeric: true, sensitivity: 'base' });
             }
-            // 数量升序 / 降序（1.6.11 的新默认）：数量相同的按名字排，保证顺序稳定
             const diff = (Number(a.count) || 0) - (Number(b.count) || 0);
             if (diff !== 0) return sortMode === 'countAsc' ? diff : -diff;
             return displayName(a.kind, a.name).localeCompare(displayName(b.kind, b.name), undefined,
@@ -279,7 +320,6 @@
         return list;
     }
 
-    // 排序按钮的图标与提示：跟着当前模式变（点击顺序 数量降序 → 数量升序 → 字典序 → 数量降序）
     const SORT_MODES = ['countDesc', 'countAsc', 'name'];
     function sortModeLabel(mode) {
         if (mode === 'countAsc') return t('sortCountAsc');
@@ -297,24 +337,15 @@
         const button = el('resourceSortBtn');
         if (!button) return;
         const label = sortModeLabel(sortMode);
-        button.title = t('sortTitle') + '：' + label;
+        button.title = t('sortTitle') + t('labelSeparator') + label;
         button.innerHTML = '<i class="fa ' + sortModeIcon(sortMode) + '"></i>';
     }
 
-    // components（可选）= 这个物品的 NBT（components 表）：给了就能在同一个注册名的若干
-    // 变体里挑“NBT 最接近”的那张图标。CC:T 的物品详情只给得出 NBT 哈希字符串，
-    // 所以网格里通常不传；此时仍然用同一注册名的导出图，不会回退到 blocksitems。
     function plainIconImg(kind, name, components) {
         const realKind = kind === 'fluid' ? 'fluid' : 'item';
         const key = resourceKey(realKind, name);
         queueMeta(realKind, name);
-        // 三档优先级（1.6.12，任务 8）：① icon-exports 本地导出图片（离线可用、与游戏里一致；
-        // NBT 变体优先匹配：完全一致 → 最接近 → 同注册名的任意一条）→ ② blocksitems 接口图标
-        // → ③ 名称字形兜底（见 ifmIconFallback）。
-        // 出图统一走 iconImgTagHtml：与资源网格主图标 / 外设方块卡是同一个实现，
-        // 免得哪条路径漏掉第 ① 层（导出图就会“有文件却没被引用”）。
         const exported = iconExportFile(realKind, name, components);
-        // 本地也没有、接口又明确说“没有这个资源”时别白刷一次 404，直接用名称字形
         if (exported || (metaState(key) !== 'missing' && !iconFailedKeys.has(key))) {
             return iconImgTagHtml(realKind, name, '', exported);
         }
@@ -333,16 +364,57 @@
             escapeHtml(JSON.stringify(samples)) + '">' + plainIconImg(sample.kind, sample.name) + '</span>';
     }
 
+    // 待发送/交付列表里的条目只存了 kind/name/nbt/count（addSend / setSend /
+    // addOptimisticDeliveries 都不带展示字段），因此过滤器拿不到 samples，会退化成
+    // 字符图标（而资源网格显示的是样本物品图标）。渲染时以资源表里的最新条目为准，
+    // 取不到再退回条目自身——这样待发送区、交付区与网格的过滤器图标完全一致，
+    // 也会跟着 rotateFilterIcons 一起轮换。
+    function iconSourceOf(entry) {
+        if (entry.kind !== 'filter' && entry.kind !== 'placeholder') return entry;
+        const latest = stores.resources.get(resourceKey(entry.kind, entry.name, entry.nbt));
+        return latest || entry;
+    }
+
+    // The item a placeholder stands for: its icon is what a placeholder is drawn
+    // with everywhere (grid, tooltips, send list). A placeholder carries no stock of
+    // its own, so this never falls back to the placeholder name.
+    function placeholderItemOf(entry) {
+        if (!entry || entry.kind !== 'placeholder') return '';
+        const latest = stores.resources.get(resourceKey('placeholder', entry.name, entry.nbt));
+        const direct = (latest && latest.item) || entry.item;
+        if (direct) return String(direct);
+        // A synthesised row (stock-keeping only) or a stale store entry may have lost
+        // the field: the processes that output this placeholder still know it.
+        let found = '';
+        stores.processes.forEach(function (process) {
+            if (found) return;
+            asArray(process.outputs).forEach(function (element) {
+                if (found) return;
+                if (element.kind === 'placeholder' && element.item &&
+                    String(element.name) === String(entry.name)) {
+                    found = String(element.item);
+                }
+            });
+        });
+        return found;
+    }
+
     function resourceIconHtml(entry) {
-        if (entry.kind === 'filter') return filterIconHtml(entry);
-        if (entry.kind === 'placeholder') {
-            const itemName = entry.item || entry.name;
+        const source = iconSourceOf(entry);
+        if (source.kind === 'filter') return filterIconHtml(source);
+        if (source.kind === 'placeholder') {
+            const itemName = placeholderItemOf(source);
+            if (!itemName) {
+                // Nothing known to draw yet: the generic placeholder glyph, never the
+                // placeholder name looked up as an item.
+                return '<span class="icon"><i class="fa ' + iconGlyphClass('placeholder') + '"></i></span>';
+            }
             queueMeta('item', itemName);
             return '<span class="icon">' + plainIconImg('item', itemName) + '</span>';
         }
-        queueMeta(entry.kind, entry.name);
-        asArray(entry.samples).forEach(function (sample) { queueMeta(sample.kind, sample.name); });
-        return iconHtml(entry.kind, entry.name);
+        queueMeta(source.kind, source.name);
+        asArray(source.samples).forEach(function (sample) { queueMeta(sample.kind, sample.name); });
+        return iconHtml(source.kind, source.name);
     }
 
     function resourceKindLabel(kind) {
@@ -352,30 +424,124 @@
         return t('placeholderKind');
     }
 
-    // 类型徽标（资源卡片左上角 / 机器容器芯片共用）：字形见 kindBadgeGlyph（核心文件里）
     function kindBadgeHtml(kind, extraClass) {
         return '<span class="kind-badge kind-' + escapeHtml(kind) + (extraClass ? ' ' + extraClass : '') +
             '" title="' + escapeHtml(resourceKindLabel(kind)) + '"><i class="fa ' + kindBadgeGlyph(kind) + '"></i></span>';
     }
 
+    // The stock-keeping target of one resource, read from the server status
+    // ("kind:name" -> amount). 0 means "not maintained" (nothing is drawn).
+    function keepAmountOf(entry) {
+        if (!entry || !status || !status.keepStock) return 0;
+        const value = Number(status.keepStock[String(entry.kind) + ':' + String(entry.name)]);
+        return (isFinite(value) && value > 0) ? Math.floor(value) : 0;
+    }
+
+    // One enchantment of an item: its display label and whether it is a curse. The
+    // registry name (name) decides "curse" (e.g. minecraft:vanishing_curse); the
+    // label is the displayName, translated by bergamot when it is on (queued while
+    // not cached yet) and shown as the English name otherwise.
+    function enchantmentInfo(enchantment) {
+        if (!enchantment) return { label: '', cursed: false };
+        const registry = String(enchantment.name || enchantment.id || '').toLowerCase();
+        const cursed = registry.indexOf('curse') >= 0;
+        const raw = String(enchantment.displayName || enchantment.name || enchantment.id || '').trim();
+        if (!raw) return { label: '', cursed: cursed };
+        const translator = window.IFMTranslate;
+        if (translator && typeof translator.isEnabled === 'function' && translator.isEnabled()) {
+            const translated = typeof translator.nameFor === 'function' ? translator.nameFor(raw) : null;
+            if (translated) return { label: translated, cursed: cursed };
+            if (typeof translator.queueNames === 'function') translator.queueNames([raw]);
+        }
+        return { label: raw, cursed: cursed };
+    }
+
+    // Durability colour: interpolate red (empty) -> orange -> yellow -> green (full)
+    // by the remaining fraction.
+    const DURABILITY_STOPS = [
+        { at: 0, rgb: [255, 107, 107] },
+        { at: 0.33, rgb: [255, 182, 72] },
+        { at: 0.66, rgb: [255, 209, 102] },
+        { at: 1, rgb: [89, 217, 138] },
+    ];
+    function durabilityColour(ratio) {
+        const value = Math.max(0, Math.min(1, Number(ratio) || 0));
+        let lo = DURABILITY_STOPS[0];
+        let hi = DURABILITY_STOPS[DURABILITY_STOPS.length - 1];
+        for (let i = 0; i < DURABILITY_STOPS.length - 1; i += 1) {
+            if (value >= DURABILITY_STOPS[i].at && value <= DURABILITY_STOPS[i + 1].at) {
+                lo = DURABILITY_STOPS[i];
+                hi = DURABILITY_STOPS[i + 1];
+                break;
+            }
+        }
+        const span = (hi.at - lo.at) || 1;
+        const t2 = (value - lo.at) / span;
+        const rgb = [0, 1, 2].map(function (channel) {
+            return Math.round(lo.rgb[channel] + (hi.rgb[channel] - lo.rgb[channel]) * t2);
+        });
+        return 'rgb(' + rgb.join(',') + ')';
+    }
+
+    // The item's maximum durability: the blocksitems API reports it as max_damage
+    // (an item type property); when that is not loaded yet it is derived from the
+    // per-stack detail as damage / (1 - durability). null when neither is usable.
+    function maxDamageOf(entry) {
+        const detail = entry && entry.detail;
+        if (!detail) return null;
+        const damage = Number(detail.damage);
+        const durability = Number(detail.durability);
+        const meta = typeof metaOf === 'function' ? metaOf('item', entry.name) : null;
+        const maxDamage = meta ? Number(meta.max_damage) : NaN;
+        if (isFinite(maxDamage) && maxDamage > 0) return Math.round(maxDamage);
+        if (isFinite(damage) && isFinite(durability) && durability < 1) {
+            const total = damage / (1 - durability);
+            if (isFinite(total) && total > 0) return Math.round(total);
+        }
+        return null;
+    }
+
     function resourceCardHtml(entry) {
-        const key = resourceKey(entry.kind, entry.name);
+        const key = resourceKey(entry.kind, entry.name, entry.nbt);
         const isPlaceholder = entry.kind === 'placeholder';
-        const countHtml = isPlaceholder ? '' : '<span class="grid-count">' + fmtCount(entry.count || 0) + '</span>';
+        const countHtml = isPlaceholder ? '' : '<span class="grid-count">' + fmtCountFloor(entry.count || 0) + '</span>';
+        // The "+" is only an indicator: crafting is started from the middle-click /
+        // shift middle-click gesture, the mark itself is not clickable any more.
         const plusHtml = entry.craftable
-            ? '<span class="grid-mark" data-craft="' + escapeHtml(key) + '" title="' + escapeHtml(t('craftOnly')) + '">+</span>'
+            ? '<span class="grid-mark craft-mark" title="' + escapeHtml(t('craftOnly')) + '">+</span>'
             : '';
-        // 左上角标出项目类型（物品 / 流体 / 过滤器 / 占位符）
+        const detail = entry.detail || null;
+        const enchanted = !!(detail && asArray(detail.enchantments).length > 0);
+        const durability = detail ? Number(detail.durability) : NaN;
+        const hasDurability = isFinite(durability);
+        let durabilityHtml = '';
+        if (hasDurability) {
+            const percent = Math.round(Math.max(0, Math.min(1, durability)) * 100);
+            const barClass = percent >= 50 ? '' : (percent >= 20 ? ' warn' : ' bad');
+            durabilityHtml = '<span class="durability" title="' + escapeHtml(t('tipDurability') +
+                t('labelSeparator') + percent + '%') + '"><span class="durability-in' + barClass +
+                '" style="width:' + percent + '%"></span></span>';
+        }
+        const keep = keepAmountOf(entry);
+        let keepHtml = '';
+        if (keep > 0) {
+            // A placeholder has no real stock, so its target never turns green/red:
+            // the badge stays grey ("off").
+            const state = (isPlaceholder || !entry.craftable) ? 'off'
+                : ((Number(entry.count) || 0) >= keep ? 'ok' : 'short');
+            keepHtml = '<span class="grid-keep ' + state + '" title="' + escapeHtml(t('keepStockNumber', {
+                keep: fmtCount(keep)
+            })) + '">' + fmtCount(keep) + '</span>';
+        }
         const kindBadge = kindBadgeHtml(entry.kind);
-        // 仿 meweb：格子里只放图标，左上角类型徽标，右上角 +（可合成），右下角数量，详情悬停显示
-        // 正在合成的物品加 crafting 类：彩色边框 + 呼吸动画
+        const icon = '<span class="card-icon' + (enchanted ? ' enchant-glint' : '') + '">' +
+            resourceIconHtml(entry) + '</span>';
         return '<div class="grid-item' + (isCrafting(entry) ? ' crafting' : '') +
             '" data-resource="' + escapeHtml(key) + '" data-tip-resource="' + escapeHtml(key) + '">' +
-            kindBadge + plusHtml + resourceIconHtml(entry) + countHtml + '</div>';
+            kindBadge + plusHtml + icon + durabilityHtml + keepHtml + countHtml + '</div>';
     }
 
     function renderResources() {
-        // 正在合成的物品仍然会被标上 .crafting 高亮：每次重画前按运行中的流程重算一遍
         activeCraftKeys = craftingKeys();
         renderResourceSortButton();
         const list = visibleResources();
@@ -387,8 +553,55 @@
         el('resourceGrid').innerHTML = list.map(resourceCardHtml).join('');
     }
 
-    // ===================== 悬停详情（仿 meweb 的 item-tooltip） =====================
-    // 网格里只显示图标，名称 / 注册名 / 数量 / 操作说明等都在悬停时用这个悬浮框显示。
+    // The resource card under the pointer: pressing K opens the stock-keeping prompt
+    // for it. Cleared when the pointer leaves the grid.
+    let hoveredResourceKey = '';
+
+    function keepStockKeyOf(entry) {
+        return String(entry.kind) + ':' + String(entry.name);
+    }
+
+    function openKeepStockPrompt(entry) {
+        if (!entry) return;
+        const isPlaceholder = entry.kind === 'placeholder';
+        const key = keepStockKeyOf(entry);
+        openPrompt({
+            title: t('keepStockTitle', { name: displayName(entry.kind, entry.name) }),
+            label: t('keepStockLabel'),
+            value: keepAmountOf(entry),
+            min: 0,
+            // A placeholder has no stock to compare against: its target is a rolling
+            // demand that keeps the producing process running.
+            hint: isPlaceholder ? t('keepStockPlaceholderHint')
+                : t('keepStockHint', { stock: fmtCount(entry.count || 0) }),
+            onConfirm: function (value) {
+                const amount = Math.max(0, Math.floor(value) || 0);
+                sendRequest('set_keep_stock', {
+                    kind: entry.kind,
+                    name: entry.name,
+                    amount: amount
+                }).then(function (response) {
+                    const result = response.result || {};
+                    if (result.error) {
+                        toast(t('requestFailed', { error: result.error }), 'error');
+                        return;
+                    }
+                    status = status || {};
+                    if (!status.keepStock) status.keepStock = {};
+                    if (amount > 0) status.keepStock[key] = amount;
+                    else delete status.keepStock[key];
+                    renderResources();
+                    toast(t('keepStockSaved', {
+                        name: displayName(entry.kind, entry.name),
+                        amount: fmtCount(amount)
+                    }), 'success');
+                }).catch(function (err) {
+                    toast(t('requestFailed', { error: err.message }), 'error');
+                });
+            }
+        });
+    }
+
     const TIP_SELECTOR = '[data-tip-resource],[data-tip-send],[data-tip-graph],[data-tip-text]';
     let tooltipNode = null;
     let tooltipTarget = null;
@@ -407,7 +620,7 @@
 
     function tipField(label, value) {
         const text = (value === undefined || value === null) ? '' : String(value);
-        return label + '：' + text;
+        return label + t('labelSeparator') + text;
     }
 
     function tipBoxHtml(title, lines) {
@@ -418,15 +631,26 @@
                 return;
             }
             if (line === undefined || line === null) return;
+            // A plain string uses the dim registry style. An object is one detail
+            // line: { text, cls } picks a class (tip-detail = white, tip-curse =
+            // red), { text, color } an explicit colour (the durability gradient).
+            if (typeof line === 'object') {
+                if (line.text === undefined || line.text === null) return;
+                if (line.color) {
+                    html += '<div class="tip-detail" style="color:' + escapeHtml(String(line.color)) + '">' +
+                        escapeHtml(String(line.text)) + '</div>';
+                } else {
+                    html += '<div class="' + escapeHtml(line.cls || 'tip-detail') + '">' +
+                        escapeHtml(String(line.text)) + '</div>';
+                }
+                return;
+            }
             html += '<div class="tip-reg">' + escapeHtml(String(line)) + '</div>';
         });
         return html;
     }
 
-    // 悬停内容依据当前的本地数据实时生成（不会显示旧值）
     function tipHtmlFor(node) {
-        // 用户第 4 项（本轮）：顶栏指标 / 房间号那类"一句话提示"走这里 ——
-        // 浏览器原生 title 要等一秒左右、密集推送时还会被顶掉，这个提示框是立刻显示的。
         const plainTip = node.getAttribute('data-tip-text');
         if (plainTip) {
             return tipBoxHtml(plainTip, []);
@@ -434,27 +658,77 @@
         const resourceAttr = node.getAttribute('data-tip-resource');
         if (resourceAttr) {
             const parts = splitKey(resourceAttr);
-            const entry = stores.resources.get(resourceAttr) || {};
-            const lines = [
-                tipField(t('tipRegistry'), parts[1]),
-                tipField(t('tipKind'), resourceKindLabel(parts[0])),
-            ];
-            if (isCrafting(entry)) lines.push(t('craftingNow'));
-            const tags = entryTags(entry);
-            if (tags.length > 0) lines.push(tipField(t('tipTags'), tagText(tags)));
-            if (parts[0] !== 'placeholder') lines.push(tipField(t('tipStored'), fmtCount(entry.count || 0)));
+            const entry = resourceView(resourceAttr) || {};
+            const isPlaceholder = parts[0] === 'placeholder';
+            const detail = entry.detail || null;
+            // Title (larger): display name + stored count.
+            const title = resourceLabel(parts[0], parts[1]) +
+                (isPlaceholder ? '' : ' x' + fmtCount(entry.count || 0));
+            const lines = [];
+            // Kind + registry on their own (white) line.
+            lines.push({ cls: 'tip-detail', text: resourceKindLabel(parts[0]) + ' ' + parts[1] });
+            if (isPlaceholder) {
+                // The placeholder's own name is the title; the item it stands for is
+                // spelled out here (that item is also what its icon shows).
+                const item = placeholderItemOf(entry);
+                if (item) {
+                    lines.push({ cls: 'tip-detail', text: tipField(t('tipPlaceholderItem'),
+                        displayName('item', item)) });
+                }
+            }
+            if (isCrafting(entry)) lines.push({ cls: 'tip-detail', text: t('craftingNow') });
+            if (detail) {
+                // Enchantments: one line each; a curse (its registry name contains
+                // "curse") is red.
+                asArray(detail.enchantments).forEach(function (enchantment) {
+                    const info = enchantmentInfo(enchantment);
+                    if (info.label) {
+                        lines.push({ cls: info.cursed ? 'tip-curse' : 'tip-detail', text: info.label });
+                    }
+                });
+                // Durability: remaining / max (percent), coloured red -> orange ->
+                // yellow -> green. Without a known max only the used points are
+                // shown, in white.
+                const damage = Number(detail.damage);
+                const maxDamage = maxDamageOf(entry);
+                if (maxDamage !== null) {
+                    const usedPoints = isFinite(damage) ? Math.round(damage) : 0;
+                    const remaining = Math.max(0, maxDamage - usedPoints);
+                    const ratio = maxDamage > 0 ? (remaining / maxDamage) : 0;
+                    lines.push({
+                        text: t('tipDurability') + ' ' + remaining + ' / ' + maxDamage +
+                            ' (' + Math.round(ratio * 100) + '%)',
+                        color: durabilityColour(ratio),
+                    });
+                } else if (isFinite(damage) && damage >= 0) {
+                    lines.push({ cls: 'tip-detail', text: t('tipDurabilityLoss') + ' ' + Math.round(damage) });
+                }
+            }
+            // Tags: one per line.
+            entryTags(entry).forEach(function (tag) {
+                lines.push({ cls: 'tip-detail', text: '#' + tag });
+            });
+            if (parts[2]) lines.push({ cls: 'tip-detail', text: t('nbt') + ' ' + parts[2] });
             const pending = sendList.get(resourceAttr);
-            if (pending) lines.push(tipField(t('tipSendAmount'), fmtCount(pending.count)));
-            if (entry.craftable) lines.push(tipField(t('craftable'), t('craftOnly')));
+            if (pending) {
+                lines.push({ cls: 'tip-detail', text: tipField(t('tipSendAmount'), fmtCount(pending.count)) });
+            }
+            if (entry.craftable) {
+                lines.push({ cls: 'tip-detail', text: tipField(t('craftable'), t('craftOnly')) });
+            }
+            const keep = keepAmountOf(entry);
+            if (keep > 0) {
+                lines.push({ cls: 'tip-detail', text: tipField(t('keepStockNumber', { keep: fmtCount(keep) }), fmtCount(keep)) });
+            }
             lines.push('', t('tipResourceClick'));
             if (entry.craftable) lines.push(t('tipCraftClick'));
-            return tipBoxHtml(resourceLabel(parts[0], parts[1]), lines);
+            return tipBoxHtml(title, lines);
         }
         const sendAttr = node.getAttribute('data-tip-send');
         if (sendAttr) {
             const parts = splitKey(sendAttr);
             const entry = sendList.get(sendAttr) || {};
-            const stock = stores.resources.get(sendAttr) || {};
+            const stock = resourceView(sendAttr) || {};
             const lines = [
                 tipField(t('tipRegistry'), parts[1]),
                 tipField(t('tipKind'), resourceKindLabel(parts[0])),
@@ -506,7 +780,6 @@
         if (tooltipNode) tooltipNode.style.display = 'none';
     }
 
-    // 网格重画后悬停的格子会被替换掉：按鼠标位置找回新格子，悬停信息不会卡住
     function refreshTooltip() {
         if (!tooltipTarget) return;
         if (document.contains(tooltipTarget)) {
@@ -545,18 +818,26 @@
         window.addEventListener('resize', hideTooltip);
     }
 
-    // ===================== 待发送网格 =====================
-    function sendCap(kind, name) {
-        const entry = stores.resources.get(resourceKey(kind, name));
+    function sendCap(a, b, c) {
+        const args = resourceArgs(a, b, c);
+        const entry = resourceView(resourceKey(args[0], args[1], args[2]));
         if (!entry) return 0;
         return entry.craftable ? Infinity : Math.max(0, entry.count || 0);
     }
 
-    function addSend(kind, name, delta) {
-        const key = resourceKey(kind, name);
-        const entry = sendList.get(key) || { kind: kind, name: name, count: 0 };
+    function addSend(a, b, c) {
+        let resource, delta;
+        if (a && typeof a === 'object') {
+            resource = a;
+            delta = b;
+        } else {
+            resource = { kind: a, name: b };
+            delta = c;
+        }
+        const key = resourceKey(resource.kind, resource.name, resource.nbt);
+        const entry = sendList.get(key) || { kind: resource.kind, name: resource.name, nbt: resource.nbt, count: 0 };
         let next = entry.count + delta;
-        const cap = sendCap(kind, name);
+        const cap = sendCap(resource);
         if (next > cap) next = cap;
         if (next <= 0) {
             sendList.delete(key);
@@ -567,26 +848,31 @@
         renderSend();
     }
 
-    function setSend(kind, name, count) {
-        const key = resourceKey(kind, name);
+    function setSend(a, b, c) {
+        let resource, count;
+        if (a && typeof a === 'object') {
+            resource = a;
+            count = b;
+        } else {
+            resource = { kind: a, name: b };
+            count = c;
+        }
+        const key = resourceKey(resource.kind, resource.name, resource.nbt);
         let next = Math.max(0, Math.floor(count) || 0);
-        const cap = sendCap(kind, name);
+        const cap = sendCap(resource);
         if (next > cap) next = cap;
         if (next <= 0) {
             sendList.delete(key);
         } else {
-            sendList.set(key, { kind: kind, name: name, count: next });
+            sendList.set(key, { kind: resource.kind, name: resource.name, nbt: resource.nbt, count: next });
         }
         renderSend();
     }
 
-    // ===================== 发送面板：待发送（左，先进先出）+ 发送中（右，最新提交的排最前） =====================
-    // 刚点「发送」时服务端队列要等它下一 tick 才回传，这里先放一条“乐观项”，
-    // 让材料立刻出现在「发送中」；服务端回传同一种材料后它就退休（见 deliveryEntries）。
     let optimisticDeliveries = [];
 
     function sendKeyOf(entry) {
-        return resourceKey(entry.kind, entry.name);
+        return resourceKey(entry.kind, entry.name, entry.nbt);
     }
 
     function addOptimisticDeliveries(items) {
@@ -595,7 +881,9 @@
             optimisticDeliveries = optimisticDeliveries.filter(function (other) {
                 return sendKeyOf(other) !== key;
             });
-            optimisticDeliveries.push({ kind: item.kind, name: item.name, count: item.count, at: Date.now() });
+            optimisticDeliveries.push({
+                kind: item.kind, name: item.name, nbt: item.nbt, count: item.count, at: Date.now()
+            });
         });
     }
 
@@ -607,23 +895,10 @@
         });
     }
 
-    // ===== 乐观占位的“增量核对”（1.6.12，任务 5）=====
-    // 后台真正发完物品后，界面上的「发送中」偶尔会一直留着那条占位：以前只在渲染时按时间猜
-    // （“服务端 1.5 秒后又推过队列”），没有推送就不会重算。
-    // 现在改成确定性做法：
-    //   ① 服务端确认收到这次发送请求之后（send_items 的响应回来）才“武装”这些占位；
-    //   ② 之后每收到一次发送队列的增量更新，就核对一次：队列里没有它 = 已经发完/被拒 → 立刻退休，
-    //      并主动重画（不再等下一次渲染）。这就是它要求的“相同的增量更新行为”。
-    //   ③ （用户第 1 项）再加一次“定时核对”——物品已经在存储里、目标容器又近时，
-    //      服务端可能在这条发送**入队与出队之间**就把它搬完了：网页既收不到“加入队列”，
-    //      也收不到“出队”的推送，光等推送的话那条占位会一直留在「发送中」（用户看到的就是
-    //      “物品其实已经发出去了，网页还写着发送中”）。到点了就自己核对一次并重画。
     let optimisticArmed = false;
     let optimisticArmedAt = 0;
     let optimisticSweeps = 0;
     let optimisticTimer = null;
-    /// 定时核对的延时（毫秒）：比服务端“没有变化时的兜底推送间隔”（2 秒）稍长一点，
-    /// 这样到点前服务端至少推过一次，不会把“刚发出、还在队列里”的占位误清掉。
     const OPTIMISTIC_SETTLE_MS = 2500;
 
     function clearOptimisticTimer() {
@@ -640,7 +915,6 @@
         clearOptimisticTimer();
         optimisticTimer = setTimeout(function () {
             optimisticTimer = null;
-            /// 到点了：不管服务端推没推过，都把对不上的占位收掉并重画（见上面的 ③）
             const before = optimisticDeliveries.length;
             settleOptimisticDeliveries();
             if (before > 0) {
@@ -650,7 +924,6 @@
         }, OPTIMISTIC_SETTLE_MS);
     }
 
-    /// 清掉所有乐观占位（服务端的真实条目由 deliveryEntries 自己接管）；返回前是否还有占位
     function settleOptimisticDeliveries() {
         clearOptimisticTimer();
         const before = optimisticDeliveries.length;
@@ -659,38 +932,28 @@
         return before > 0;
     }
 
-    /// 核对并移除已经不在服务端队列里的占位；返回是否真的移除了（调用方据此重画）
-    /// force = true：不再等“响应之后的第 2 次推送”，立刻清（定时核对用）
     function reconcileOptimisticDeliveries(force) {
         if (!optimisticArmed || optimisticDeliveries.length === 0) return false;
         optimisticSweeps += 1;
-        // 响应回来之后的第 1 次推送，内容可能是在服务端处理这条请求之前收集的，
-        // 那时队列里当然还没有它 —— 所以再等一次推送（或 1.5 秒）才敢把“队列里没有它”
-        // 当成“已经发完 / 被拒”，避免刚发出的东西立刻从「发送中」闪掉。
         const settled = force === true || optimisticSweeps >= 2 ||
             (Date.now() - optimisticArmedAt) >= 1500;
         if (!settled) return false;
-        // 队列里有它 → 由服务端的真实条目接管；队列里没有它 → 已经发完/被拒 → 退休。
-        // 两种情况都该把本地占位清掉（否则就是一直留着的那条“发送中”）。
         return settleOptimisticDeliveries();
     }
 
-    // 发送中：乐观项（最新提交的排最前）+ 服务端队列（按 id 从后往前 = 最新提交的排最前）
     function deliveryEntries() {
         const out = [];
         const real = {};
         Array.from(stores.deliveries.values()).forEach(function (item) {
             real[sendKeyOf(item)] = item;
         });
-        // 服务端已经有这种材料了（或增量核对发现它已经不在队列里）：乐观项退休。
-        // 实测兜底：超过 1 分钟还没对上就当它已经不在队列里（离线/丢包时不会永远残留）。
         const nowMs = Date.now();
         optimisticDeliveries = optimisticDeliveries.filter(function (entry) {
             if (real[sendKeyOf(entry)]) return false;
             return nowMs - (Number(entry.at) || 0) < 60000;
         });
         optimisticDeliveries.slice().reverse().forEach(function (entry) {
-            out.push({ kind: entry.kind, name: entry.name, count: entry.count, pending: true });
+            out.push({ kind: entry.kind, name: entry.name, nbt: entry.nbt, count: entry.count, pending: true });
         });
         Array.from(stores.deliveries.values())
             .sort(function (a, b) { return (Number(b.id) || 0) - (Number(a.id) || 0); })
@@ -699,13 +962,12 @@
                     id: item.id,
                     kind: item.kind,
                     name: item.name,
+                    nbt: item.nbt,
                     count: Number(item.remaining || item.total || 0),
-                    // 用户第 5 项：总共多少也带上 —— 服务端会把"同容器 + 同资源"的多次发送合并成
-                    // 一条（remaining/total 相加），网页只有拿到 total 才能显示成"剩余/总共"。
                     total: Number(item.total || 0),
                     container: item.container,
                     process: item.processName,
-                    error: item.lastError
+                    error: describeMessage(item.lastError)
                 });
             });
         return out;
@@ -713,22 +975,16 @@
 
     function deliveryItemHtml(entry) {
         const tip = entry.error || entry.container || entry.process || '';
-        // 取消按钮：只有服务端队列里的条目才有 id（刚点发送的乐观占位还没拿到 id，不能取消）
         const cancel = entry.id
             ? '<span class="grid-mark danger" data-delivery-cancel="' + escapeHtml(String(entry.id)) + '" title="' +
               escapeHtml(t('deliveryCancel')) + '">×</span>'
             : '';
-        // 用户第 5 项：数量显示成"剩余 / 总共"。以前只显示 remaining —— 同一目标容器 + 同一资源
-        // 的多次发送会在服务端合并（见 Recipe:addDelivery，remaining/total 相加），网页上却只看到
-        // 一个大数字（例如 381 发两次 → 762），没人知道它是两次并起来的。
         const total = Number(entry.total || 0);
         const countText = fmtCount(entry.count) +
             (total > 0 && total !== Number(entry.count || 0)
                 ? '<span class="delivery-total" title="' + escapeHtml(t('deliveryTotalTitle')) + '">/' +
                   fmtCount(total) + '</span>'
                 : '');
-        // 发送卡住的原因（服务端 lastError）除了 tooltip，再给一个左上角的红色感叹号 ——
-        // 以前它只藏在 title 里，卡片看起来和正常的一模一样（"显然是发送不了了"却看不出来）。
         const errorMark = entry.error
             ? '<span class="grid-mark danger delivery-error-mark" title="' + escapeHtml(entry.error) + '">!</span>'
             : '';
@@ -745,43 +1001,63 @@
             '</div>';
     }
 
-    // 底部 dock 的显隐（用户第 3 项："有多个发送中的物品时，移除其中一个，整个 dock 会消失再出现"）：
-    // 以前一次渲染里发现两栏都空就立刻 display:none —— 而"瞬时为空"很常见：
-    //   * 客户端 30 秒超时 / 重连 / 服务端主动全量同步时，deliveries 会先被清掉再填回来；
-    //   * 缓存条目在两次推送之间被清空（例如刚发出去的那条被服务端删掉）。
-    // 现在：空态先等一小会儿（HIDE_GRACE_MS）再隐藏；期间数据回来了就取消隐藏；
-    // 并且只在"服务端确实在线"（serverSeen）时才隐藏 —— 失联时保留上一次的内容而不是整块消失。
     const HIDE_GRACE_MS = 600;
     let panelHideTimer = null;
+    let deliveryPanelWanted = false;
     let lastSendHtml = '';
     let lastDeliveryHtml = '';
 
-    function scheduleDeliveryPanelHide() {
+    // The send list and the deliveries are the bottom toolbar of the resources page: it is
+    // shown while that page is on screen and there is something in it (or was, within the
+    // grace period of a just emptied list). Everything goes through
+    // refreshDeliveryPanelVisibility, so a page switch and a data change can never fight
+    // over the same style property.
+    function deliveryPanelVisible() {
+        const onResources = typeof currentPanel === 'function' ? currentPanel() === 'resources' : true;
+        return onResources && deliveryPanelWanted;
+    }
+
+    function refreshDeliveryPanelVisibility() {
         const panel = el('deliveryPanel');
-        if (!panel || panelHideTimer) return;
+        if (!panel) return;
+        const show = deliveryPanelVisible();
+        if (show && panelHideTimer) {
+            clearTimeout(panelHideTimer);
+            panelHideTimer = null;
+        }
+        const want = show ? '' : 'none';
+        if (panel.style.display !== want) panel.style.display = want;
+        syncDeliveryPanelSpacing();
+    }
+
+    function scheduleDeliveryPanelHide() {
+        if (!deliveryPanelWanted || panelHideTimer) return;
         panelHideTimer = setTimeout(function () {
             panelHideTimer = null;
-            if (!serverSeen) return;                       // 服务端失联/同步中：宁可留着旧内容
+            if (!serverSeen) return;
             const grid = el('sendGrid');
             const deliveryGrid = el('deliveryGrid');
             const stillEmpty = (!grid || grid.innerHTML === '') &&
                 (!deliveryGrid || deliveryGrid.innerHTML === '');
             if (!stillEmpty) return;
-            const node = el('deliveryPanel');
-            if (node) node.style.display = 'none';
-            syncDeliveryPanelSpacing();
+            deliveryPanelWanted = false;
+            refreshDeliveryPanelVisibility();
         }, HIDE_GRACE_MS);
     }
 
     function syncDeliveryPanelVisibility(hasAny) {
-        const panel = el('deliveryPanel');
-        if (!panel) return;
-        if (hasAny) {
+        deliveryPanelWanted = hasAny === true;
+        if (deliveryPanelWanted) {
+            refreshDeliveryPanelVisibility();
+            return;
+        }
+        if (!deliveryPanelVisible()) {
+            // Another page is on screen, so the toolbar is hidden anyway: no grace.
             if (panelHideTimer) {
                 clearTimeout(panelHideTimer);
                 panelHideTimer = null;
             }
-            if (panel.style.display === 'none') panel.style.display = '';
+            refreshDeliveryPanelVisibility();
             return;
         }
         scheduleDeliveryPanelHide();
@@ -796,7 +1072,6 @@
         const deliveryGrid = el('deliveryGrid');
         if (!grid || !deliveryGrid) return;
         if (!hasAny) {
-            // 立刻清空两栏（数据可能在下一次推送里就回来）；只在真的写过内容时才动 DOM
             if (lastSendHtml !== '') {
                 grid.innerHTML = '';
                 lastSendHtml = '';
@@ -808,11 +1083,8 @@
             syncDeliveryPanelSpacing();
             return;
         }
-        // 与资源网格同样的显示方式：类型徽标 + 图标 + 右上角 ×（移除）+ 右下角数量。
-        // 必须用 resourceIconHtml：过滤器/占位符不是物品，按 item 去查图标接口会 404，
-        // 结果就只能显示名称兜底（以前“待发送”里的过滤器图标不显示就是这个原因）。
         const sendHtml = entries.map(function (entry) {
-            const key = resourceKey(entry.kind, entry.name);
+            const key = resourceKey(entry.kind, entry.name, entry.nbt);
             return '<div class="grid-item" data-send="' + escapeHtml(key) + '" data-tip-send="' + escapeHtml(key) + '">' +
                 kindBadgeHtml(entry.kind) +
                 '<span class="grid-mark danger" data-send-remove="' + escapeHtml(key) + '" title="' +
@@ -822,8 +1094,6 @@
                 '</div>';
         }).join('');
         const deliveryHtml = deliveries.map(deliveryItemHtml).join('');
-        // 内容没变就不动 DOM（用户第 3 项）：重画（资源每秒都在变 → 会带着重画一次）时
-        // 反复写同一份 HTML 会让浏览器重建这些卡片（图标重新解码、布局重排），看起来就是"闪一下"。
         if (sendHtml !== lastSendHtml) {
             grid.innerHTML = sendHtml;
             lastSendHtml = sendHtml;
@@ -835,15 +1105,11 @@
         syncDeliveryPanelSpacing();
     }
 
-    // 点「发送」时的滑动动画：待发送卡片的一份副本从原位置飞到「发送中」里的对应位置（经典 FLIP）
-    // 1.6.11 修复「动画丢失」：以前只在 append 后直接 requestAnimationFrame 改 transform ——
-    // 如果 append 和改样式落在同一帧里，浏览器从没画过“初始位置”，transition 就不会触发（等于没动画）。
-    // 现在 append 之后先强制一次布局（读 offsetWidth）把初始样式落地，再在下一帧改 transform。
     function animateSendToDelivery(pairs) {
         const ghosts = [];
         pairs.forEach(function (pair) {
             if (!pair.fromRect || !pair.node) return;
-            if (!pair.fromRect.width && !pair.fromRect.height) return;      // 起点量不到（面板刚显示）：不做动画
+            if (!pair.fromRect.width && !pair.fromRect.height) return;
             const ghost = pair.node.cloneNode(true);
             ghost.classList.add('send-ghost');
             ghost.style.left = pair.fromRect.left + 'px';
@@ -851,22 +1117,22 @@
             ghost.style.width = pair.fromRect.width + 'px';
             ghost.style.height = pair.fromRect.height + 'px';
             document.body.appendChild(ghost);
-            // 关键：强制同步布局，保证浏览器已经用“起点样式”算过一遍这个元素
             void ghost.offsetWidth;
-            // 终点量不到（例如占位卡片还没画出来）时退到「发送中」这一栏的左上角，至少飞向正确区域
             let toRect = pair.toRect;
             if (!toRect || (!toRect.width && !toRect.height)) {
                 const grid = el('deliveryGrid');
                 toRect = grid ? grid.getBoundingClientRect() : null;
             }
-            if (!toRect) {
+            // The send list is a panel page and may well be hidden while something is put
+            // on it: its rect is all zeros then, and the animation would fly the ghost
+            // into the corner of the window. Skip such a pair instead.
+            if (!toRect || (!toRect.width && !toRect.height)) {
                 ghost.remove();
                 return;
             }
             ghosts.push({ node: ghost, from: pair.fromRect, to: toRect });
         });
         if (ghosts.length === 0) return;
-        // 下一帧再改位置，保证 transition 真的生效
         requestAnimationFrame(function () {
             ghosts.forEach(function (item) {
                 const scale = item.from.width > 0 ? (item.to.width / item.from.width) : 1;
@@ -883,7 +1149,6 @@
     function renderSendContainerSelect() {
         const select = el('sendContainer');
         const previous = select.value;
-        // output 角色的容器：同名物品/流体容器靠“种类:名称”键区分，所以下拉值用键
         const options = Array.from(stores.containers.values())
             .filter(function (item) { return item.role === 'output'; })
             .sort(function (a, b) { return containerKeyOf(a).localeCompare(containerKeyOf(b)); });
@@ -896,6 +1161,3 @@
             select.value = previous;
         }
     }
-
-
-    

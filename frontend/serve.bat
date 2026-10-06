@@ -1,6 +1,4 @@
 @echo off
-rem IFM frontend local web server launcher (Windows). Double-click this file.
-rem It just runs: python serve.py (with any extra arguments you pass).
 cd /d "%~dp0"
 
 set PY=python

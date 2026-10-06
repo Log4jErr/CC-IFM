@@ -127,8 +127,12 @@ def target_files(names):
     base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if names:
         return [os.path.abspath(name) for name in names]
-    files = [os.path.join(base, "IFMMaster.lua")]
-    module_dir = os.path.join(base, "modules")
+    # 本仓库把源码放在 backend/ 下（CC:T 解包后的旧布局则是项目根目录，两种都支持）
+    source_dir = os.path.join(base, "backend")
+    if not os.path.isdir(os.path.join(source_dir, "modules")):
+        source_dir = base
+    files = [os.path.join(source_dir, "IFMMaster.lua")]
+    module_dir = os.path.join(source_dir, "modules")
     if os.path.isdir(module_dir):
         files += [os.path.join(module_dir, n) for n in sorted(os.listdir(module_dir)) if n.endswith(".lua")]
     return files

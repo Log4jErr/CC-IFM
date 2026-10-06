@@ -1,53 +1,81 @@
-// IFM :: web/ifm-net.js
-// 服务端日志通道 / WebSocket 协议 / 渲染调度
-// （由 index.html 拆分而来；所有文件按顺序在页面里加载，共享同一份全局作用域）
 'use strict';
 
-// ===================== 服务端日志 =====================
-    // 服务端把日志推过来（不写文件、不刷屏 CC:T 终端），这里输出到浏览器控制台
-    const serverLogLines = [];        // 保留最近若干条，便于在控制台里回看
+    const serverLogLines = [];
     function serverLog(line) {
         serverLogLines.push(line);
         while (serverLogLines.length > 500) serverLogLines.shift();
         if (!window.console || !console.log) return;
-        // 用户第 2 项：日志分级上色 —— 后端在行首加了 [warn] / [error] 标记
-        //（见 modules/util.lua 的 LOG_TAGS / classify），网页这边据此换颜色与打印通道。
         const text = String(line);
         const match = /^\[[^\]]*\]\s*\[(warn|error)\]\s/.exec(text);
         const level = match ? match[1] : 'info';
+        const isDebug = /^\[[^\]]*\]\s*\[debug\]\s/.test(text);
         if (level === 'error') {
             (console.error || console.log).call(console, '%c' + text, 'color:#ff6b6b');
         } else if (level === 'warn') {
             (console.warn || console.log).call(console, '%c' + text, 'color:#e0b050');
+        } else if (isDebug) {
+            (console.debug || console.log).call(console, '%c' + text, 'color:#8b8b8b');
         } else {
             console.log(text);
         }
     }
     window.ifmServerLog = function () { return serverLogLines.slice(); };
 
-    // ===================== WebSocket =====================
-    // 所有出站消息都带上前端版本号：服务端据此在日志里提示版本不一致（网页自己也会先断开）
+    const SESSION_TOKEN = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+
     function withClientVersion(payload) {
-        if (payload && typeof payload === 'object' && payload.version === undefined) {
-            payload.version = IFM_CLIENT_VERSION;
+        if (payload && typeof payload === 'object') {
+            if (payload.version === undefined) {
+                payload.version = IFM_CLIENT_VERSION;
+            }
+            if (payload.session === undefined) {
+                payload.session = SESSION_TOKEN;
+            }
         }
         return payload;
     }
 
-    function sendRaw(payload) {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify(escapePayloadForServer(withClientVersion(payload))));
-            return true;
-        }
-        return false;
+    // Every request the UI fires (a button click, the container tool poll, the
+    // diagnose button) gives up after this long. Nobody wants a button to stay
+    // disabled for half a minute because the master went quiet; the log lines
+    // tell the player which request was dropped.
+    const REQUEST_TIMEOUT_MS = 5000;
+
+    let outbox = [];
+
+    // No batching delay: every frame goes out as soon as it is queued.
+    function queueFrame(payload) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+        outbox.push(escapePayloadForServer(withClientVersion(payload)));
+        flushOutbox();
+        return true;
     }
 
-    // 已发出、还没收到响应的请求数：按钮点下去就能看到“请求中 N”，不必等结果
+    function flushOutbox() {
+        if (outbox.length === 0) return;
+        const batch = outbox;
+        outbox = [];
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        try {
+            ws.send(JSON.stringify(batch.length === 1 ? batch[0] : batch));
+        } catch (err) {
+            serverLog("[IFM] outbox send failed: " + (err && err.message));
+        }
+    }
+
+    function sendRaw(payload) {
+        return queueFrame(payload);
+    }
+
     let pendingCount = 0;
 
-    // 本连接在房间里的 uid（中继在自己的 join 帧里给）：用来丢掉"中继回声回来的自己发的帧"。
-    // 每次连接都是新的 uid，断开时清空（见 handleIncoming / socket.onclose）。
     let myUid = null;
+
+    let batchCount = 0;
+    let frameTotal = 0;
+    let unknownFrameCount = 0;
+    let parseFailCount = 0;
+    let messageParseFailCount = 0;
 
     function updatePendingInfo() {
         const node = el('pendingInfo');
@@ -55,9 +83,6 @@
         node.textContent = pendingCount > 0 ? t('pendingRequests', { n: pendingCount }) : '';
     }
 
-    // 用户第 3/4 项：房间号 / 中转地址在标题行里显示成 ****（截图、录屏、直播时不泄露），
-    // 鼠标悬停显示真实值：title 走浏览器原生提示，data-tip-text 走网页的即时提示框
-    // （原生提示要等一秒左右，密集推送还会把它顶掉 —— 见 setHtmlIfChanged）。
     function maskText(id, value, shown) {
         const node = el(id);
         if (!node) return;
@@ -79,10 +104,6 @@
                 return;
             }
             const id = ++requestSeq;
-            // 注意顺序：请求关联 id 与 action 必须最后写入，否则 payload 里同名的字段
-            // （例如 delete_delivery 的 { id = 发货 id }）会把关联 id 覆盖掉 ——
-            // 响应确实回来了，但网页按错误的 id 找不到等待中的请求，只能干等 30 秒超时
-            //（用户实测：“request delete_delivery got no response in 30s”就是这么来的）。
             const payload = Object.assign({}, data || {}, { id: id, action: action });
             const finish = function () {
                 pendingCount = Math.max(0, pendingCount - 1);
@@ -94,17 +115,17 @@
             });
             pendingCount += 1;
             updatePendingInfo();
-            ws.send(JSON.stringify(escapePayloadForServer(withClientVersion(payload))));
+            queueFrame(payload);
             setTimeout(function () {
                 if (pendingRequests.has(id)) {
                     pendingRequests.delete(id);
                     finish();
-                    // 超时：服务端可能其实已经执行了（只是响应没回来）——顺手做一次全量同步
-                    serverLog('[IFM] request ' + action + ' got no response in 30s, requesting a full sync');
-                    sendRaw({ action: 'full_request' });
+                    serverLog('[IFM] request ' + action + ' got no response in '
+                        + Math.round(REQUEST_TIMEOUT_MS / 1000) + 's - giving up on it '
+                        + '(connection problem?); NOT re-syncing silently');
                     reject(new Error(t('requestTimeout', { action: action })));
                 }
-            }, 30000);
+            }, REQUEST_TIMEOUT_MS);
         });
     }
 
@@ -112,18 +133,77 @@
         if (connected) sendRaw({ action: 'heartbeat' });
     }
 
+    let lastBundleSeq = null;
+    function unpackServerText(text) {
+        if (typeof text !== 'string' || text.lastIndexOf('BDPK', 0) !== 0) return false;
+        let body = text.slice(4);
+        let seq = null;
+        const prefixMatch = /^([0-9]+):/.exec(body);
+        if (prefixMatch) {
+            seq = Number(prefixMatch[1]);
+            body = body.slice(prefixMatch[0].length);
+        }
+        if (seq !== null) {
+            if (lastBundleSeq !== null && seq > lastBundleSeq + 1) {
+                serverLog('[IFM] LOST ' + (seq - lastBundleSeq - 1) + ' bundle(s) (#'
+                    + (lastBundleSeq + 1) + '..#' + (seq - 1) + '): the transport dropped them'
+                    + ' - look up their sizes in the master log (bundle #N: B bytes, K frame(s))');
+            } else if (lastBundleSeq !== null && seq <= lastBundleSeq) {
+                serverLog('[IFM] bundle sequence restarted at #' + seq + ' (the master restarted?)');
+            }
+            lastBundleSeq = seq;
+        }
+        const parts = body === '' ? [] : body.split('==+');
+        batchCount += 1;
+        frameTotal += parts.length;
+        if (batchCount <= 3 || batchCount % 100 === 0) {
+            serverLog('[IFM] bundle frames: received ' + batchCount + ' bundle(s), '
+                + frameTotal + ' frame(s) total');
+        }
+        for (let i = 0; i < parts.length; i += 1) {
+            let frame;
+            try {
+                frame = JSON.parse(parts[i].split('=+').join('='));
+            } catch (err) {
+                parseFailCount += 1;
+                if (parseFailCount <= 3 || parseFailCount % 100 === 0) {
+                    serverLog('[IFM] DROPPED a bundled frame that is not valid JSON (#'
+                        + parseFailCount + '): ' + String(parts[i]).slice(0, 120));
+                }
+                continue;
+            }
+            handleFrame(frame);
+        }
+        return true;
+    }
+
     function handleIncoming(raw) {
+        if (unpackServerText(raw)) return;
         let data;
         try {
             data = JSON.parse(raw);
         } catch (err) {
+            parseFailCount += 1;
+            if (parseFailCount <= 3 || parseFailCount % 100 === 0) {
+                serverLog('[IFM] DROPPED a frame that is not valid JSON (#'
+                    + parseFailCount + '): ' + String(raw).slice(0, 120));
+            }
             return;
         }
-        // 发送者身份必须在解包 data.message **之前**取：解包之后这一层就没了。
-        // 中继的房间广播是"发给所有人（包含发送者自己）"，所以我们会收到自己刚发出的帧 ——
-        // 必须按 uid 丢掉，否则它会被当成服务端数据：自己发出的请求回声与本请求 id 相同，
-        // 谁先到谁被下面的 pendingRequests 认领（回声带的是请求体、没有 result）⇒
-        // 表现为"点了没反应 / 结果不刷新"。（服务端也做同样的过滤，见 protocol.lua 的 isOwnFrame。）
+        if (Array.isArray(data)) {
+            batchCount += 1;
+            frameTotal += data.length;
+            if (batchCount <= 3 || batchCount % 100 === 0) {
+                serverLog('[IFM] batch frames: received ' + batchCount + ' batch(es), '
+                    + frameTotal + ' frame(s) total');
+            }
+            for (let i = 0; i < data.length; i += 1) handleFrame(data[i]);
+            return;
+        }
+        handleFrame(data);
+    }
+
+    function handleFrame(data) {
         const frameType = data && data.type;
         const fromUid = data && data.uid != null ? String(data.uid) : null;
         if (frameType === 'join' && data.self) {
@@ -135,22 +215,36 @@
         if (data.message && typeof data.message === 'object') {
             data = data.message;
         } else if (typeof data.message === 'string') {
-            try { data = JSON.parse(data.message); } catch (err) { /* keep */ }
+            if (unpackServerText(data.message)) return;
+            try {
+                data = JSON.parse(data.message);
+            } catch (err) {
+                messageParseFailCount += 1;
+                if (messageParseFailCount <= 3 || messageParseFailCount % 100 === 0) {
+                    serverLog('[IFM] DROPPED a wrapped frame whose message is not JSON (#'
+                        + messageParseFailCount + '): ' + String(data.message).slice(0, 120));
+                }
+                return;
+            }
         }
-        // 传输层里的名称字段是 ASCII 转义形式：只把这些字段还原成真正的字符
+        if (Array.isArray(data)) {
+            batchCount += 1;
+            frameTotal += data.length;
+            if (batchCount <= 3 || batchCount % 100 === 0) {
+                serverLog('[IFM] batch frames: received ' + batchCount + ' batch(es), '
+                    + frameTotal + ' frame(s) total');
+            }
+            for (let i = 0; i < data.length; i += 1) handleFrame(data[i]);
+            return;
+        }
         data = decodeFrameFromServer(data);
         if (data.type === 'join' || data.type === 'leave') return;
-        // 服务端的应用层保活（没人看网页时防止中继因"空闲"踢连接）：静默忽略。
-        // 它不代表服务端有状态变化 —— 不需要刷新看门狗，也不需要重画界面。
         if (data.type === 'keepalive') return;
-        // 带 action 的帧只可能来自 IFM 服务端：收到它才把状态切成“已连接”（同时刷新看门狗时间）
         if (data.action) markServerSeen();
-        // 服务端日志：没有任何文件写入，全部由服务端推送到这里，直接在浏览器控制台打印
         if (data.action === 'log') {
             asArray(data.lines).forEach(function (line) {
                 const text = unescapeAsciiText(String(line));
                 serverLog(text);
-                // 诊断报告：在 begin/end 标记之间收集，收齐后渲染到诊断窗口
                 if (text.indexOf('===== IFM diagnose begin') >= 0) {
                     diagnoseBuffer = [text];
                     if (diagnoseTimer) clearTimeout(diagnoseTimer);
@@ -164,9 +258,11 @@
             });
             return;
         }
+        if (data.action === 'state_clear') {
+            beginStateClear(data.categories);
+            return;
+        }
         if (data.action === 'full_sync_start') {
-            // 全量同步开始：先不清空本地数据（清空会让所有列表瞬间变空 → 整页闪一下）。
-            // 服务端只要房间里有客户端加入/重连就会广播一次全量，清空式处理会让“闪一下”反复发生。
             beginFullSync();
             return;
         }
@@ -182,15 +278,34 @@
             const resolver = pendingRequests.get(data.id);
             pendingRequests.delete(data.id);
             resolver(data);
+            return;
+        }
+        if (!data.action && !data.type && !data.id) {
+            if (unknownFrameCount < 5) {
+                unknownFrameCount += 1;
+                serverLog('[IFM] unknown frame shape (ignored): ' + JSON.stringify(data).slice(0, 200));
+            }
         }
     }
 
     function applyStatus(next) {
+        const prevPending = JSON.stringify(status && status.capacityPending || []);
+        const prevKeep = JSON.stringify(status && status.keepStock || {});
         status = next || {};
         statusUpdatedAt = Date.now();
-        // 服务端版本号：不一致就弹警告并停止连接（见 applyServerVersion）
         applyServerVersion(status.version);
         markDirty('status');
+        // The peripheral cards are highlighted from status.capacityPending, so a change
+        // there has to re-render that panel too (dirty.status alone would not).
+        if (JSON.stringify(status.capacityPending || []) !== prevPending) markDirty('peripherals');
+        // The resource panel draws the stock-keeping number from status.keepStock, so
+        // a change there has to re-render the grid too.
+        if (JSON.stringify(status.keepStock || {}) !== prevKeep) markDirty('resources');
+    }
+
+    // No tolerance for a missing protocol field: the UI reads the fields as they
+    // arrive (a build mismatch must be visible, not silently patched over).
+    function checkProtocolFields() {
     }
 
     function applyChanges(changes) {
@@ -203,38 +318,37 @@
             if (!store) return;
             const list = Array.isArray(changes[category]) ? changes[category] : [];
             list.forEach(function (item) {
+                checkProtocolFields(category, item);
                 const key = keyOf(category, item);
                 if (item._deleted) store.delete(key); else store.set(key, normalizeItemArrays(category, item));
             });
             markDirty(category);
-            // 发送队列的增量更新到了：立刻核对「发送中」里的乐观占位
-            // （后台已经发完的物品要马上从界面上消失，任务 5 / 1.6.12）
             if (category === 'deliveries') reconcileOptimisticDeliveries();
         });
         scheduleRender();
     }
 
-    // ===================== 全量同步（无闪） =====================
-    // 服务端全量 = full_sync_start → 分批 incremental_update → full_sync_end。
-    // 这里在 start..end 之间把数据先收进缓冲，end（或超时兜底）时整体替换并只重画一次：
-    // 页面不会再出现“列表先变空、再填回来”的闪烁，中途发失败也不会把界面清空。
-    let fullSyncBuffer = null;      // { changes: { [category]: [...] }, timer }
-    // 1.6.12：发送队列的乐观占位不再按“服务端推送时间”猜退休时机，
-    // 改成 send_items 响应后“武装”，之后每次收到 deliveries 增量更新就核对（见 ifm-resources.js）。
+    let fullSyncBuffer = null;
 
     function beginFullSync() {
         if (fullSyncBuffer) clearTimeout(fullSyncBuffer.timer);
         fullSyncBuffer = {
             changes: {},
-            timer: setTimeout(finishFullSync, 1500)     // 兜底：万一没收到 full_sync_end
+            timer: setTimeout(finishFullSync, 1500)
         };
+    }
+
+    function beginStateClear(categories) {
+        if (!fullSyncBuffer) beginFullSync();
+        fullSyncBuffer.clearAll = true;
+        fullSyncBuffer.clearedCategories = Array.isArray(categories) ? categories.slice() : null;
     }
 
     function bufferFullSyncChanges(changes) {
         if (!fullSyncBuffer) beginFullSync();
         Object.keys(changes).forEach(function (category) {
             if (category === 'status') {
-                fullSyncBuffer.changes.status = changes.status;   // 标量类别：直接覆盖
+                fullSyncBuffer.changes.status = changes.status;
                 return;
             }
             const list = fullSyncBuffer.changes[category] || (fullSyncBuffer.changes[category] = []);
@@ -250,17 +364,24 @@
         fullSyncBuffer = null;
         clearTimeout(buffer.timer);
         let touched = false;
-        Object.keys(buffer.changes).forEach(function (category) {
+        // state_clear tells the page which categories the server cleared. A
+        // category whose new list is empty produces no incremental_update frame at
+        // all, so clearing only the categories that arrived with changes would keep
+        // the rows of the previous sync in the panel forever.
+        const cleared = {};
+        asArray(buffer.clearedCategories).forEach(function (category) { cleared[category] = true; });
+        Object.keys(buffer.changes).forEach(function (category) { cleared[category] = true; });
+        Object.keys(cleared).forEach(function (category) {
             if (category === 'status') {
-                applyStatus(buffer.changes.status);
+                if (buffer.changes.status !== undefined) applyStatus(buffer.changes.status);
                 return;
             }
             const store = stores[category];
             if (!store) return;
-            // 只替换这一轮真的收到数据的类别（没出现的类别保持原样，避免误清空）
             store.clear();
             asArray(buffer.changes[category]).forEach(function (item) {
-                if (item && item._deleted) return;                // 全量里不该有墓碑
+                if (item && item._deleted) return;
+                checkProtocolFields(category, item);
                 store.set(keyOf(category, item), normalizeItemArrays(category, item));
             });
             markDirty(category);
@@ -270,10 +391,6 @@
         if (touched) scheduleRender();
     }
 
-    // ===================== 版本比对 =====================
-    // 服务端版本号随 status.version 下发（后端 IFMMaster.lua 的 buildStatus 写入）。
-    // 与前端 IFM_CLIENT_VERSION 不一致时：弹警告 + 主动断开 + 不再自动重连，
-    // 避免“新前端配旧后端”这种组合产生各种难以定位的怪现象。
     function applyServerVersion(version) {
         if (!version || typeof version !== 'string') return;
         if (serverVersion === version && versionMismatch === (version !== IFM_CLIENT_VERSION)) return;
@@ -286,22 +403,14 @@
         const message = t('versionMismatch', { client: IFM_CLIENT_VERSION, server: version });
         serverLog('[IFM] ' + message);
         toast(message, 'error');
+        renderVersionLabel();
+        // Never keep talking to a build this page cannot understand: drop the
+        // connection and go back to the login page (clicking Connect again retries
+        // after the server has been updated).
+        disconnect();
         setText('loginError', message);
         setDisplay('loginOverlay', 'flex');
         setDisplay('app', 'none');
-        connected = false;
-        serverSeen = false;
-        if (heartbeatTimer) {
-            clearInterval(heartbeatTimer);
-            heartbeatTimer = null;
-        }
-        setConnectionStatus('offline');
-        renderVersionLabel();
-        if (ws) {
-            const socket = ws;
-            ws = null;
-            try { socket.close(); } catch (err) { /* ignore */ }
-        }
     }
 
     function normalizeRelay(value) {
@@ -316,16 +425,16 @@
     }
 
     function connect(roomName) {
-        // 版本不一致时拒绝再连（applyServerVersion 已经提示过原因，这里只保证不会偷偷重连）
         if (versionMismatch) {
-            setText('loginError', t('versionMismatch', { client: IFM_CLIENT_VERSION, server: serverVersion || '?' }));
-            setDisplay('loginOverlay', 'flex');
-            setDisplay('app', 'none');
-            setConnectionStatus('offline');
-            return;
+            // A previous attempt hit another build. The user may have updated the
+            // server since: clear the flag and try again (a new mismatch drops the
+            // connection again right away).
+            versionMismatch = false;
+            serverVersion = '';
+            renderVersionLabel();
         }
         if (ws) {
-            try { ws.close(); } catch (err) { /* ignore */ }
+            try { ws.close(); } catch (err) {  }
             ws = null;
         }
         room = (roomName || '').trim();
@@ -340,8 +449,6 @@
         setCookie('ifm_relay', relayBase, 365);
         setConnectionStatus('connecting');
         setText('loginError', '');
-        // 用户第 4 项（本轮）：房间号与中转地址显示到**一起**（一个标签：****@****），
-        // 悬停显示真实值（title + 即时提示框）。原来的两个独立标签会被 flex 换行拆开。
         maskText('roomLabel', '#' + room + ' @ ' + relayBase, '****@****');
         const relayNode = el('relayLabel');
         if (relayNode) {
@@ -359,18 +466,17 @@
             return;
         }
         ws = socket;
-        // 每个回调都先确认“自己还是当前这条连接”：
-        // 看门狗为了刷新连接会主动重建 WebSocket，被换掉的旧连接稍后仍会触发 onclose/onerror，
-        // 那时绝不能再改界面 —— 否则登录遮罩与主界面会来回切换（服务端离线时页面一直闪就是这么来的）。
+        // A failed handshake fires onerror and then onclose(1006). onclose runs
+        // last, so without this flag it overwrites the more useful "cannot reach
+        // the relay" text (wsError) with the generic "connection closed" one
+        // (wsClosed). The connection-failure text has to win.
+        let connectFailed = false;
         const isCurrent = function () { return ws === socket; };
         socket.onopen = function () {
             if (!isCurrent()) return;
             connected = true;
             serverSeen = false;
             stallNotified = false;
-            // 中继连上 ≠ 服务端在线：先显示“连接中…”。
-            // 只有“本页曾经收到过服务端数据”（重连场景）才立刻切回主界面；
-            // 否则留在登录框等服务端开口，避免空界面与登录框来回闪。
             setConnectionStatus('connecting');
             if (everSeenServer) {
                 setDisplay('loginOverlay', 'none');
@@ -388,6 +494,7 @@
         };
         socket.onerror = function () {
             if (!isCurrent()) return;
+            connectFailed = true;
             setConnectionStatus('offline');
             setText('loginError', t('wsError', { relay: relayBase }));
         };
@@ -395,7 +502,7 @@
             if (!isCurrent()) return;
             const wasConnected = connected;
             connected = false;
-            myUid = null;               // 这条连接的房间 uid 作废（重连会拿到新的）
+            myUid = null;
             if (heartbeatTimer) {
                 clearInterval(heartbeatTimer);
                 heartbeatTimer = null;
@@ -404,25 +511,31 @@
             setDisplay('loginOverlay', 'flex');
             setDisplay('app', 'none');
             if (!wasConnected) {
-                setText('loginError', t('wsClosed', {
-                    code: (event && event.code) || 0,
-                    reason: (event && event.reason) || '-'
-                }));
+                const code = (event && event.code) || 0;
+                // Never opened + code 1006 means the browser could not reach the
+                // relay at all (DNS / TLS / blocked / wrong scheme), so report the
+                // connection failure instead of the generic closed-connection text.
+                if (connectFailed || code === 1006) {
+                    setText('loginError', t('wsError', { relay: relayBase }));
+                } else {
+                    setText('loginError', t('wsClosed', {
+                        code: code,
+                        reason: (event && event.reason) || '-'
+                    }));
+                }
             }
         };
     }
 
     function disconnect() {
         if (ws) {
-            // 先摘掉引用：close() 触发的 onclose 会因为“不是当前连接”而被忽略
             const socket = ws;
             ws = null;
-            try { socket.close(); } catch (err) { /* ignore */ }
+            try { socket.close(); } catch (err) {  }
         }
         connected = false;
         serverSeen = false;
         setConnectionStatus('offline');
-        // 断开是用户主动点的：界面切回登录框由这里负责（onclose 已被忽略，不再切界面）
         setDisplay('loginOverlay', 'flex');
         setDisplay('app', 'none');
     }
@@ -439,7 +552,6 @@
         }, '');
     }
 
-    // ===================== 渲染调度 =====================
     function markDirty(name) {
         dirty[name] = true;
     }
@@ -458,22 +570,18 @@
             renderSend();
         }
         if (dirty.processes || dirty.runtime) {
-            // 合成状态会影响资源网格的排序与高亮（正在合成的排最前面）
             renderResources();
             renderProcesses();
             renderSend();
         }
         if (dirty.deliveries) {
-            // 底部面板的「发送中」栏（与「待发送」共用一次渲染：面板显隐、高度都靠它同步）
             renderSend();
         }
-        // 「外设与定义」板块里还含机器类型 / 机器卡片（层级：机器类型 → 机器 → 输入/输出/信号 → 外设）
         if (dirty.peripherals || dirty.containers || dirty.signals || dirty.missing ||
             dirty.machines || dirty.machineTypes) {
             renderPeripherals();
             renderSendContainerSelect();
         }
-        // 「过滤器」是独立面板：图标要用资源里的 samples，所以资源变化时也要重画
         if (dirty.filters || dirty.resources) {
             renderFilterPanel();
         }
@@ -487,13 +595,11 @@
         refreshTooltip();
     }
 
-    // 顶部状态（用户第 2 项）：只显示「图标 + 数字」，含义在悬停提示里（以前是一长串中文明细）
     function renderStatus() {
         const node = el('tagInfo');
         if (node) {
             const scan = status ? status.tagScan : null;
             if (scan && scan.queued > 0) {
-                // 标签扫描进行中：转圈图标 + 进度数字（提示里写全“标签扫描中 {done}/{total}”）
                 setHtmlIfChanged(node, statusStatHtml('fa-spinner fa-spin',
                     fmtCount(scan.scanned) + '/' + fmtCount(scan.queued),
                     t('tagScanning', { done: scan.scanned, total: scan.queued }) +
@@ -516,14 +622,18 @@
     renderDispatchInfo();
     }
 
-    // 资源浏览的容量信息：已存储物品总数 / 可存储物品总数、已占用槽位数 / 总槽位数（进度条）
     function capacityRowHtml(label, used, total) {
         const percent = total > 0 ? Math.max(0, Math.min(100, Math.round(used / total * 100))) : 0;
         const cls = percent >= 90 ? 'bad' : (percent >= 60 ? 'warn' : '');
-        return '<div class="capacity-row">' +
+        // The bar abbreviates a large count; the tooltip spells the exact numbers out.
+        const tip = t('capacityTip', {
+            label: label, used: fmtExact(used), total: fmtExact(total), percent: percent
+        });
+        return '<div class="capacity-row" title="' + escapeHtml(tip) +
+            '" data-tip-text="' + escapeHtml(tip) + '">' +
             '<span class="capacity-label">' + escapeHtml(label) + '</span>' +
             '<div class="progress"><div class="bar ' + cls + '" style="width:' + percent + '%"></div></div>' +
-            '<span class="capacity-label">' + escapeHtml(fmtCount(used) + ' / ' + fmtCount(total) + '（' + percent + '%）') + '</span>' +
+            '<span class="capacity-label">' + escapeHtml(fmtCount(used) + ' / ' + fmtCount(total) + t('wrapParen', { text: percent + '%' })) + '</span>' +
             '</div>';
     }
 
@@ -535,12 +645,18 @@
             node.innerHTML = '';
             return;
         }
+        const unsized = capacity.unsized || 0;
+        const unsizedTip = t('capacityUnsized', { n: fmtExact(unsized) });
         node.innerHTML =
             capacityRowHtml(t('capacityItems'), capacity.items || 0, capacity.itemCapacity || 0) +
-            capacityRowHtml(t('capacitySlots'), capacity.slots || 0, capacity.totalSlots || 0);
+            capacityRowHtml(t('capacitySlots'), capacity.slots || 0, capacity.totalSlots || 0) +
+            (unsized > 0
+                ? '<div class="capacity-row" title="' + escapeHtml(unsizedTip) +
+                    '" data-tip-text="' + escapeHtml(unsizedTip) + '"><span class="capacity-label">' +
+                    escapeHtml(t('capacityUnsized', { n: fmtCount(unsized) })) + '</span></div>'
+                : '');
     }
 
-    // 按钮即时反馈：点下去立刻禁用 + 图标转起来，响应回来后再恢复（避免“点了没反应”）
     function setButtonBusyById(id, busy) {
         const button = el(id);
         if (!button) return;
@@ -566,8 +682,6 @@
         });
     }
 
-    // 存储整理进度（服务端 status.compact）：1.8.0 起整理是自动的（compact 队列为空时服务端就会
-    // 重新算一遍计划并把搬运任务排进队列），所以这里只显示进度，没有「整理」按钮了。
     function renderCompactProgress() {
         const node = el('compactProgress');
         if (!node) return;
@@ -577,23 +691,53 @@
             node.innerHTML = '';
             return;
         }
-        if (job.planning) {
-            // 计划还在算：显示已扫描容器数 / 已探测种类数（没有进度条，因为总步数还不知道）
-            const scanned = job.containersTotal
-                ? t('compactPlanningContainers', { done: job.containersDone || 0, total: job.containersTotal })
-                : '';
-            const probed = job.groupsTotal
-                ? t('compactPlanningKinds', { done: job.groupsDone || 0, total: job.groupsTotal })
-                : '';
-            const detail = [scanned, probed].filter(function (text) { return !!text; }).join(' · ');
+        if (job.waiting === 'slotCount') {
+            // Compaction is held back until every storage container reported its slot
+            // count: show why instead of hiding the bar.
             node.style.display = '';
             node.innerHTML = '<div class="capacity-row">' +
-                '<span class="capacity-label">' + escapeHtml(t('compactPlanning')) + '</span>' +
-                '<span class="capacity-label">' + escapeHtml(detail) + '</span>' +
+                '<span class="capacity-label">' + escapeHtml(t('compactWaitingSlotCount', {
+                    n: fmtCount(job.pendingSlotCount || 0)
+                })) + '</span>' +
                 '</div>';
             return;
         }
-        // 计划已经生成成搬运任务：显示生成了多少条、队列里还剩多少（执行由 compact 队列负责）
+        if (job.waiting === 'capacity') {
+            // Compaction is held back until every storage container reported its slot
+            // capacities: show why instead of hiding the bar.
+            node.style.display = '';
+            node.innerHTML = '<div class="capacity-row">' +
+                '<span class="capacity-label">' + escapeHtml(t('compactWaitingCapacity', {
+                    n: fmtCount(job.pendingCapacity || 0)
+                })) + '</span>' +
+                '</div>';
+            return;
+        }
+        if (job.planning) {
+            const scanned = job.containersTotal
+                ? t('compactPlanningContainers', { done: job.containersDone || 0, total: job.containersTotal })
+                : '';
+            // The slot cursor of the running compaction pass: how far the planner has
+            // walked through the storage slots (groupsDone/groupsTotal - one slot per
+            // pass call).
+            const total = Number(job.groupsTotal) || 0;
+            const done = Math.max(0, Math.min(total, Number(job.groupsDone) || 0));
+            const percent = total > 0 ? Math.round(done / total * 100) : 0;
+            const slotLine = total > 0
+                ? '<div class="capacity-row">' +
+                    '<span class="capacity-label">' + escapeHtml(t('compactPlanningSlots')) + '</span>' +
+                    '<div class="progress"><div class="bar" style="width:' + percent + '%"></div></div>' +
+                    '<span class="capacity-label">' + escapeHtml(fmtCount(done) + ' / ' + fmtCount(total) +
+                        t('wrapParen', { text: percent + '%' })) + '</span>' +
+                    '</div>'
+                : '';
+            node.style.display = '';
+            node.innerHTML = '<div class="capacity-row">' +
+                '<span class="capacity-label">' + escapeHtml(t('compactPlanning')) + '</span>' +
+                '<span class="capacity-label">' + escapeHtml(scanned) + '</span>' +
+                '</div>' + slotLine;
+            return;
+        }
         node.style.display = '';
         node.innerHTML = '<div class="capacity-row">' +
             '<span class="capacity-label">' + escapeHtml(t('compactAuto')) + '</span>' +
@@ -604,6 +748,3 @@
             })) + '</span>' +
             '</div>';
     }
-
-
-    

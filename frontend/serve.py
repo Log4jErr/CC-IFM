@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-# IFM :: frontend/serve.py —— 本地静态服务器（1.5.0 抢救后重写版）
-#
-# 用途：在 PC 上把 frontend/ 目录用 HTTP 提供出来，浏览器打开 index.html 即可用网页操作 IFM。
-#   python serve.py                 # 默认端口 8000
-#   python serve.py --port 8080
-#   python serve.py --room myroom   # 只影响打印出来的示例 URL（页面里仍可自己填房间号）
-#   python serve.py --relay ws://192.168.1.10:8765/c/
-#
-# 不做目录列表、不压缩，只按 MIME 类型返回文件，并强制 no-store（改前端后刷新即可见）。
 
 import argparse
 import functools
@@ -18,7 +9,6 @@ import socketserver
 import sys
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     extensions_map = dict(http.server.SimpleHTTPRequestHandler.extensions_map)
@@ -42,7 +32,6 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         sys.stdout.write("[serve] %s\n" % (fmt % args))
         sys.stdout.flush()
 
-
 def local_ips():
     ips = []
     try:
@@ -54,7 +43,6 @@ def local_ips():
     except OSError:
         pass
     return ips
-
 
 def main():
     parser = argparse.ArgumentParser(description="IFM web client local server")
@@ -83,7 +71,6 @@ def main():
             httpd.serve_forever()
         except KeyboardInterrupt:
             print("\nstopped")
-
 
 if __name__ == "__main__":
     main()

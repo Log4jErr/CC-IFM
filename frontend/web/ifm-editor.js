@@ -1,9 +1,5 @@
-// IFM :: web/ifm-editor.js
-// 编辑器（表单 / 各类定义 / 流程元素）
-// （由 index.html 拆分而来；所有文件按顺序在页面里加载，共享同一份全局作用域）
 'use strict';
 
-// ===================== 模态框基础设施 =====================
     let editorInstance = null;
     let promptInstance = null;
     let diagnoseInstance = null;
@@ -25,11 +21,73 @@
         return diagnoseInstance;
     }
 
-    // ===================== 数量表达式（网页端求解） =====================
-    // 待发送数量 / 合成数量 / 批次数等输入框里可以直接写算式，点确定时在网页端求出结果：
-    //   2*64+32   ·   (128+64)/2   ·   3*9-4   ·   100/4
-    // 只接受数字与 + - * / % ( )，不用 eval（安全、跨浏览器行为一致）。
-    function evalExpression(text) {
+    // Expressions are evaluated with exact rationals: "1/3*3" is 1 and
+    // "(128+64)/3*3" is 192, never 191.99999999999997. Doubles only come back at
+    // the very end, and because every prompt asks for an integer count the value
+    // that is finally applied is that rational rounded UP (64/3 is 22, not 21).
+    const RATIONAL_LIMIT = 9007199254740991;
+
+    function gcdOf(left, right) {
+        let a = Math.abs(left);
+        let b = Math.abs(right);
+        while (b > 0) {
+            const rest = a % b;
+            a = b;
+            b = rest;
+        }
+        return a;
+    }
+
+    // Numerator and denominator stay integers: past the 2^53 range the arithmetic
+    // would silently fall back to floats, so such a step fails the whole
+    // expression instead of returning a wrong number.
+    function rationalOf(numerator, denominator) {
+        if (!isFinite(numerator) || !isFinite(denominator) || denominator === 0) return null;
+        if (!Number.isInteger(numerator) || !Number.isInteger(denominator)) return null;
+        let n = numerator;
+        let d = denominator;
+        if (d < 0) {
+            n = -n;
+            d = -d;
+        }
+        const divisor = gcdOf(n, d) || 1;
+        n /= divisor;
+        d /= divisor;
+        if (Math.abs(n) > RATIONAL_LIMIT || Math.abs(d) > RATIONAL_LIMIT) return null;
+        return { n: n, d: d };
+    }
+
+    function rationalNegate(value) {
+        return value ? { n: -value.n, d: value.d } : null;
+    }
+
+    function rationalAdd(a, b) {
+        return rationalOf(a.n * b.d + b.n * a.d, a.d * b.d);
+    }
+
+    function rationalMultiply(a, b) {
+        return rationalOf(a.n * b.n, a.d * b.d);
+    }
+
+    function rationalDivide(a, b) {
+        return b.n === 0 ? null : rationalOf(a.n * b.d, a.d * b.n);
+    }
+
+    // a % b = a - trunc(a / b) * b, which stays exact for fractions too.
+    function rationalModulo(a, b) {
+        if (b.n === 0) return null;
+        const quotient = (a.n * b.d) / (a.d * b.n);
+        if (!isFinite(quotient)) return null;
+        return rationalAdd(a, rationalMultiply(rationalOf(-Math.trunc(quotient), 1), b));
+    }
+
+    function ceilRational(value) {
+        const whole = Math.trunc(value.n / value.d);
+        return (whole * value.d < value.n) ? whole + 1 : whole;
+    }
+
+    // The exact value of an expression, or null when the text is not a valid one.
+    function evalRational(text) {
         const source = String(text === undefined || text === null ? '' : text).replace(/\s+/g, '');
         if (source === '') return null;
         let index = 0;
@@ -42,12 +100,25 @@
         function parseNumber() {
             const start = index;
             while (index < source.length && /[0-9.]/.test(source.charAt(index))) index += 1;
-            if (start === index) {
+            const literal = source.slice(start, index);
+            if (literal === '' || literal === '.' || !/^[0-9]*\.?[0-9]*$/.test(literal)) {
                 bad = true;
-                return 0;
+                return null;
             }
-            const value = Number(source.slice(start, index));
-            if (!isFinite(value)) bad = true;
+            const dot = literal.indexOf('.');
+            if (dot < 0) {
+                const whole = rationalOf(Number(literal), 1);
+                if (!whole) bad = true;
+                return whole;
+            }
+            const decimals = literal.length - dot - 1;
+            if (decimals > 15) {
+                bad = true;
+                return null;
+            }
+            const digits = literal.slice(0, dot) + literal.slice(dot + 1);
+            const value = rationalOf(Number(digits === '' ? '0' : digits), Math.pow(10, decimals));
+            if (!value) bad = true;
             return value;
         }
 
@@ -59,7 +130,7 @@
             }
             if (char === '-') {
                 index += 1;
-                return -parseFactor();
+                return rationalNegate(parseFactor());
             }
             if (char === '(') {
                 index += 1;
@@ -81,13 +152,17 @@
                 if (char !== '*' && char !== '/' && char !== '%') break;
                 index += 1;
                 const right = parseFactor();
-                if ((char === '/' || char === '%') && right === 0) {
+                if (!right) {
                     bad = true;
-                    return 0;
+                    return null;
                 }
-                if (char === '*') value = value * right;
-                else if (char === '/') value = value / right;
-                else value = value % right;
+                if (char === '*') value = rationalMultiply(value, right);
+                else if (char === '/') value = rationalDivide(value, right);
+                else value = rationalModulo(value, right);
+                if (!value) {
+                    bad = true;
+                    return null;
+                }
             }
             return value;
         }
@@ -99,21 +174,37 @@
                 if (char !== '+' && char !== '-') break;
                 index += 1;
                 const right = parseProduct();
-                value = (char === '+') ? value + right : value - right;
+                if (!right) {
+                    bad = true;
+                    return null;
+                }
+                value = (char === '+') ? rationalAdd(value, right)
+                    : rationalAdd(value, rationalNegate(right));
+                if (!value) {
+                    bad = true;
+                    return null;
+                }
             }
             return value;
         }
 
         const result = parseSum();
-        if (bad || index !== source.length || !isFinite(result)) return null;
+        if (bad || !result || index !== source.length) return null;
         return result;
+    }
+
+    // Every prompt asks for an integer count, so the value that is handed to
+    // onConfirm (and shown in the preview) is the exact result rounded UP: a
+    // request for "64/3" units is a request for 22, never for 21.
+    function evalPromptInteger(text) {
+        const value = evalRational(text);
+        return value ? ceilRational(value) : null;
     }
 
     function isPlainNumber(text) {
         return /^[0-9]+(\.[0-9]+)?$/.test(text);
     }
 
-    // 数量框下方的实时提示：普通数字时提示“支持四则运算”，写了算式就显示求解结果
     function updatePromptPreview() {
         const node = el('promptPreview');
         const input = el('promptInput');
@@ -124,7 +215,7 @@
             node.style.color = 'var(--text-dim)';
             return;
         }
-        const value = evalExpression(raw);
+        const value = evalPromptInteger(raw);
         if (value === null) {
             node.textContent = t('exprInvalid', { text: raw });
             node.style.color = 'var(--bad)';
@@ -156,7 +247,6 @@
         el('promptHint').textContent = options.hint || '';
         const instance = promptModalInstance();
         if (!options.selectOptions) {
-            // 弹窗真正显示后再聚焦并把内容全选：这样“合成物品”的数量可以直接键入覆盖
             el('promptModal').addEventListener('shown.bs.modal', function () {
                 input.focus();
                 if (typeof input.select === 'function') input.select();
@@ -166,11 +256,11 @@
     }
 
     function confirmPrompt() {
+        console.log('[IFM] confirmPrompt fired: promptState=' + (promptState ? 'set' : 'null'));
         if (!promptState) return;
         const options = promptState;
         const raw = String(el('promptInput').value || '').trim();
-        // 空输入按 0 处理（与旧行为一致）；否则按表达式求值，非法表达式保持弹窗打开让用户改
-        const value = raw === '' ? 0 : evalExpression(raw);
+        const value = raw === '' ? 0 : evalPromptInteger(raw);
         if (value === null) {
             toast(t('exprInvalid', { text: raw }), 'error');
             updatePromptPreview();
@@ -186,7 +276,6 @@
         }
     }
 
-    // ===================== 表单控件 =====================
     function fieldRow(label, control) {
         return '<div class="editor-row"><label>' + escapeHtml(label) + '</label><div>' + control + '</div></div>';
     }
@@ -213,11 +302,27 @@
         return html + '</select>';
     }
 
-    // ===================== 有序多选（机器的输入/输出容器） =====================
-    // 需求：容器既能多选，顺序也由用户决定（顺序就是机器列表里的选择次序）。
-    // 原生 <select multiple> 既难多选、也没法调序，所以自己画一个：已选列表（↑ / ↓ / ×）+ 添加下拉。
-    const pickerState = new Map();      // id -> 已选值数组（顺序即用户顺序）
-    const pickerOptions = new Map();    // id -> [{ value, label }] 全部候选
+    // A searchable replacement for selectHtml: a visible search box (with the shared
+    // suggestion panel) plus a hidden input that keeps the original id and value, so
+    // readValue(id) and an onchange passed in attrs are unchanged. Used for the machine
+    // type dropdown, whose list must be filtered by name / label / pinyin.
+    function searchableSelectHtml(id, options, value, attrs) {
+        let label = '';
+        asArray(options).forEach(function (option) {
+            if (String(option.value) === String(value)) label = option.label;
+        });
+        return '<span class="searchable-select">' +
+            '<input type="text" class="ss-input" id="' + id + 'Search" autocomplete="off"' +
+            ' data-ac-provider="machineType" data-ac-value-target="' + id + '"' +
+            ' value="' + escapeHtml(label) + '" placeholder="' + escapeHtml(t('search')) + '">' +
+            '<input type="hidden" id="' + id + '" value="' +
+            escapeHtml(value === undefined || value === null ? '' : value) + '"' +
+            (attrs ? ' ' + attrs : '') + '>' +
+            '</span>';
+    }
+
+    const pickerState = new Map();
+    const pickerOptions = new Map();
 
     function orderedPickerHtml(id, options, values) {
         const chosen = asArray(values).map(String);
@@ -250,7 +355,6 @@
         }).join('');
     }
 
-    // 只重画某一个选择器（其它表单控件的内容不受影响）
     function renderOrderedPicker(id) {
         const chosen = pickerState.get(id) || [];
         const holder = el(id + 'Chosen');
@@ -282,23 +386,17 @@
         Array.prototype.forEach.call(document.querySelectorAll('#editorBody [data-picker]'), function (node) {
             renderOrderedPicker(node.getAttribute('data-picker'));
         });
-        // 文本输入框的候选列表（物品/流体/过滤器/标签…）：见 attachAutocomplete
         Array.prototype.forEach.call(
-            document.querySelectorAll('#editorBody input[list="ifmSuggestions"], #editorBody input.rule-value,' +
-                ' #editorBody #toolResource'),
+            document.querySelectorAll('#editorBody input.e-id, #editorBody input.rule-value,' +
+                ' #editorBody #toolResource, #editorBody [data-ac-provider]'),
             function (input) { attachAutocomplete(input); }
         );
     }
 
-    // ===================== 输入候选（自动补全，1.6.10）=====================
-    // 需求（用户第 16 项）：输入物品 / 流体 / 过滤器 / 标签…时，根据已有的资源给出候选，
-    // 候选以列表形式排在输入框上方或下方（取决于输入框在屏幕中的位置），并且支持：
-    //   ↑ / ↓ 选择候选项 · Tab 用候选补全输入框 · Enter 采用候选项 · Esc 关闭 · 鼠标点击采用
-    // 原生 <datalist> 做不到“列表随位置上下翻转 + Tab 补全 + 自定义样式”，所以这里自己画一个浮层。
     const AC_LIMIT = 12;
-    let acPanel = null;            // 当前打开的候选浮层（同一时刻只开一个）
-    let acState = null;            // { input, items, index, panel }
-    let acApplying = false;        // 正在把候选项写回输入框（此时不要再自动弹出候选）
+    let acPanel = null;
+    let acState = null;
+    let acApplying = false;
 
     function closeAutocomplete() {
         if (acPanel && acPanel.parentNode) acPanel.parentNode.removeChild(acPanel);
@@ -306,10 +404,6 @@
         acState = null;
     }
 
-    // 候选池（source 决定给哪一类）：
-    //   any（默认）→ 物品 / 流体 / 过滤器 / 标签 / 常见标签（流程元素、容器工具用）
-    //   tag        → 只给标签（“包含物品标签”这类规则用：以前会拿物品名去补全，任务 3）
-    //   item/fluid → 只给该种类的资源
     function acCandidates(query, source) {
         const text = String(query || '').trim().toLowerCase();
         const kind = source || 'any';
@@ -339,26 +433,72 @@
         return out.slice(0, AC_LIMIT);
     }
 
-    // 常见标签（没有扫描到标签数据时也能给点候选）
     const AC_TAG_HINTS = ['c:ingots', 'c:ores', 'c:stones', 'c:plates', 'c:water', 'minecraft:logs'];
 
-    // 输入框该给哪一类候选：过滤器规则行里看“规则类型”
     function acSourceForInput(input) {
+        // An input that pins its resource kind (the container tool's resource field,
+        // the machine type icon) only suggests that kind.
+        const stockKind = (input && input.getAttribute) ? input.getAttribute('data-stock-kind') : null;
+        if (stockKind === 'item' || stockKind === 'fluid') return stockKind;
         const row = input && input.closest ? input.closest('.rule-row') : null;
         if (!row) return 'any';
         const select = row.querySelector('.rule-type');
         const ruleType = select ? String(select.value || '') : '';
-        if (ruleType.indexOf('Tag_') >= 0) return 'tag';       // itemTag_include / fluidTag_include
+        if (ruleType.indexOf('Tag_') >= 0) return 'tag';
         if (ruleType.indexOf('item_') === 0) return 'item';
         if (ruleType.indexOf('fluid_') === 0) return 'fluid';
         return 'any';
     }
 
+    // Extra candidate sources for inputs carrying data-ac-provider (the searchable
+    // machine type select and the filter-reference fields). Each returns
+    // [{value, label}] and matches the query against value, label and - only in the
+    // Chinese UI - pinyin (pinyinSearchHit itself refuses when lang is not zh).
+    const AC_PROVIDERS = {
+        machineType: function (query) {
+            return acFilterOptions(machineTypeOptions(), query);
+        },
+        filterIds: function (query) {
+            return acFilterOptions(filterOptions(editorState.name).map(function (row) {
+                return { value: row.value, label: row.label };
+            }), query, function (row) { return displayName('filter', row.value); });
+        },
+    };
+
+    function acFilterOptions(rows, query, extraLabel) {
+        const text = String(query || '').trim().toLowerCase();
+        return asArray(rows).filter(function (row) {
+            if (!text) return true;
+            const value = String(row.value || '').toLowerCase();
+            const label = String(row.label || '').toLowerCase();
+            if (value.indexOf(text) >= 0 || label.indexOf(text) >= 0) return true;
+            if (lang !== 'zh') return false;
+            const targets = [row.label];
+            if (extraLabel) targets.push(extraLabel(row));
+            for (let i = 0; i < targets.length; i += 1) {
+                try {
+                    if (pinyinSearchHit(text, String(targets[i] || ''), '')) return true;
+                } catch (err) {  }
+            }
+            return false;
+        }).slice(0, AC_LIMIT);
+    }
+
+    function acItemsFor(input) {
+        const providerName = (input && input.getAttribute) ? input.getAttribute('data-ac-provider') : null;
+        const provider = providerName ? AC_PROVIDERS[providerName] : null;
+        const query = String((input && input.value) || '').trim();
+        if (provider) return provider(query);
+        return acCandidates(query, acSourceForInput(input)).map(function (value) {
+            return { value: value, label: value };
+        });
+    }
+
     function renderAcPanel() {
         if (!acState) return;
-        acState.panel.innerHTML = acState.items.map(function (value, index) {
+        acState.panel.innerHTML = acState.items.map(function (item, index) {
             return '<div class="ifm-ac-item' + (index === acState.index ? ' active' : '') +
-                '" data-ac-index="' + index + '">' + escapeHtml(value) + '</div>';
+                '" data-ac-index="' + index + '">' + escapeHtml(item.label) + '</div>';
         }).join('');
         const active = acState.panel.querySelector('.ifm-ac-item.active');
         if (active && active.scrollIntoView) active.scrollIntoView({ block: 'nearest' });
@@ -366,19 +506,26 @@
 
     function applyAcIndex(index) {
         if (!acState) return;
-        const value = acState.items[index];
-        if (value === undefined) return;
+        const item = acState.items[index];
+        if (item === undefined) return;
         const input = acState.input;
+        const targetId = input.getAttribute ? input.getAttribute('data-ac-value-target') : null;
+        const target = targetId ? el(targetId) : null;
         closeAutocomplete();
-        input.value = value;
-        // 通知其它监听器（例如工具输入框的变更处理）：期间不要再次弹出候选（否则列表会“补全后又弹回来”）
+        input.value = item.label;
         acApplying = true;
+        // A searchable select keeps its real value in a hidden input (the one carrying
+        // the original id): write it and let its onchange run.
+        if (target) {
+            target.value = item.value;
+            target.dispatchEvent(new window.Event('change', { bubbles: true }));
+        }
         input.dispatchEvent(new window.Event('input', { bubbles: true }));
         acApplying = false;
     }
 
     function openAutocomplete(input, index) {
-        const items = acCandidates(input.value, acSourceForInput(input));
+        const items = acItemsFor(input);
         if (items.length === 0) {
             closeAutocomplete();
             return;
@@ -390,7 +537,6 @@
             document.body.appendChild(panel);
             acPanel = panel;
             acState = { input: input, items: items, index: 0, panel: panel };
-            // 鼠标点候选项：直接采用
             panel.addEventListener('mousedown', function (event) {
                 const node = event.target.closest('[data-ac-index]');
                 if (!node || !acState) return;
@@ -404,7 +550,6 @@
         } else if (acState.index >= items.length) {
             acState.index = 0;
         }
-        // 位置：默认贴在输入框下面；下面放不下（离屏幕底部太近）就翻到上面
         const rect = input.getBoundingClientRect();
         acState.panel.style.width = Math.max(140, Math.round(rect.width)) + 'px';
         renderAcPanel();
@@ -431,7 +576,6 @@
         input.addEventListener('keydown', function (event) {
             const key = event.key;
             if (key === 'ArrowDown' || key === 'ArrowUp') {
-                // ↑/↓：打开候选（还没打开时）或上下移动选择
                 if (!acState || acState.input !== input) {
                     openAutocomplete(input, 0);
                 } else {
@@ -446,10 +590,9 @@
                 return;
             }
             if (key === 'Tab' || key === 'Enter') {
-                // Tab / Enter：用当前选中的候选项补全输入框
                 applyAcIndex(acState.index);
                 event.preventDefault();
-                event.stopPropagation();      // 别再触发编辑器的“回车即保存”
+                event.stopPropagation();
                 return;
             }
             if (key === 'Escape') {
@@ -457,6 +600,21 @@
                 event.stopPropagation();
             }
         });
+    }
+
+    // The candidate panel has to disappear when the user clicks anywhere else: the
+    // input's blur alone is not enough (some handlers cancel mousedown, and a
+    // re-render can leave a panel whose input is already detached).
+    document.addEventListener('pointerdown', function (event) {
+        if (!acState) return;
+        const target = event.target;
+        if (acState.input === target || (acState.panel && acState.panel.contains(target))) return;
+        closeAutocomplete();
+    }, true);
+    window.addEventListener('scroll', function () { closeAutocomplete(); }, true);
+    window.addEventListener('resize', function () { closeAutocomplete(); });
+    if (el('editorModal')) {
+        el('editorModal').addEventListener('hidden.bs.modal', function () { closeAutocomplete(); });
     }
 
     window.ifmPickerAdd = function (id) {
@@ -501,17 +659,15 @@
     }
 
     function readMulti(id) {
-        // 机器编辑器用的是“有序多选”（见 orderedPickerHtml）：值存在 pickerState 里
         if (pickerState.has(id)) return pickerState.get(id).slice();
         const node = el(id);
         if (!node) return [];
         return Array.prototype.slice.call(node.selectedOptions || []).map(function (option) { return option.value; });
     }
 
-    // ===================== 编辑器：通用 =====================
     const KIND_LABEL_KEY = {
         containers: 'container', signals: 'signal', filters: 'filter',
-        machineTypes: 'machineType', machines: 'machine', processes: 'processes'
+        machineTypes: 'machineType', machines: 'machine', processes: 'processKind'
     };
     const SAVE_ACTION = {
         containers: 'set_container', signals: 'set_signal', filters: 'set_filter',
@@ -524,7 +680,6 @@
     const ROLE_VALUES = ['storage', 'input', 'interaction', 'output'];
     const SIDE_VALUES = ['top', 'bottom', 'left', 'right', 'front', 'back'];
     const OP_VALUES = ['gt', 'ge', 'eq', 'le', 'lt'];
-    // 比较符号直接显示数学符号（gt/ge/eq/le/lt 对用户没有意义）
     const OP_LABELS = { gt: '>', ge: '≥', eq: '=', le: '≤', lt: '<' };
     const ELEMENT_KINDS = ['item', 'fluid', 'filter', 'placeholder', 'waitSignal', 'emitSignal', 'emitPulse', 'waitTime'];
     const RULE_TYPES = [
@@ -571,9 +726,10 @@
         });
     }
 
-    /// 机器类型显示名（与 ifm-processes.js 里的同名助手一致）：预设类型本地化，自定义类型原样。
-    /// 注意：这两个脚本共享全局作用域，所以这里的 const 名字必须与那边不同（重复声明会直接报错）。
-    const EDITOR_MACHINE_TYPE_LABEL_KEYS = { turtle_crafter: 'machineTypeTurtleCrafter' };
+    const EDITOR_MACHINE_TYPE_LABEL_KEYS = {
+        turtle_crafter: 'machineTypeTurtleCrafter',
+        type_conversion: 'machineTypeTypeConversion'
+    };
     function machineTypeLabel(name) {
         const key = EDITOR_MACHINE_TYPE_LABEL_KEYS[String(name)];
         if (!key) return String(name);
@@ -581,8 +737,12 @@
         return (text && text !== key) ? text : String(name);
     }
 
-    function machineTypeOptions() {
-        return byName(Array.from(stores.machineTypes.values())).map(function (item) {
+    function machineTypeOptions(includeConversion) {
+        return byName(Array.from(stores.machineTypes.values()).filter(function (item) {
+            // The type conversion type is virtual: it cannot back a real machine, so
+            // the machine editor must not offer it (the process editor may).
+            return includeConversion !== false || String(item.name) !== 'type_conversion';
+        })).map(function (item) {
             const label = machineTypeLabel(item.name);
             return { value: item.name, label: label === item.name ? item.name : (label + ' (' + item.name + ')') };
         });
@@ -600,8 +760,6 @@
         return fieldRow(t('name'), textInput('fldName', name || '', 'unique name'));
     }
 
-    // ===== 容器定义：容器种类与外设名都不允许手动设置 =====
-    // 外设（方块）当前提供的外设类型：inventory / fluid_storage / redstone_relay
     function peripheralKindsOf(name) {
         const kinds = [];
         Array.from(stores.peripherals.values()).forEach(function (item) {
@@ -610,7 +768,6 @@
         return kinds;
     }
 
-    // 容器种类由外设实际提供的能力决定；两种都提供时沿用调用方给的种类（在外设卡片上点哪一行就是哪种）
     function containerKindOfPeripheral(peripheralName, fallback) {
         const kinds = peripheralKindsOf(peripheralName);
         const hasItem = kinds.indexOf('inventory') >= 0;
@@ -625,10 +782,9 @@
         const kinds = peripheralKindsOf(peripheralName);
         const base = kind === 'fluid' ? t('fluidContainer') : t('itemContainer');
         if (kinds.indexOf(wanted) < 0) return base;
-        return base + '（' + kinds.join(' / ') + '）';
+        return base + t('wrapParen', { text: kinds.join(' / ') });
     }
 
-    // 只读字段：用户能看到值，但不能手动改（浏览器禁用输入框仍然可以读取 value）
     function readOnlyRow(label, value, hint) {
         return '<div class="editor-row"><label>' + escapeHtml(label) + '</label><div>' +
             '<input type="text" value="' + escapeHtml(value) + '" readonly disabled>' +
@@ -636,7 +792,6 @@
             '</div></div>';
     }
 
-    // 容器管理块（只看/只搬已经保存过的定义）：新建时只显示一行提示
     function containerToolBlock(name) {
         if (!name) {
             return '<div class="editor-block">' +
@@ -647,27 +802,44 @@
         return '<div class="editor-block">' +
             '<h4><i class="fa fa-archive"></i> ' + escapeHtml(t('containerManage')) + '</h4>' +
             '<div id="toolMeta"></div>' +
-            '<div class="editor-block">' +
+            '<div class="editor-block" id="toolMoveBlock">' +
             '<h4><i class="fa fa-exchange"></i> ' + escapeHtml(t('containerMoveTitle')) + '</h4>' +
             '<div class="editor-row"><label>' + escapeHtml(t('resourceLabel')) + '</label>' +
             '<span class="search-wrap">' +
-            '<input type="text" id="toolResource" placeholder="' + escapeHtml(t('item') + ' / ' + t('fluid')) +
-            '" list="toolSuggestions" autocomplete="off">' +
+            '<input type="text" id="toolResource" data-stock-kind="item" placeholder="' +
+            escapeHtml(t('item') + ' / ' + t('fluid')) + '" autocomplete="off">' +
             '<button class="btn-pixel search-clear" id="toolResourceClear" type="button" title="' +
             escapeHtml(t('searchClear')) + '" style="display:none"><i class="fa fa-times"></i></button>' +
+            '<button class="btn-pixel" id="toolResourcePick" type="button" data-stock-target="#toolResource" ' +
+            'title="' + escapeHtml(t('pickResource')) + '" onclick="window.ifmOpenStockPicker(this)">' +
+            '<i class="fa fa-box-open"></i></button>' +
             '</span></div>' +
             '<div class="editor-row"><label>' + escapeHtml(t('count')) + '</label>' +
-            '<input type="number" id="toolCount" value="64" min="1"></div>' +
-            '<datalist id="toolSuggestions"></datalist>' +
+            '<input type="number" id="toolCount" value="1" min="1"></div>' +
+            '<div class="editor-row"><label>' + escapeHtml(t('nbtHash')) + '</label>' +
+            '<input type="text" id="toolNbt" placeholder="' + escapeHtml(t('nbtAny')) + '" title="' +
+            escapeHtml(t('toolNbtHint')) + '" autocomplete="off"></div>' +
+            // One container-level put button, shown for fluid containers only: a fluid
+            // has no slot to put into, so the take side keeps its per-row buttons and
+            // the put side lives here, outside the contents list.
+            '<div class="editor-row" id="toolPutRow" style="display:none">' +
+            '<button class="btn-pixel" id="toolPutGlobal" type="button"><i class="fa fa-sign-in"></i> ' +
+            escapeHtml(t('containerPut')) + '</button></div>' +
+            // Container-wide slot capacity multiplier: the value applies to every slot
+            // without a per-slot override; an empty value clears it.
+            '<div class="editor-row" id="toolSlotMultRow" style="display:none">' +
+            '<label>' + escapeHtml(t('slotMultiplierAllLabel')) + '</label>' +
+            '<span style="display:inline-flex;gap:6px;align-items:center">' +
+            '<input type="number" id="toolSlotMultAll" min="0" step="1" style="width:90px" placeholder="' +
+            escapeHtml(t('slotMultiplierEmptyHint')) + '">' +
+            '<button class="btn-pixel" id="toolSlotMultAllBtn" type="button"><i class="fa fa-check"></i> ' +
+            escapeHtml(t('slotMultiplierApplyAll')) + '</button></span></div>' +
             '<div class="muted">' + escapeHtml(t('containerTakeHint')) + '</div>' +
+            '</div>' +
             '<div style="margin-top:6px">' +
             '<button class="btn-pixel" id="toolRefreshBtn" type="button"><i class="fa fa-refresh"></i> ' +
-            escapeHtml(t('refresh')) + '</button> ' +
-            '<button class="btn-pixel primary" id="toolPutBtn" type="button"><i class="fa fa-arrow-down"></i> ' +
-            escapeHtml(t('containerPut')) + '</button> ' +
-            '<button class="btn-pixel" id="toolTakeBtn" type="button"><i class="fa fa-arrow-up"></i> ' +
-            escapeHtml(t('containerTake')) + '</button>' +
-            '</div></div>' +
+            escapeHtml(t('refresh')) + '</button>' +
+            '</div>' +
             '<div class="editor-block">' +
             '<h4><i class="fa fa-list"></i> ' + escapeHtml(t('containerContents')) + '</h4>' +
             '<div id="toolContents"></div></div>' +
@@ -680,13 +852,11 @@
         const kindValue = containerKindOfPeripheral(peripheralName, data.kind === 'fluid' ? 'fluid' : 'item');
         const roleValue = data.role || 'storage';
         const priorityValue = Number(data.priority || 0);
-        // 角色用带 onchange 的下拉框：切换后决定要不要填名称（存储容器不需要名称）
         const roleSelect = '<select id="fldRole" style="width:100%" onchange="window.ifmContainerRoleChanged(this)">' +
             ROLE_VALUES.map(function (value) {
                 return '<option value="' + escapeHtml(value) + '"' + (value === roleValue ? ' selected' : '') +
                     '>' + escapeHtml(roleLabel(value)) + '</option>';
             }).join('') + '</select>';
-        // 存储优先级是可选的（可填负数：越小越先被取出）；用原生 input，免得被 min=0 限制住
         const priorityInput = '<input type="number" id="fldPriority" step="1" style="width:120px" value="' +
             escapeHtml(String(priorityValue)) + '">';
         const nameVisible = roleValue === 'output';
@@ -702,7 +872,6 @@
             containerToolBlock(name);
     }
 
-    // 角色切换：只有输出容器需要名称；存储 / 交互容器都用外设名作定义名（服务端自动推导）
     window.ifmContainerRoleChanged = function (select) {
         const named = select.value === 'output';
         const row = el('containerNameRow');
@@ -716,14 +885,29 @@
     };
 
     function buildSignalEditor(data, name) {
-        // 红石信号不需要命名（1.6.9）：名称就是中继器外设名，同一个中继器可以给多台机器用。
         return fieldRow(t('peripheral'), selectHtml('fldPeripheral', peripheralOptions(['redstone_relay']), data.peripheral)) +
             '<div class="muted">' + escapeHtml(t('signalNameHint')) + '</div>';
     }
 
+    // The icon is an item registry name; it may be typed or picked from stock
+    // (the stock picker writes the registry name into the named input).
+    function machineTypeIconControl(value) {
+        return '<div class="editor-row"><label>' + escapeHtml(t('machineTypeIcon')) + '</label>' +
+            '<span class="search-wrap">' +
+            '<input type="text" id="fldMachineTypeIcon" value="' + escapeHtml(value || '') +
+            '" placeholder="mod:name" autocomplete="off" title="' +
+            escapeHtml(t('machineTypeIconHint')) + '">' +
+            '<button class="btn-pixel" type="button" data-stock-target="#fldMachineTypeIcon" ' +
+            'data-stock-kind="item" onclick="window.ifmOpenStockPicker(this)">' +
+            '<i class="fa fa-box-open"></i> ' + escapeHtml(t('pickResource')) + '</button>' +
+            '</span></div>';
+    }
+
     function buildMachineTypeEditor(data, name) {
         return nameRow(name || data.name) +
-            '<div class="muted">' + escapeHtml(t('machineType') + '：同类机器之间会轮流选取，轮换次序由服务端持久化记忆') + '</div>';
+            machineTypeIconControl(data.icon) +
+            '<div class="muted">' + escapeHtml(t('machineTypeIconHint')) + '</div>' +
+            '<div class="muted">' + escapeHtml(t('machineTypeRotateHint')) + '</div>';
     }
 
     function buildEditor(kind, data, name) {
@@ -742,7 +926,6 @@
         const data = preset ? deepClone(preset) : deepClone(name ? (store.get(name) || {}) : {});
         editorState = { kind: kind, name: name || null, data: data };
         if (kind === 'containers') {
-            // 容器种类与外设名不允许手动设置：只读展示，保存/删除时也用这里的值
             const peripheralName = data.peripheral || '';
             editorState.locked = {
                 peripheral: peripheralName,
@@ -757,20 +940,17 @@
         initPickers();
         applyElementVisibility();
         refreshElementIcons();
-        // 容器定义：把「容器管理」（内容物 / 手动搬运）一起挂进这个弹窗
+        if (kind === 'processes') bindElementRowSorting();
         if (kind === 'containers' && window.ifmContainerToolMount) {
-            window.ifmContainerToolMount(name || null);
+            window.ifmContainerToolMount(name || null, data.peripheral || null);
         }
         editorModalInstance().show();
     }
 
-    // 新增/重命名定义时避免重名：已存在“木桶”就改为“木桶2”，已存在“木桶2”就改为“木桶3”……
-    // （服务端 Store:set 以名称为键，同名会直接覆盖旧定义，所以保存前先取一个未被占用的名字）
     function uniqueDefinitionName(kind, requested, currentName) {
         const store = stores[kind];
         const base = String(requested || '').trim();
         if (!store || !base) return base;
-        // 容器定义在数据里以“种类:名称”为键（物品容器与流体容器允许同名），其它定义直接用名称
         const lockedKind = (editorState.locked && editorState.locked.kind) === 'fluid' ? 'fluid' : 'item';
         const keyOfName = function (value) {
             return kind === 'containers' ? (lockedKind === 'fluid' ? 'fluid:' : 'item:') + value : value;
@@ -789,7 +969,6 @@
         return base + index;
     }
 
-    // 机器 / 流程定义没有“名称”字段：按机器类型 / 首个产物自动推导（保存时再自动去重）
     function autoDefinitionName(kind) {
         if (kind === 'machines') {
             return readValue('fldType') || t('machine');
@@ -806,8 +985,6 @@
         return '';
     }
 
-    // 当前编辑的容器需不需要名称：只有输出容器需要（机器按名字引用它、发送也要选它）；
-    // 存储 / 交互容器都用外设名作定义名，不显示也不接受名称输入
     function isNamedContainerRole() {
         const role = readValue('fldRole') || (editorState.data && editorState.data.role) || 'storage';
         return role === 'output';
@@ -818,22 +995,18 @@
         if (!kind) return;
         const currentName = editorState.name;
         let requested = readValue('fldName');
-        // 存储容器没有名称输入框：直接拿外设名提交（服务端也是这么推导的）
         if (kind === 'containers' && !isNamedContainerRole()) {
             requested = (editorState.locked && editorState.locked.peripheral) || currentName || '';
         }
-        // 红石信号不需要命名（1.6.9）：名字就是中继器外设名（同一个中继器只保留一个定义）
         if (kind === 'signals') {
             requested = readValue('fldPeripheral') || currentName || '';
         }
-        // 机器 / 流程没有名称字段：编辑既有定义时沿用原名，新建时按类型/产物自动推导
         if (!requested && currentName) requested = currentName;
         if (!requested) requested = autoDefinitionName(kind);
         if (!requested) {
             toast(t('name') + ' ?', 'error');
             return;
         }
-        // 信号名恒等于外设名：不做“重名自动加序号”（服务端会把同一中继器的旧定义顶掉）
         const name = kind === 'signals' ? requested : uniqueDefinitionName(kind, requested, currentName);
         if (name !== requested) {
             const field = el('fldName');
@@ -842,8 +1015,6 @@
         }
         const payload = collectPayload(kind);
         if (!payload) return;
-        // previous = 编辑前的键（容器是“种类:名称”）：服务端据此把旧定义摘掉，
-        // 这样改名（编辑）不会再撞上“同一外设每种容器只能用一个名字”的校验
         const request = { name: name, data: payload };
         if (currentName) request.previous = currentName;
         busyButton('editorSaveBtn', sendRequest(SAVE_ACTION[kind], request)).then(function (response) {
@@ -864,13 +1035,11 @@
         let name = editorState.name;
         if (!kind || !name) return;
         const payload = { name: name };
-        // 容器定义以“种类:名称”为键，删除时要带上种类（同名物品/流体容器互不影响）
         if (kind === 'containers') {
             const locked = editorState.locked || {};
             payload.kind = locked.kind === 'fluid' ? 'fluid' : 'item';
             name = String(name).replace(/^(item|fluid):/, '');
         }
-        // 容器 / 信号定义允许强制删除（换外设时用：引用它的流程会被冻结，重新建出同名定义就恢复）
         if (kind === 'containers' || kind === 'signals') payload.force = true;
         if (!window.confirm(t('deleteConfirm', { name: name }))) return;
         busyButton('editorDeleteBtn', sendRequest(DELETE_ACTION[kind], payload)).then(function (response) {
@@ -886,11 +1055,6 @@
         });
     }
 
-    // ===================== 流程校验（前端先挡一遍，服务端保存时还会再校验一次） =====================
-    // 机器类型：必须存在，并且至少有一台机器在用（否则流程永远等不到机器）。
-    // 材料参数：资源名必须填；输入数目 > 0；产物“最多数目”> 0 且“最少”≤“最多”；占位符要填名称与关联物品；
-    //           红石元素要指定机器信号序号（不能超过该机器类型下机器配置的条数）；等待时长不能为负；
-    //           输入元素的容器序号不能超过机器对应种类的输入容器数量（超了就永远等不到材料）。
     function machinesOfType(typeName) {
         return Array.from(stores.machines.values()).filter(function (machine) {
             return String(machine.type || '') === String(typeName || '');
@@ -911,12 +1075,6 @@
         return labels[kind] || String(kind || '');
     }
 
-    // ===================== 流程设置复制 / 抽象流程（用户第 3 项）=====================
-    // 「抽象流程」的判定在 ifm-core.js（processIsAbstract / elementIsAbstract，与后端的
-    // Store.processIsAbstract 同一套语义）：物品/流体元素的注册名 = abstract 即为抽象操作。
-    // 抽象流程不能合成（服务端也会拒绝下单），只用来把整套输入/输出设置复制到别的流程里。
-
-    // 可以复制的来源流程：只限同一个机器类型；抽象流程排在最前（优先显示）
     function processCopyCandidates(machineType) {
         const type = String(machineType || '');
         if (!type) return [];
@@ -941,9 +1099,14 @@
         if (!machineType) return t('processNeedMachineType');
         if (!stores.machineTypes.has(machineType)) return t('processUnknownMachineType', { name: machineType });
         const machines = machinesOfType(machineType);
-        if (machines.length === 0) return t('processNoMachineOfType', { name: machineType });
+        // A process may be prepared before its machine exists: the machine type
+        // only has to be defined, so the limits below are skipped when there is
+        // no machine to derive them from.
+        const hasMachines = machines.length > 0;
         const itemInputs = maxListLength(machines, 'itemInputs');
         const fluidInputs = maxListLength(machines, 'fluidInputs');
+        const itemOutputs = maxListLength(machines, 'itemOutputs');
+        const fluidOutputs = maxListLength(machines, 'fluidOutputs');
         const maxSignals = maxListLength(machines, 'signals');
         const check = function (element, index, side) {
             const kind = element.kind || 'item';
@@ -951,20 +1114,24 @@
                 side: side === 'input' ? t('inputs') : t('outputs'),
                 index: index + 1,
                 kind: elementKindLabel(kind)
-            }) + '：';
+            }) + t('labelSeparator');
             if (kind === 'item' || kind === 'fluid' || kind === 'filter') {
                 const id = String(element.id || '').trim();
                 if (!id) return at + t('processMissingResource');
                 if (kind === 'filter' && !stores.filters.has(id)) {
                     return at + t('processUnknownFilter', { name: id });
                 }
+                // Both sides may pin a machine container (inputs and outputs);
+                // the count check only exists on the input side.
+                const limit = kind === 'fluid'
+                    ? (side === 'input' ? fluidInputs : fluidOutputs)
+                    : (side === 'input' ? itemInputs : itemOutputs);
+                const containerIndex = Number(element.containerIndex);
+                if (hasMachines && isFinite(containerIndex) && containerIndex > limit) {
+                    return at + t('processContainerIndexTooBig', { n: limit });
+                }
                 if (side === 'input') {
                     if (!(Number(element.count) > 0)) return at + t('processBadCount');
-                    const limit = kind === 'fluid' ? fluidInputs : itemInputs;
-                    const containerIndex = Number(element.containerIndex);
-                    if (isFinite(containerIndex) && containerIndex > limit) {
-                        return at + t('processContainerIndexTooBig', { n: limit });
-                    }
                 } else {
                     const min = Number(element.min || 0);
                     const max = Number(element.max || 0);
@@ -978,8 +1145,8 @@
             } else if (kind === 'waitSignal' || kind === 'emitSignal' || kind === 'emitPulse') {
                 const signalIndex = Number(element.machineSignalIndex || 0);
                 if (!(signalIndex >= 1)) return at + t('processBadSignalIndex');
-                if (maxSignals === 0) return at + t('processNoSignals');
-                if (signalIndex > maxSignals) return at + t('processSignalIndexTooBig', { n: maxSignals });
+                if (hasMachines && maxSignals === 0) return at + t('processNoSignals');
+                if (hasMachines && signalIndex > maxSignals) return at + t('processSignalIndexTooBig', { n: maxSignals });
             } else if (kind === 'waitTime') {
                 if (!(Number(element.seconds) >= 0)) return at + t('processBadSeconds');
             }
@@ -1002,7 +1169,6 @@
         if (kind === 'containers') {
             const locked = editorState.locked || {};
             if (!locked.peripheral) {
-                // 容器定义只能从“外设与定义”里某个外设的「+ 容器」进入（外设名不能手填）
                 toast(t('needFreePeripheral'), 'error');
                 return null;
             }
@@ -1017,7 +1183,7 @@
             return { peripheral: readValue('fldPeripheral') };
         }
         if (kind === 'machineTypes') {
-            return {};
+            return { icon: readValue('fldMachineTypeIcon') };
         }
         if (kind === 'filters') {
             return { rules: collectRules() };
@@ -1034,13 +1200,14 @@
             };
         }
         if (kind === 'processes') {
+            const ioModeField = el('fldIoMode');
             const payload = {
                 machineType: readValue('fldMachineType'),
                 maxMultiplier: Math.max(1, Math.floor(readNumber('fldMaxMultiplier', 1))),
+                ioMode: ioModeField ? String(ioModeField.value || 'sequential') : 'sequential',
                 inputs: collectElements('input'),
                 outputs: collectElements('output')
             };
-            // 前端先校验一遍（机器类型 / 材料参数），服务端保存时还会再校验一次
             const problem = validateProcessDraft(payload);
             if (problem) {
                 toast(problem, 'error');
@@ -1051,48 +1218,37 @@
         return null;
     }
 
-    // ===================== 编辑器：过滤器规则 =====================
     const RULE_LABELS = {
-        item_include: { zh: '包含物品', en: 'Include item' },
-        item_exclude: { zh: '排除物品', en: 'Exclude item' },
-        fluid_include: { zh: '包含流体', en: 'Include fluid' },
-        fluid_exclude: { zh: '排除流体', en: 'Exclude fluid' },
-        itemTag_include: { zh: '包含物品标签', en: 'Include item tag' },
-        itemTag_exclude: { zh: '排除物品标签', en: 'Exclude item tag' },
-        fluidTag_include: { zh: '包含流体标签', en: 'Include fluid tag' },
-        fluidTag_exclude: { zh: '排除流体标签', en: 'Exclude fluid tag' },
-        filter_include: { zh: '包含过滤器', en: 'Include filter' },
-        filter_exclude: { zh: '排除过滤器', en: 'Exclude filter' }
+        item_include: 'filterModeItemInclude',
+        item_exclude: 'filterModeItemExclude',
+        fluid_include: 'filterModeFluidInclude',
+        fluid_exclude: 'filterModeFluidExclude',
+        itemTag_include: 'filterModeItemTagInclude',
+        itemTag_exclude: 'filterModeItemTagExclude',
+        fluidTag_include: 'filterModeFluidTagInclude',
+        fluidTag_exclude: 'filterModeFluidTagExclude',
+        filter_include: 'filterModeFilterInclude',
+        filter_exclude: 'filterModeFilterExclude'
     };
 
     function ruleLabel(type) {
-        const entry = RULE_LABELS[type];
-        return entry ? (entry[lang] || entry.zh) : type;
+        const key = RULE_LABELS[type];
+        return key ? t(key) : type;
     }
 
     function isFilterRefRule(type) {
         return type === 'filter_include' || type === 'filter_exclude';
     }
 
-    function suggestionValues() {
-        const values = [];
-        Array.from(stores.resources.values()).forEach(function (entry) {
-            if (entry.kind === 'item' || entry.kind === 'fluid') values.push(entry.name);
-        });
-        Array.from(stores.filters.values()).forEach(function (entry) { values.push(entry.name); });
-        values.push('c:ores/gold', 'c:ingots/iron', 'c:water');
-        return values.sort();
-    }
-
     function ruleValueHtml(type, value) {
         if (isFilterRefRule(type)) {
-            const options = filterOptions(editorState.name).map(function (option) {
-                return '<option value="' + escapeHtml(option.value) + '"' +
-                    (String(option.value) === String(value) ? ' selected' : '') + '>' + escapeHtml(option.label) + '</option>';
-            }).join('');
-            return '<select class="rule-value" style="flex:1 1 150px"><option value="">—</option>' + options + '</select>';
+            // A free text field with the shared suggestion panel: the filter list can be
+            // searched (and pinyin-matched) instead of scrolling a native dropdown.
+            return '<input type="text" class="rule-value" data-ac-provider="filterIds" value="' +
+                escapeHtml(value || '') + '" placeholder="' + escapeHtml(t('search')) +
+                '" style="flex:1 1 150px">';
         }
-        return '<input type="text" class="rule-value" list="ifmSuggestions" value="' + escapeHtml(value || '') +
+        return '<input type="text" class="rule-value" value="' + escapeHtml(value || '') +
             '" placeholder="mod:name / tag" style="flex:1 1 150px">';
     }
 
@@ -1118,7 +1274,6 @@
         const slot = row.querySelector('.rule-value-slot');
         const current = slot.querySelector('input, select');
         slot.innerHTML = ruleValueHtml(select.value, current ? current.value : '');
-        // 换成文本输入框时补上候选列表（“包含物品标签”给标签候选，物品/流体给对应资源，任务 3）
         const input = slot.querySelector('input.rule-value');
         if (input) attachAutocomplete(input);
     };
@@ -1133,7 +1288,12 @@
         if (!list) return;
         const holder = document.createElement('div');
         holder.innerHTML = ruleRowHtml('item_include', '', false, '');
-        list.appendChild(holder.firstChild);
+        const row = holder.firstChild;
+        list.appendChild(row);
+        // the row is created after initPickers() ran, so attach the suggestion
+        // panel here (it is the only candidate source now)
+        const input = row.querySelector('input.rule-value');
+        if (input) attachAutocomplete(input);
     };
 
     function collectRules() {
@@ -1157,11 +1317,7 @@
 
     function buildFilterEditor(data, name) {
         const rules = asArray(data.rules);
-        const suggestions = suggestionValues().map(function (value) {
-            return '<option value="' + escapeHtml(value) + '"></option>';
-        }).join('');
         return nameRow(name || data.name) +
-            '<datalist id="ifmSuggestions">' + suggestions + '</datalist>' +
             '<div class="editor-block">' +
             '<h4>' + escapeHtml(t('rules')) +
             '<button class="btn-pixel" type="button" onclick="window.ifmAddRule()"><i class="fa fa-plus"></i> ' +
@@ -1170,17 +1326,14 @@
                 return ruleRowHtml(rule.type, rule.id, rule.ignoreNbt, rule.nbt);
             }).join('') + '</div>' +
             '<div class="muted">' +
-            escapeHtml('语义：存在包含规则时必须命中其一；没有任何包含规则时视为包含一切；命中任一排除规则即不匹配。' +
-                '标签直接填写标签名（如 c:ores/gold）。') +
+            escapeHtml(t('filterSemanticsHint')) +
             '</div></div>';
     }
 
-    // ===================== 编辑器：机器 =====================
-    // 机器没有“名称”字段：保存时按机器类型自动命名（见 autoDefinitionName）
     function buildMachineEditor(data, name) {
         const itemContainers = containerOptions('interaction', 'item');
         const fluidContainers = containerOptions('interaction', 'fluid');
-        return fieldRow(t('machineTypeField'), selectHtml('fldType', machineTypeOptions(), data.type, true)) +
+        return fieldRow(t('machineTypeField'), searchableSelectHtml('fldType', machineTypeOptions(false), data.type)) +
             fieldRow(t('parallel'), numberInput('fldParallel', data.parallel || 1, 1, 1)) +
             '<div class="editor-block"><h4>' + escapeHtml(t('inputs')) + '</h4>' +
             fieldRow(t('itemInputs'), orderedPickerHtml('fldItemInputs', itemContainers, data.itemInputs)) +
@@ -1193,12 +1346,9 @@
             '<div class="editor-block"><h4>' + escapeHtml(t('signalsField')) + '</h4>' +
             fieldRow(t('signalsField'), orderedPickerHtml('fldSignals', signalOptions(), data.signals)) +
             '</div>' +
-            '<div class="muted">' + escapeHtml('机器引用到的容器定义必须使用 interaction 角色；' +
-                '物品输入/输出只列出物品容器，流体输入/输出只列出流体容器。' +
-                '可多选，列表里的上下箭头用于调整顺序（序号 1 优先）。') + '</div>';
+            '<div class="muted">' + escapeHtml(t('machineRoleHint')) + '</div>';
     }
 
-    // ===================== 编辑器：流程元素 =====================
     function selectForClass(className, values, value, labels) {
         return '<select class="' + className + '">' + values.map(function (item) {
             const label = (labels && labels[item]) ? labels[item] : item;
@@ -1209,7 +1359,6 @@
 
     function sideCheckboxes(selected) {
         const chosen = asArray(selected);
-        // 没有任何配置（新建元素）默认六面全开；已有配置就按配置显示
         const useAll = chosen.length === 0;
         return SIDE_VALUES.map(function (side) {
             const on = useAll || chosen.indexOf(side) >= 0;
@@ -1220,21 +1369,18 @@
 
     function elementIdControl(kind, value) {
         if (kind === 'filter') {
-            const options = byName(Array.from(stores.filters.values())).map(function (item) {
-                return '<option value="' + escapeHtml(item.name) + '"' +
-                    (String(item.name) === String(value) ? ' selected' : '') + '>' + escapeHtml(item.name) + '</option>';
-            }).join('');
-            return '<select class="e-id" style="flex:1 1 130px"><option value="">—</option>' + options + '</select>';
+            // A free text field with the shared suggestion panel: the filter list can be
+            // searched (and pinyin-matched) instead of scrolling a native dropdown.
+            return '<input type="text" class="e-id" data-ac-provider="filterIds" value="' +
+                escapeHtml(value || '') + '" placeholder="' + escapeHtml(t('search')) +
+                '" style="flex:1 1 130px">';
         }
-        const input = '<input type="text" class="e-id" list="ifmSuggestions" value="' + escapeHtml(value || '') +
+        const input = '<input type="text" class="e-id" value="' + escapeHtml(value || '') +
             '" placeholder="mod:name" style="flex:1 1 130px">';
         if (kind === 'item' || kind === 'fluid') {
-            // 「从库存选择」改为弹窗（图标 + 名称 + 搜索框），比原生下拉好找得多
             return input + '<button class="btn-pixel" type="button" data-stock-kind="' + kind + '" ' +
                 'onclick="window.ifmOpenStockPicker(this)"><i class="fa fa-box-open"></i> ' +
                 escapeHtml(t('pickResource')) + '</button>';
         }
         return input;
     }
-
-    

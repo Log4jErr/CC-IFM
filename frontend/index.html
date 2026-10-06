@@ -1,36 +1,34 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-ifm-build="214">
+<html lang="zh-CN" data-ifm-build="487">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<!-- index.html 本身不带版本号（不能像 web/*.js 那样加 ?v=），而它引用的 JS 都带版本号：
-     如果浏览器把旧的 index.html 缓存下来，就会出现"新 JS 找不到旧页面里的元素"这种半更新状态。
-     注意：本文件是 UTF-8；不要用 PowerShell 的 Get-Content/Set-Content 改写它（会把中文变成乱码、
-     还会吃掉引号与 '<'，导致元素被解析器吞掉）。要改就改 data-ifm-build 与 ?v=，并同步 web/ifm-app.js 的 IFM_APP_BUILD。 -->
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>IFM - 集成工厂管理终端</title>
+<title>IFM</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.5.2/css/all.min.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
-<link rel="stylesheet" href="web/ifm.css?v=214">
+<link rel="stylesheet" href="web/ifm.css?v=487">
 </head>
 <body>
 <div id="loginOverlay">
     <div class="login-box">
         <h1><i class="fa fa-industry"></i> IFM</h1>
-        <p data-i18n="loginHint">集成工厂管理终端，请输入与服务端相同的房间号</p>
+        <p data-i18n="loginHint">loginHint</p>
         <input id="roomInput" type="text" placeholder="room name" autocomplete="off">
         <input id="relayInput" type="text" placeholder="wss://itty.ws/c/" autocomplete="off">
         <button class="btn-pixel primary" id="connectBtn" style="width:100%;justify-content:center">
-            <i class="fa fa-plug"></i> <span data-i18n="connect">连接</span>
+            <i class="fa fa-plug"></i> <span data-i18n="connect">connect</span>
         </button>
-        <!-- 用户第 1 项：登录页加一个帮助按钮，指向 GitHub 仓库（**不是** Wiki） -->
         <a class="btn-pixel help-btn" id="helpBtn" href="https://github.com/Log4jErr/CC-IFM"
            target="_blank" rel="noopener noreferrer" data-i18n-title="helpHint">
-            <i class="fa fa-circle-question"></i> <span data-i18n="help">帮助</span>
+            <i class="fa fa-circle-question"></i> <span data-i18n="help">help</span>
         </a>
-        <p class="muted" style="margin-top:10px" data-i18n="relayHint">浏览器连不上公共中转时，可自建一个房间广播式中转（把 WebSocket 广播给同路径的所有连接即可），并把地址填到上面的中转地址栏</p>
+        <button class="btn-pixel help-btn" id="loginLangBtn" type="button" data-i18n-title="langTitle">
+            <i class="fa fa-language"></i> <span id="loginLangLabel" data-i18n="langLabel">langLabel</span>
+        </button>
+        <p class="muted" style="margin-top:10px" data-i18n="relayHint">relayHint</p>
         <p class="muted mt-2" id="loginError"></p>
         <p class="muted" id="versionHint"></p>
     </div>
@@ -38,6 +36,7 @@
 
 <div id="app">
     <header class="app-header">
+        <button class="btn-pixel nav-toggle" id="navToggle" type="button"><i class="fa fa-industry"></i> IFM</button>
         <h1><i class="fa fa-industry"></i> IFM</h1>
         <span><span id="statusDot" class="status-dot"></span><span id="statusText"></span></span>
         <span class="muted" id="roomLabel"></span>
@@ -45,129 +44,122 @@
         <span class="muted" id="versionLabel"></span>
         <span class="muted" id="tagInfo"></span>
         <span class="muted" id="transferInfo"></span>
-        <span class="muted" id="dispatchInfo" data-i18n-title="dispatchHint"></span>
+        <span class="muted" id="dispatchInfo"></span>
         <span class="muted" id="pendingInfo"></span>
         <span class="header-spacer"></span>
-        <button class="btn-pixel" id="diagnoseBtn" title="诊断：结果输出到浏览器控制台（服务端同时 print 到终端）"><i class="fa fa-stethoscope"></i></button>
-        <button class="btn-pixel" id="langBtn" title="中英切换"><i class="fa fa-language"></i> <span id="langLabel">中</span></button>
-        <button class="btn-pixel" id="translateBtn" title="物品名翻译"><i class="fa fa-translate"></i> <span id="translateLabel"></span></button>
-        <button class="btn-pixel danger" id="disconnectBtn" title="断开"><i class="fa fa-power-off"></i></button>
+        <button class="btn-pixel" id="diagnoseBtn" data-i18n-title="diagnoseTitle" title="diagnoseTitle"><i class="fa fa-stethoscope"></i></button>
+        <button class="btn-pixel" id="langBtn" data-i18n-title="langTitle" title="langTitle"><i class="fa fa-language"></i> <span id="langLabel" data-i18n="langLabel">langLabel</span></button>
+        <button class="btn-pixel" id="translateBtn" data-i18n-title="translateTitle" title="translateTitle"><i class="fa fa-translate"></i> <span id="translateLabel"></span></button>
+        <button class="btn-pixel danger" id="disconnectBtn" data-i18n-title="disconnect" title="disconnect"><i class="fa fa-power-off"></i></button>
     </header>
 
-    <section class="panel">
-        <header>
-            <h2><i class="fa fa-tasks"></i> <span data-i18n="processes">进程</span></h2>
-        </header>
-        <div id="processList"></div>
-    </section>
+    <div class="app-body">
+        <nav id="panelNav" class="panel-nav">
+            <button class="btn-pixel nav-item" type="button" data-panel="processes"><i class="fa fa-tasks"></i> <span data-i18n="processes">processes</span></button>
+            <button class="btn-pixel nav-item" type="button" data-panel="graph"><i class="fa fa-sitemap"></i> <span data-i18n="graph">graph</span></button>
+            <button class="btn-pixel nav-item" type="button" data-panel="resources"><i class="fa fa-th"></i> <span data-i18n="resources">resources</span></button>
+            <button class="btn-pixel nav-item" type="button" data-panel="workers"><i class="fa fa-server"></i> <span data-i18n="workerPanel">workerPanel</span></button>
+            <button class="btn-pixel nav-item" type="button" data-panel="peripherals"><i class="fa fa-microchip"></i> <span data-i18n="peripherals">peripherals</span></button>
+            <button class="btn-pixel nav-item" type="button" data-panel="filter"><i class="fa fa-filter"></i> <span data-i18n="filter">filter</span></button>
+            <button class="btn-pixel nav-item" type="button" data-panel="settings"><i class="fa fa-sliders"></i> <span data-i18n="settingsTitle">settingsTitle</span></button>
+        </nav>
+        <main id="panelPages" class="panel-pages">
+        <section class="panel" data-panel-page="processes">
+            <header>
+                <h2><i class="fa fa-tasks"></i> <span data-i18n="processes">processes</span></h2>
+            </header>
+            <div id="processList"></div>
+        </section>
 
-    <section class="panel">
-        <header>
-            <h2><i class="fa fa-sitemap"></i> <span data-i18n="graph">流程依赖图</span></h2>
-            <span class="spacer"></span>
-            <button class="btn-pixel primary" id="addProcessBtn"><i class="fa fa-plus"></i> <span data-i18n="addProcess">添加流程</span></button>
-        </header>
-        <div id="graph"></div>
-    </section>
+        <section class="panel" data-panel-page="graph">
+            <header>
+                <h2><i class="fa fa-sitemap"></i> <span data-i18n="graph">graph</span></h2>
+                <span class="spacer"></span>
+            </header>
+            <div id="graph"></div>
+        </section>
 
-    <section class="panel">
-        <header>
-            <h2><i class="fa fa-th"></i> <span data-i18n="resources">资源</span></h2>
-            <span class="spacer"></span>
-            <span class="search-wrap">
-                <input id="resourceSearch" placeholder="搜索" autocomplete="off" title="搜索：关键词 / #标签 / @模组（空格分隔多个条件，同时满足才显示）">
-                <button class="btn-pixel search-clear" id="resourceSearchClear" type="button" data-i18n-title="searchClear" style="display:none" title="清空搜索"><i class="fa fa-times"></i></button>
-            </span>
-            <button class="btn-pixel" id="resourceSortBtn" title="切换排序"><i class="fa fa-sort-alpha-asc"></i></button>
-        </header>
-        <div class="capacity-box" id="capacityBars"></div>
-        <div class="capacity-box" id="compactProgress" style="display:none"></div>
-        <div id="resourceGrid" class="resource-grid"></div>
-    </section>
+        <section class="panel" data-panel-page="resources">
+            <header>
+                <h2><i class="fa fa-th"></i> <span data-i18n="resources">resources</span></h2>
+                <span class="spacer"></span>
+            </header>
+            <div id="resourceGrid" class="resource-grid"></div>
+        </section>
 
-    <!-- 底部悬浮 dock（固定窗口底部）：左边「待发送」（从前往后 = 先进先出），
-         右边「发送中」（从后往前 = 最新提交的排最前）；点「发送」时材料会从左边滑到右边 -->
+
+        <section class="panel" data-panel-page="workers">
+            <header>
+                <h2><i class="fa fa-server"></i> <span data-i18n="workerPanel">workerPanel</span></h2>
+                <span class="spacer"></span>
+                <span class="muted" id="workerHint"></span>
+                <span class="worker-load-wrap">
+                    <span class="progress worker-load total" id="workerLoadBar"><span class="bar"></span></span>
+                    <span class="muted" id="workerLoadText"></span>
+                </span>
+            </header>
+            <div id="workerList"></div>
+        </section>
+
+        <section class="panel peripheral-panel" data-panel-page="peripherals">
+            <header>
+                <h2><i class="fa fa-microchip"></i> <span data-i18n="peripherals">peripherals</span></h2>
+                <span class="spacer"></span>
+                <span class="muted" id="peripheralSelHint"></span>
+            </header>
+            <div id="missingList" class="peripheral-section"></div>
+            <div id="machineTypeList" class="machine-type-list"></div>
+            <div id="storageList" class="machine-type-list"></div>
+            <div id="inputList" class="machine-type-list"></div>
+            <div id="outputList" class="machine-type-list"></div>
+            <div id="peripheralList"></div>
+        </section>
+
+        <section class="panel" data-panel-page="filter">
+            <header>
+                <h2><i class="fa fa-filter"></i> <span data-i18n="filter">filter</span></h2>
+                <span class="spacer"></span>
+                <button class="btn-pixel" id="addFilterBtn"><i class="fa fa-plus"></i> <span data-i18n="filter">filter</span></button>
+            </header>
+            <div id="filterList" class="chip-list"></div>
+        </section>
+
+        <section class="panel" data-panel-page="settings">
+            <header>
+                <h2><i class="fa fa-sliders"></i> <span data-i18n="settingsTitle">settingsTitle</span></h2>
+                <span class="spacer"></span>
+            </header>
+            <div id="settingsBody"></div>
+            <input type="file" id="dataFileInput" accept=".json,application/json" style="display:none">
+        </section>
+        </main>
     <section class="panel" id="deliveryPanel">
         <header>
-            <h2><i class="fa fa-send"></i> <span data-i18n="send">发送</span></h2>
+            <h2><i class="fa fa-send"></i> <span data-i18n="send">send</span></h2>
             <span class="spacer"></span>
-            <select id="sendContainer" title="发送到的容器（仅 output 角色定义）"></select>
-            <button class="btn-pixel primary" id="sendBtn"><i class="fa fa-paper-plane"></i> <span data-i18n="send">发送</span></button>
-            <button class="btn-pixel danger" id="clearSendBtn" title="清空待发送"><i class="fa fa-trash"></i></button>
+            <select id="sendContainer" data-i18n-title="sendContainerHint" title="sendContainerHint"></select>
+            <button class="btn-pixel primary" id="sendBtn"><i class="fa fa-paper-plane"></i> <span data-i18n="send">send</span></button>
         </header>
         <div class="delivery-columns">
             <div class="delivery-column">
-                <div class="delivery-head"><i class="fa fa-hourglass-half"></i> <span data-i18n="sendList">待发送</span></div>
+                <div class="delivery-head"><i class="fa fa-hourglass-half"></i> <span data-i18n="sendList">sendList</span>
+                    <button class="btn-pixel danger delivery-clear" id="clearSendBtn" type="button" data-i18n-title="clearSendTitle" title="clearSendTitle"><i class="fa fa-trash"></i></button>
+                </div>
                 <div id="sendGrid" class="resource-grid"></div>
             </div>
             <div class="delivery-column">
-                <div class="delivery-head"><i class="fa fa-truck"></i> <span data-i18n="deliveries">发送中</span>
+                <div class="delivery-head"><i class="fa fa-truck"></i> <span data-i18n="deliveries">deliveries</span>
                     <button class="btn-pixel danger delivery-clear" id="clearDeliveriesBtn" type="button"><i class="fa fa-trash"></i></button>
                 </div>
                 <div id="deliveryGrid" class="resource-grid"></div>
             </div>
         </div>
     </section>
-
-    <section class="panel">
-        <header>
-            <h2><i class="fa fa-server"></i> <span data-i18n="workerPanel">从节点</span></h2>
-            <span class="spacer"></span>
-            <span class="muted" id="workerHint"></span>
-            <!-- 用户第 4 项：从节点总负载条（只统计从节点；主控本机那 32 个槽位不计入，见 ifm-workers.js） -->
-            <span class="worker-load-wrap">
-                <span class="progress worker-load total" id="workerLoadBar"><span class="bar"></span></span>
-                <span class="muted" id="workerLoadText"></span>
-            </span>
-        </header>
-        <div id="workerList"></div>
-    </section>
-
-    <section class="panel peripheral-panel">
-        <header>
-            <h2><i class="fa fa-microchip"></i> <span data-i18n="peripherals">外设与定义</span></h2>
-            <span class="spacer"></span>
-            <span class="search-wrap">
-                <input id="peripheralSearch" placeholder="搜索" autocomplete="off" title="搜索：关键词 / #标签 / @模组（空格分隔多个条件，同时满足才显示）">
-                <button class="btn-pixel search-clear" id="peripheralSearchClear" type="button" data-i18n-title="searchClear" style="display:none" title="清空搜索"><i class="fa fa-times"></i></button>
-            </span>
-            <button class="btn-pixel" id="peripheralSortBtn" data-i18n-title="peripheralSortTitle" title="切换排序：外设名（默认）/ 方块名 / 定义数量"><i class="fa fa-sort-alpha-asc"></i> <span id="peripheralSortLabel">外设名</span></button>
-            <span class="muted" id="peripheralSelHint"></span>
-            <button class="btn-pixel" id="addMachineTypeBtn"><i class="fa fa-plus"></i> <span data-i18n="machineType">机器类型</span></button>
-        </header>
-        <!-- 顺序：缺失外设 → 机器类型卡片 → 存储容器卡片 → 输入容器卡片 → 未分配功能的外设方块卡片 -->
-        <div id="missingList" class="peripheral-section"></div>
-        <!-- 机器类型卡片（层级：机器类型 → 机器 → 输入/输出/信号 → 外设卡片） -->
-        <div id="machineTypeList" class="machine-type-list"></div>
-        <!-- 存储容器卡片：所有 role=storage 的容器外设聚合在这里（可拖入/拖出） -->
-        <div id="storageList" class="machine-type-list"></div>
-        <!-- 输入容器卡片（1.6.10）：人工/上游放料的中转箱，role=input —— 里面的东西会被定期搬进存储容器 -->
-        <div id="inputList" class="machine-type-list"></div>
-        <!-- 输出容器卡片（1.8.0）：role=output —— 拖外设进来会弹出容器定义弹窗（角色已填好，名称等用户填） -->
-        <div id="outputList" class="machine-type-list"></div>
-        <!-- 只显示“还有未分配功能”的方块卡片（布局：按内容宽度紧凑换行，见 ifm.css 的 #peripheralList） -->
-        <div id="peripheralList"></div>
-    </section>
-
-    <section class="panel">
-        <header>
-            <h2><i class="fa fa-filter"></i> <span data-i18n="filter">过滤器</span></h2>
-            <span class="spacer"></span>
-            <button class="btn-pixel" id="addFilterBtn"><i class="fa fa-plus"></i> <span data-i18n="filter">过滤器</span></button>
-        </header>
-        <div id="filterList" class="chip-list"></div>
-    </section>
-
-    <section class="panel">
-        <header>
-            <h2><i class="fa fa-sliders"></i> <span data-i18n="settingsTitle">设置</span></h2>
-            <span class="spacer"></span>
-        </header>
-        <div id="settingsBody"></div>
-    </section>
+    </div>
+    <div id="navBackdrop" class="nav-backdrop"></div>
 </div>
 
-<div class="modal fade" id="editorModal" tabindex="-1">
+<div class="modal fade" id="editorModal" tabindex="-1" data-bs-focus="false">
     <div class="modal-dialog modal-lg modal-dialog-scrollable">
         <div class="modal-content">
             <div class="modal-header">
@@ -176,10 +168,10 @@
             </div>
             <div class="modal-body" id="editorBody"></div>
             <div class="modal-footer">
-                <button class="btn-pixel danger" id="editorDeleteBtn"><i class="fa fa-trash"></i> <span data-i18n="delete">删除</span></button>
+                <button class="btn-pixel danger" id="editorDeleteBtn"><i class="fa fa-trash"></i> <span data-i18n="delete">delete</span></button>
                 <span style="flex:1"></span>
-                <button class="btn-pixel" data-bs-dismiss="modal"><i class="fa fa-times"></i> <span data-i18n="cancel">取消</span></button>
-                <button class="btn-pixel primary" id="editorSaveBtn"><i class="fa fa-check"></i> <span data-i18n="save">保存</span></button>
+                <button class="btn-pixel" data-bs-dismiss="modal"><i class="fa fa-times"></i> <span data-i18n="cancel">cancel</span></button>
+                <button class="btn-pixel primary" id="editorSaveBtn"><i class="fa fa-check"></i> <span data-i18n="save">save</span></button>
             </div>
         </div>
     </div>
@@ -199,30 +191,30 @@
                 <p class="muted" id="promptHint"></p>
             </div>
             <div class="modal-footer">
-                <button class="btn-pixel" data-bs-dismiss="modal"><i class="fa fa-times"></i> <span data-i18n="cancel">取消</span></button>
-                <button class="btn-pixel primary" id="promptConfirmBtn"><i class="fa fa-check"></i> <span data-i18n="ok">确定</span></button>
+                <button class="btn-pixel" data-bs-dismiss="modal"><i class="fa fa-times"></i> <span data-i18n="cancel">cancel</span></button>
+                <button class="btn-pixel primary" id="promptConfirmBtn"><i class="fa fa-check"></i> <span data-i18n="ok">ok</span></button>
             </div>
         </div>
     </div>
 </div>
 
-<div class="modal fade" id="stockModal" tabindex="-1">
+<div class="modal fade" id="stockModal" tabindex="-1" data-bs-focus="false">
     <div class="modal-dialog modal-lg modal-dialog-scrollable">
         <div class="modal-content">
             <div class="modal-header">
-                <h5 class="modal-title"><i class="fa fa-box-open"></i> <span data-i18n="pickResourceTitle">从库存选择</span></h5>
+                <h5 class="modal-title"><i class="fa fa-box-open"></i> <span data-i18n="pickResourceTitle">pickResourceTitle</span></h5>
                 <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
             </div>
             <div class="modal-body">
                 <span class="search-wrap" style="margin-bottom:10px">
-                    <input type="text" id="stockSearch" placeholder="搜索" title="搜索：关键词 / #标签 / @模组（空格分隔多个条件，同时满足才显示）">
-                    <button class="btn-pixel search-clear" id="stockSearchClear" type="button" data-i18n-title="searchClear" style="display:none" title="清空搜索"><i class="fa fa-times"></i></button>
+                    <input type="text" id="stockSearch" placeholder="search" title="searchSyntax">
+                    <button class="btn-pixel search-clear" id="stockSearchClear" type="button" data-i18n-title="searchClear" style="display:none" title="searchClear"><i class="fa fa-times"></i></button>
                 </span>
                 <div id="stockList" class="stock-list"></div>
             </div>
             <div class="modal-footer">
                 <span class="muted" id="stockHint" style="margin-right:auto"></span>
-                <button class="btn-pixel" data-bs-dismiss="modal"><i class="fa fa-times"></i> <span data-i18n="cancel">取消</span></button>
+                <button class="btn-pixel" data-bs-dismiss="modal"><i class="fa fa-times"></i> <span data-i18n="cancel">cancel</span></button>
             </div>
         </div>
     </div>
@@ -232,7 +224,7 @@
     <div class="modal-dialog modal-xl modal-dialog-scrollable">
         <div class="modal-content">
             <div class="modal-header">
-                <h5 class="modal-title"><i class="fa fa-stethoscope"></i> <span data-i18n="diagnoseBtn">诊断</span></h5>
+                <h5 class="modal-title"><i class="fa fa-stethoscope"></i> <span data-i18n="diagnoseBtn">diagnoseBtn</span></h5>
                 <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
             </div>
             <div class="modal-body">
@@ -244,38 +236,67 @@
                 <button class="btn-pixel" type="button" onclick="window.ifmDiagnose('tick')"><i class="fa fa-step-forward"></i> tick</button>
                 <button class="btn-pixel danger" type="button" onclick="window.ifmDiagnose('move')"><i class="fa fa-exchange"></i> move</button>
                 <button class="btn-pixel" type="button" onclick="window.ifmDiagnose('perf')"><i class="fa fa-clock-o"></i> perf</button>
-                <button class="btn-pixel primary" data-bs-dismiss="modal"><i class="fa fa-check"></i> <span data-i18n="ok">确定</span></button>
+                <button class="btn-pixel primary" data-bs-dismiss="modal"><i class="fa fa-check"></i> <span data-i18n="ok">ok</span></button>
             </div>
         </div>
     </div>
 </div>
 
+<div id="searchToolbar" class="search-toolbar" style="display:none">
+    <span class="search-group" data-search-panel="processes" hidden>
+        <span class="search-wrap">
+            <input type="text" id="processSearch" placeholder="search" autocomplete="off" title="searchSyntax">
+            <button class="btn-pixel search-clear" id="processSearchClear" type="button" data-i18n-title="searchClear" style="display:none" title="searchClear"><i class="fa fa-times"></i></button>
+        </span>
+    </span>
+    <span class="search-group" data-search-panel="graph" hidden>
+        <span class="search-wrap">
+            <input type="text" id="graphSearch" placeholder="search" autocomplete="off" title="searchSyntax">
+            <button class="btn-pixel search-clear" id="graphSearchClear" type="button" data-i18n-title="searchClear" style="display:none" title="searchClear"><i class="fa fa-times"></i></button>
+        </span>
+        <button class="btn-pixel" id="graphLayoutBtn" data-i18n-title="graphLayoutTitle" title="graphLayoutTitle"><i class="fa fa-random"></i> <span id="graphLayoutLabel"></span></button>
+        <button class="btn-pixel" id="graphSvgBtn" data-i18n-title="graphDownloadSvg" title="graphDownloadSvg"><i class="fa fa-download"></i></button>
+        <button class="btn-pixel primary" id="addProcessBtn"><i class="fa fa-plus"></i> <span data-i18n="addProcess">addProcess</span></button>
+    </span>
+    <span class="search-group" data-search-panel="resources" hidden>
+        <span class="search-wrap">
+            <input type="text" id="resourceSearch" placeholder="search" autocomplete="off" title="searchSyntax">
+            <button class="btn-pixel search-clear" id="resourceSearchClear" type="button" data-i18n-title="searchClear" style="display:none" title="searchClear"><i class="fa fa-times"></i></button>
+        </span>
+        <button class="btn-pixel" id="resourceSortBtn" data-i18n-title="sortTitle" title="sortTitle"><i class="fa fa-sort-alpha-asc"></i></button>
+        <div class="capacity-box" id="capacityBars"></div>
+        <div class="capacity-box" id="compactProgress" style="display:none"></div>
+    </span>
+    <span class="search-group" data-search-panel="peripherals" hidden>
+        <span class="search-wrap">
+            <input type="text" id="peripheralSearch" placeholder="search" autocomplete="off" title="searchSyntax">
+            <button class="btn-pixel search-clear" id="peripheralSearchClear" type="button" data-i18n-title="searchClear" style="display:none" title="searchClear"><i class="fa fa-times"></i></button>
+        </span>
+        <button class="btn-pixel" id="peripheralSortBtn" data-i18n-title="peripheralSortTitle" title="peripheralSortTitle"><i class="fa fa-sort-alpha-asc"></i> <span id="peripheralSortLabel">sortPeripheralPeripheral</span></button>
+        <button class="btn-pixel" id="addMachineTypeBtn"><i class="fa fa-plus"></i> <span data-i18n="machineType">machineType</span></button>
+    </span>
+</div>
+
 <div id="toastArea"></div>
-<!-- 外设卡片右键框选时的虚线框（用户第 6 项）：脚本只改它的位置与尺寸 -->
 <div id="selectMarquee"></div>
 
-<!-- 物品名翻译模块（Bergamot wasm，懒加载；开关状态存在 localStorage） -->
-<!-- 本地资源都带 ?v=<前端版本号>：改了 JS/CSS 之后浏览器不会再拿旧缓存（否则会出现“代码改了网页没变”） -->
-<script src="web/ifm-translate.js?v=214"></script>
-<!-- 中文拼音搜索（任务 7）：pinyinlite 是体积较大的拼音词典，按需加载；
-     文件不存在时前端会静默降级（搜索框自动退回“中英文关键词”匹配） -->
+<script src="web/ifm-translate.js?v=487"></script>
 <script charset="UTF-8" src="dist/pinyinlite_full.min.js"></script>
 
-<script src="web/ifm-core.js?v=214"></script>
-<script src="web/ifm-meta.js?v=214"></script>
-<script src="web/ifm-net.js?v=214"></script>
-<script src="web/ifm-resources.js?v=214"></script>
-<script src="web/ifm-processes.js?v=214"></script>
-<script src="web/ifm-editor.js?v=214"></script>
-<script src="web/ifm-picker.js?v=214"></script>
-<script src="web/ifm-workers.js?v=214"></script>
-<script src="web/ifm-app.js?v=214"></script>
+<script src="web/ifm-messages.js?v=487"></script>
+<script src="web/ifm-core.js?v=487"></script>
+<script src="web/ifm-meta.js?v=487"></script>
+<script src="web/ifm-net.js?v=487"></script>
+<script src="web/ifm-resources.js?v=487"></script>
+<script src="web/ifm-processes.js?v=487"></script>
+    <script src="web/ifm-panels.js?v=487"></script>
+<script src="web/ifm-editor.js?v=487"></script>
+<script src="web/ifm-picker.js?v=487"></script>
+<script src="web/ifm-workers.js?v=487"></script>
+<script src="web/ifm-app.js?v=487"></script>
 <script>
-// 启动自检（静态兜底，不依赖任何 web/*.js）：如果本地脚本完全没加载成功 —— 比如
-// index.html 被单独部署、web/ 没跟着复制，或者某个 <script> 被 HTML 注释吃掉 ——
-// 登录框上会直接给出提示。不然用户只会看到"点了连接没反应"，完全不知道发生了什么。
 window.setTimeout(function () {
-    if (typeof window.ifmServerLog === 'function') return;   // ifm-net.js 已执行
+    if (typeof window.ifmServerLog === 'function') return;
     var node = document.getElementById('loginError');
     if (node && !node.textContent) {
         node.textContent = 'IFM scripts did not load - deploy the whole web/ folder next to index.html ' +
@@ -284,7 +305,7 @@ window.setTimeout(function () {
 }, 2000);
 </script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@12/dist/mermaid.min.js"></script>
 </body>
 </html>
 

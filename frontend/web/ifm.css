@@ -1,4 +1,3 @@
-/* IFM 网页样式（由 index.html 拆分而来） */
 :root {
     --page-bg: #23252b;
     --panel-bg: #2f323a;
@@ -87,7 +86,6 @@ select, input, textarea {
     outline: none;
 }
 input[type="checkbox"] { width: 16px; height: 16px; }
-/* ===== 资源网格（仿 meweb）：格子里只放图标，右上角 +，右下角数量，详情悬停显示 ===== */
 .resource-grid {
     display: flex;
     flex-wrap: wrap;
@@ -108,7 +106,6 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     flex: 0 0 auto;
 }
 .grid-item:hover { border-color: var(--accent); background: #464b57; }
-/* 正在合成的物品：彩色边框 + 呼吸动画，一眼就能看到（见 isCrafting / resourceOrder） */
 .grid-item.crafting {
     border-color: var(--accent-2);
     background: #4b4636;
@@ -119,7 +116,6 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     0%, 100% { box-shadow: 0 0 0 1px var(--accent-2), 0 0 4px rgba(255, 209, 102, .35); }
     50% { box-shadow: 0 0 0 1px var(--accent-2), 0 0 12px rgba(255, 209, 102, .85); }
 }
-/* 流程编辑器里材料 / 产物的图标 */
 .element-icon {
     display: inline-flex;
     align-items: center;
@@ -154,7 +150,6 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     pointer-events: none;
     z-index: 2;
 }
-/* 右上角标记：可合成的 “+” / 待发送与发送中的 “×”（都可以点） */
 .grid-item .grid-mark {
     position: absolute;
     top: 0;
@@ -168,7 +163,6 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     cursor: pointer;
 }
 .grid-item .grid-mark.danger { color: var(--bad); }
-/* 悬停详情（仿 meweb 的 item-tooltip） */
 .icon-tooltip {
     position: fixed;
     z-index: 4000;
@@ -184,12 +178,10 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 }
 .icon-tooltip .tip-name { font-weight: bold; font-size: 13px; margin-bottom: 2px; }
 .icon-tooltip .tip-reg { color: var(--text-dim); word-break: break-all; }
-/* 存储容量：资源面板顶部的进度条 */
 .capacity-box { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
 .capacity-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
 .capacity-row .capacity-label { color: var(--text-dim); white-space: nowrap; }
 .capacity-row .progress { flex: 1 1 auto; min-width: 120px; margin-top: 0; }
-/* 流程依赖图：流程节点（圆形）里只放一个方块标记，节点不带文本 */
 .ifm-graph-dot { display: inline-block; width: 18px; height: 18px; }
 .chip-list { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip {
@@ -200,28 +192,18 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    /* 允许在窄容器（机器卡片的位置卡片）里收缩：否则长外设名会把卡片撑出边框 */
     min-width: 0;
     max-width: 100%;
 }
 .chip.ok { border-color: var(--good); }
 .chip.missing { border-color: var(--bad); }
-/* 外设卡片的批量选择（用户第 6 项 / 本轮第 3 项）：
-   .selected    = 已被选中（Ctrl+点击 / 右键框选）
-   .marquee-hit = 正在被框选框住（松开鼠标后才真正选中）
-   命中目标是**外设芯片**：方块卡片里的未分配功能芯片、机器卡片里的位置芯片都能选。 */
 .card-block.selected { border-color: var(--accent); background: rgba(120, 190, 255, .08); }
 .card-block.selected > .peripheral-card-head { border-bottom-color: var(--accent); }
 .chip.selected { border-color: var(--accent); background: rgba(120, 190, 255, .08); }
 .marquee-hit { outline: 2px dashed var(--accent); outline-offset: 1px; }
-/* worker 卡片的负载条（本轮第 5 项）：细一点，别抢了文字的位置 */
 .progress.worker-load { height: 8px; margin-top: 3px; max-width: 300px; }
-/* 用户第 4 项：从节点总负载条（在「从节点」面板标题右侧）—— 只统计从节点的负载与槽位总和，
-   主控本机那 32 个槽位不计入（它压根不在 stores.workers 里，见 Transfer:localStatus）。 */
 .worker-load-wrap { display: inline-flex; align-items: center; gap: 6px; margin-left: 8px; }
 .progress.worker-load.total { width: 160px; margin-top: 0; }
-/* 面板标题里的进度条用的是 <span>（标题行是 flex，塞 <div> 会打断布局）——
-   inline 元素不吃 height，所以这里显式给它 inline-block */
 .worker-load-wrap .progress { display: inline-block; vertical-align: middle; }
 .worker-load-wrap .progress > .bar { display: block; }
 .peripheral-card-head { cursor: grab; }
@@ -234,8 +216,6 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     background: rgba(120, 190, 255, .16);
     pointer-events: none;
 }
-/* ===== 外设与定义：容器类型用颜色区分（见 web/ifm-processes.js 的 peripheralFunctionRows） ===== */
-/* 物品容器 = 蓝色、流体容器 = 青色、信号 = 琥珀色：左侧的类型标签与右侧的定义芯片同色，一眼分清 */
 :root {
     --item-kind: #6fb2ff;
     --fluid-kind: #4fd6c8;
@@ -246,10 +226,13 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 .def-fluid { border-left: 6px solid var(--fluid-kind); }
 .def-signal { border-left: 6px solid var(--signal-kind); }
 .def-chip:hover { border-color: var(--accent-2); }
-/* 这个方块的所有外设都还没定义：整张卡片标黄（提示“还没告诉 IFM 它是干什么的”） */
 .card-block.warn { border-color: var(--warn); background: #4a4028; }
 .card-block.warn h3 { color: var(--warn); }
-.card-block /* 流程元素里的“虚操作”（抽象模板）：换一种底色，和真实材料区分开 */
+/* A container peripheral whose slot information has not been read yet: its card is
+   outlined in the warn colour until the slot count / slot capacity is known. */
+.card-block.capacity-pending { border-color: var(--warn); }
+#peripheralList .card-block.capacity-pending { border-color: var(--warn); }
+.card-block
 .element-row select.e-kind { flex: 0 0 auto; }
 .element-row .e-vname { border-color: var(--warn); }
 .card-block {
@@ -257,23 +240,19 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     border: 2px solid var(--border);
     padding: 8px;
     cursor: pointer;
-    /* grid / flex 子项默认 min-width:auto 会被长内容撑破容器：这里允许收缩 */
     min-width: 0;
 }
 .card-block h3 { font-size: 13px; margin: 0 0 6px 0; }
 .card-block .meta { font-size: 11px; color: var(--text-dim); word-break: break-all; }
-.progress { height: 12px; background: #1c1e23; border: 2px solid var(--border); margin-top: 4px; }
+.progress { position: relative; height: 12px; background: #1c1e23; border: 2px solid var(--border); margin-top: 4px; }
 .progress > .bar { height: 100%; background: var(--good); width: 0; }
 .progress > .bar.warn { background: var(--warn); }
 .progress > .bar.bad { background: var(--bad); }
-/* 外设与定义：方块卡片既贴合内部芯片的大小（一个方块只有 1~2 个芯片时不要被撑宽），
-   又要紧凑排列 —— 所以用 flex 换行，而不是等宽网格列。
-   * 以前这里用 .row-3 的 repeat(auto-fill, minmax(250px, 1fr))：列宽先按 250px 均分好
-     （宽屏 5~6 列），卡片再 width:fit-content 缩到内容大小，于是每张卡片右边都空着大半列，
-     一行也永远只排得下 5~6 张 —— 看着就是“横向很松、一行只有 6 个”（用户反馈）。
-   * flex + flex-wrap 按卡片真实宽度塞满每一行（同样宽度的卡片能挤进更多张），间距固定 10px；
-     宽度取内容需要的最大值、上限 100%（长芯片行不撑破面板），与上面的机器类型卡片（.machine-type-list）
-     同一套做法。align-items:flex-start 让同排更高的卡片不把别的卡片拉长。 */
+/* Process progress bars are scaled to the extraction maximum; these ticks mark the
+   guaranteed minimum and the expected yield on that scale. */
+.progress > .progress-tick { position: absolute; top: 0; bottom: 0; width: 2px;
+    margin-left: -1px; background: #d7dbe2; opacity: 0.85; }
+.progress > .progress-tick.expect { background: #ffffff; }
 #peripheralList {
     display: flex;
     flex-wrap: wrap;
@@ -298,7 +277,6 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     flex-wrap: wrap;
 }
 .flow-row .grow { flex: 1 1 auto; }
-/* 空闲（还没下单）的流程行：整行淡一点，与运行中的区分开 */
 .flow-row.idle { opacity: .75; }
 .state-tag { padding: 1px 6px; border: 2px solid var(--border); font-size: 11px; }
 .state-tag.running { background: var(--good); color: #16181d; }
@@ -324,21 +302,16 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 .login-box h1 { font-size: 20px; margin-bottom: 6px; }
 .login-box p { color: var(--text-dim); font-size: 12px; }
 .login-box input { width: 100%; margin: 12px 0; padding: 8px; }
-/* 登录页帮助按钮（用户第 1 项）：指向 GitHub 仓库（不是 Wiki） */
 .login-box .help-btn {
     width: 100%;
     justify-content: center;
     margin-top: 8px;
     text-decoration: none;
 }
-/* 状态栏（用户第 2 项）：只显示「图标 + 数字」，含义在悬停提示里 */
 .status-icon { opacity: .7; }
 .status-value { margin: 0 10px 0 4px; }
-/* 房间号 / 中继地址默认显示 ****（悬停看真实值，见 maskText） */
 .muted.masked { cursor: help; }
-/* 顶栏里被 JS 隐藏的标签（relayLabel 并进 roomLabel 之后）不能占位 */
 .app-header [hidden] { display: none !important; }
-/* 容器管理（用户第 5 项）：按槽位画格子，空格子也要显示，左上角是 #槽位号 */
 .slot-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
@@ -354,7 +327,21 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     background: var(--panel-bg-2);
     border: 2px solid var(--border);
 }
-.slot-cell.empty { opacity: .5; }
+.slot-cell.empty { background: rgba(0, 0, 0, .18); border-style: dashed; }
+/* The empty cell only dims its own text: the put button in it has to stay
+   fully clickable-looking (a faded button reads as "disabled"). */
+.slot-cell.empty .slot-index,
+.slot-cell.empty .slot-empty { opacity: .55; }
+.slot-actions {
+    display: flex;
+    gap: 4px;
+    margin-top: auto;
+}
+.slot-actions .btn-pixel {
+    flex: 1 1 auto;
+    font-size: 11px;
+    padding: 2px 4px;
+}
 .slot-index {
     position: absolute;
     top: 2px;
@@ -383,7 +370,6 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 #editorModal .modal-footer, #promptModal .modal-footer, #diagnoseModal .modal-footer {
     border-top: 2px solid var(--border);
 }
-/* 容器管理（现在在「编辑容器定义」弹窗里）：顶部只读信息行，与编辑器的字段行同一套排版 */
 #toolMeta { margin-bottom: 10px; }
 .info-row {
     display: grid;
@@ -398,13 +384,11 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 .info-row .info-value.bad { color: var(--bad); }
 #diagnoseOutput { color: var(--text); max-height: 60vh; overflow: auto; }
 .editor-row { display: grid; grid-template-columns: 130px 1fr; gap: 8px; align-items: center; margin-bottom: 8px; }
-/* 调度权重面板（1.8.0）：每行的文本 / 滑条 / 数字框是同一个 Grid 的直接子项（见 renderSettings） */
 #settingsBody .settings-label { font-size: 12px; color: var(--text-dim); white-space: nowrap; }
 #settingsBody .settings-label.warn { color: var(--bad); font-weight: 600; }
 #settingsBody .warn-icon { color: var(--bad); margin-left: 4px; }
 #settingsBody input[type="range"] { width: 100%; margin: 0; }
 #settingsBody input[type="number"] { width: 72px; margin: 0; }
-/* 登录框的错误信息：红色（用户第 3 项） */
 #loginError { color: var(--bad); font-weight: 600; }
 .editor-row > label { font-size: 12px; color: var(--text-dim); }
 .editor-block { border: 2px solid var(--border); padding: 8px; margin-bottom: 10px; background: var(--panel-bg-2); }
@@ -412,33 +396,33 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 .element-row {
     display: flex;
     flex-wrap: wrap;
-    gap: 6px;
+    gap: 8px;
     align-items: center;
     border: 2px solid var(--border);
     padding: 6px;
-    margin-bottom: 6px;
+    margin-bottom: 8px;
     background: var(--panel-bg);
     font-size: 12px;
 }
 .element-row .grow { flex: 1 1 120px; }
+/* Operation cards are re-ordered by dragging their background (see
+   bindElementRowSorting): the cursor hints at it and the carried card dims. */
+.element-row { cursor: grab; }
+.element-row.dragging { opacity: .55; cursor: grabbing; }
+.element-row.dragging * { cursor: grabbing; }
 .rule-row { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
 .rule-row select { max-width: 160px; }
 .rule-row input[type="text"] { flex: 1 1 150px; }
-/* 机器定义渲染在机器类型卡片内部：**左右排列、流式换行**（用户第 2 项）。
-   以前是 auto-fill 网格，但机器类型卡片本身是 width: max-content —— 网格的 max-content 只有一列宽，
-   于是里面的机器卡片实际被竖着叠起来。改成 flex 换行：每张按 210px 起排，一行放不下就换行。 */
-/* 用户第 1 项（本轮）：机器卡片在类型卡片里**居中**排布 —— 类型卡片的宽度是 max-content
-   （换行后可能比"实际行宽"宽一点），居中之后多出来的空间左右均分，
-   不会再出现"留白全部堆在右侧"的观感。 */
+/* Searchable select (machine type): a visible search box plus a hidden value input.
+   The value input keeps the original id, so readValue(id) is unchanged (ifm-editor.js). */
+.searchable-select { display: block; width: 100%; }
+.searchable-select .ss-input { width: 100%; }
 .machine-list { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: center; gap: 8px; }
 .machine-card {
     background: var(--panel-bg);
     border: 2px solid var(--border);
     padding: 6px;
     cursor: pointer;
-    /* 用户第 1 项（本轮）：**不要固定宽度** —— 卡片按内容定宽（跟方块卡片一样 max-content）。
-       上一版为了消掉"类型卡片比机器宽出一大截"给过 210px 固定宽度，但用户要求全部按内容；
-       换行造成的右侧留白改由 .machine-list 的居中排布消化（见下）。 */
     flex: 0 1 auto;
     width: max-content;
     max-width: 100%;
@@ -446,10 +430,8 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 }
 .machine-card:hover { border-color: var(--accent); }
 .machine-card h4 { font-size: 12px; margin: 0 0 4px 0; word-break: break-all; }
-/* 机器类型卡片：标题 + 右上角「+ 机器」按钮 */
 .card-block .card-head { display: flex; align-items: flex-start; gap: 8px; }
 .card-block .card-head h3 { flex: 1 1 auto; }
-/* 有序多选（机器的输入/输出容器：可多选，且顺序由上下箭头决定） */
 .ordered-picker { display: flex; flex-direction: column; gap: 6px; }
 .picker-chosen { display: flex; flex-direction: column; gap: 4px; }
 .picker-item {
@@ -464,7 +446,6 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 .picker-name { flex: 1 1 auto; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .picker-add { display: flex; align-items: center; gap: 6px; }
 .picker-add select { flex: 1 1 auto; }
-/* 「从库存选择」弹窗：图标 + 名称 + 搜索框 */
 #stockModal .modal-content {
     background: var(--panel-bg);
     color: var(--text);
@@ -473,7 +454,6 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 }
 #stockModal .modal-header { border-bottom: 2px solid var(--border); }
 #stockModal .modal-footer { border-top: 2px solid var(--border); }
-/* 编辑器里再开这个弹窗：盖在编辑器之上 */
 #stockModal { z-index: 1085; }
 .stock-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 6px; }
 .stock-item {
@@ -492,17 +472,20 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 .stock-item .icon img { width: 24px; height: 24px; }
 .stock-name { flex: 1 1 auto; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .stock-count { font-size: 12px; color: var(--accent-2); }
-/* 发送中：始终悬浮在浏览器窗口底部（body 的下内边距由脚本按它的高度补偿） */
+.stock-count.craftable { font-style: italic; opacity: .85; }
+/* The send list and the deliveries are the bottom toolbar of the resources page (see
+   web/ifm-resources.js for the visibility): it is pinned to the bottom of the window
+   while that page is on screen, and the body keeps a reserve for it so the grid above
+   stays reachable (ifm-processes.js: syncDeliveryPanelSpacing). */
 #deliveryPanel {
     position: fixed;
-    left: 0;
+    left: var(--ifm-nav-w, 0px);
     right: 0;
     bottom: 0;
     margin: 0;
     z-index: 40;
     max-height: 34vh;
     overflow: auto;
-    /* 滚动条出现/消失时不改变内容宽度：避免底部面板内容左右抖动 */
     scrollbar-gutter: stable;
     border-left: none;
     border-right: none;
@@ -515,11 +498,56 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 .toast-msg.success { border-color: var(--good); }
 .toast-msg.error { border-color: var(--bad); }
 .toast-msg.info { border-color: var(--accent); }
-#graph { background: #1c1e23; border: 2px solid var(--border); padding: 8px; overflow: auto; min-height: 120px; }
+/* mermaid measures a node label in a temporary container OUTSIDE #graph, so these
+   placeholder sizes must exist globally - a #graph-scoped rule cannot apply during
+   that measurement, and the measured label is what sizes the node. */
+/* mermaid wraps an HTML node label in a <p> and measures that div; the default <p>
+   margins inflate the measured label (and therefore the node), so zero them out
+   globally - the measurement happens outside #graph, hence no scoping here. */
+.nodeLabel p, .edgeLabel p { margin: 0; padding: 0; }
+.ifm-graph-icon { display: inline-block; width: 26px; height: 26px; }
+.ifm-graph-machine-icon { display: inline-block; width: 24px; height: 24px; vertical-align: middle; }
+.ifm-graph-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--accent); vertical-align: middle; }
+/* The graph fills the room left below the sticky header and the bottom toolbar
+   (--ifm-bottom-bars is maintained by ifm-processes.js: syncBottomBars). It is a
+   two-axis scroll viewport, so a long chain scrolls inside it and the page stays
+   put; there is no max-height, the height IS the available space. */
+section.panel[data-panel-page="graph"] {
+    display: flex;
+    flex-direction: column;
+    height: calc(100vh - var(--ifm-header-h, 58px) - var(--ifm-bottom-bars, 0px) - 28px);
+}
+#graph { background: #1c1e23; border: 2px solid var(--border); padding: 8px; overflow: auto; min-height: 120px; cursor: grab; user-select: none; flex: 1 1 auto; }
+#graph.panning { cursor: grabbing; }
+/* mermaid writes a max-width onto the svg and scales a long chain down to the
+   panel width; drop it so the graph keeps its own size and #graph can scroll. */
+#graph svg { max-width: none !important; height: auto; }
+/* mermaid draws in a temporary container that it appends to <body> (the container
+   argument of its render call) and removes again once the svg is ready. While the panels
+   are pages the document is short, so a stray container used to blink in view at the
+   bottom of the page: the sink keeps that work off screen, and the id rule catches a
+   mermaid build that ignores the argument. `visibility` (not display) leaves the labels
+   measurable - display:none would zero them and the nodes would come out wrong - and the
+   width keeps their wrapping the same as it is inside the document. */
+.graph-render-sink,
+body > div[id^="difmGraphSvg"] {
+    position: fixed;
+    left: -20000px;
+    top: 0;
+    width: 100vw;
+    visibility: hidden;
+    pointer-events: none;
+    z-index: -1;
+}
+/* Some crossings stay unavoidable in a factory graph (one material feeds several
+   processes); thinner lines and a small label with an opaque background keep them
+   readable instead of turning the panel into a knot. */
+#graph svg .flowchart-link,
+#graph svg .edgePath .path { stroke-width: 1.4px; }
+#graph svg .edgeLabel { font-size: 11px; }
+#graph svg .edgeLabel foreignObject > div { background: #1c1e23; padding: 0 2px; }
 .muted { color: var(--text-dim); font-size: 12px; }
-/* Font Awesome 不可用时的文字兜底（名称首字） */
 .icon .icon-text { font-size: 16px; font-weight: bold; color: var(--accent-2); }
-/* Font Awesome 6：显式声明 .fa 与 .fa-solid 的字体，避免依赖简写别名 */
 .fa, .fa-solid {
     font-family: "Font Awesome 6 Free";
     font-weight: 900;
@@ -530,7 +558,6 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     text-rendering: auto;
     -webkit-font-smoothing: antialiased;
 }
-/* 旧版（FA4）图标名 → FA6 同码点别名，避免改动大量 HTML/JS */
 .fa-refresh::before { content: "\f021"; }
 .fa-floppy-o::before { content: "\f0c7"; }
 .fa-search::before { content: "\f002"; }
@@ -554,13 +581,40 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 .fa-arrow-up::before { content: "\f062"; }
 .fa-arrow-down::before { content: "\f063"; }
 
-/* ===================== 搜索框 + 右侧清空按钮 ===================== */
 .search-wrap { display: inline-flex; align-items: center; gap: 4px; }
 .search-wrap input { min-width: 130px; }
 .search-wrap .search-clear { padding: 3px 7px; }
 .search-wrap .search-clear i { font-size: 11px; }
 
-/* ===================== 资源卡片左上角的类型徽标 ===================== */
+/* The page search boxes: a fixed bottom toolbar so the search stays reachable while a
+   long list is scrolled (ifm-panels.js picks the group per page; ifm-processes.js
+   syncBottomBars stacks it above the delivery toolbar and reserves the body bottom). */
+.search-toolbar {
+    position: fixed;
+    left: var(--ifm-nav-w, 0px);
+    right: 0;
+    bottom: 0;
+    z-index: 41;
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: flex-start;
+    gap: 10px;
+    background: var(--panel-bg);
+    border-top: 3px solid var(--border);
+    padding: 8px 12px;
+    box-shadow: 0 -4px 12px rgba(0, 0, 0, .45);
+}
+/* One group is the toolbar of the page that is on screen; the others are hidden
+   (ifm-panels.js: refreshSearchToolbar). */
+.search-group { display: flex; flex: 1 1 auto; align-items: center; gap: 10px; flex-wrap: wrap; }
+/* .search-group is flex, which would beat the UA [hidden] rule: spell it out. */
+.search-toolbar [hidden] { display: none; }
+.search-toolbar .search-wrap input { min-width: 260px; }
+/* The capacity / compact bars live in the fixed toolbar now: each of "item capacity"
+   and "slot usage" takes a full row of its own. */
+.search-toolbar .capacity-box { flex: 1 1 100%; flex-direction: column; margin-bottom: 0; gap: 4px; }
+.search-toolbar .capacity-row { width: 100%; }
+
 .kind-badge {
     position: absolute;
     left: 2px;
@@ -581,8 +635,6 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 .kind-badge.kind-filter { color: #d0a3ff; }
 .kind-badge.kind-placeholder { color: var(--warn); }
 
-/* ===================== 机器卡片里的容器芯片 ===================== */
-/* 类型徽标：输入=红、输出=绿；物品用 cube、流体用 tint */
 .chip-badge {
     display: inline-flex;
     align-items: center;
@@ -599,12 +651,9 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 .chip .chip-text { max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chip .chip-del { padding: 1px 5px; line-height: 1; }
 .chip .chip-del i { font-size: 9px; }
-/* 芯片里的「移除」按钮：和其它 btn-pixel 一致，但在芯片里更紧凑一点 */
 .chip.pc-chip .chip-del, .chip.unassigned .btn-pixel { padding: 1px 5px; line-height: 1; }
 .chip.pc-chip .chip-del i, .chip.unassigned .btn-pixel i { font-size: 9px; }
 
-/* ===================== 没有图标时的名称兜底 ===================== */
-/* 字数越多字号越小：中文取前 4 字、英文取各单词首字母（见 iconFallbackText） */
 .icon-text {
     font-weight: bold;
     color: var(--accent-2);
@@ -622,11 +671,6 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 .grid-item .icon-text[data-fallback-len="3"] { font-size: 16px; }
 .grid-item .icon-text[data-fallback-len="4"] { font-size: 13px; }
 
-/* ===================== 流程依赖图节点里的图标 ===================== */
-/* 材料节点（正方形）里只放图标，尺寸必须钉死：mermaid 把「标签本身是图片」的节点当成图标标签，
-   会往图片身上写 display:flex;flex-direction:column;min-width:80px;max-width:80px，
-   图片就被拉成 80×26、节点也按 80 宽量尺寸（依赖图里“图标被拉伸”的根因）。
-   样式表里的 !important 声明可以压过内联的非 !important 声明，所以这里能把它盖掉。 */
 #graph svg .nodeLabel img,
 #graph svg .node .label img {
     width: 26px !important;
@@ -638,7 +682,6 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     object-fit: contain !important;
     display: block !important;
 }
-/* 图标外面那层定尺容器（见 web/ifm-processes.js 的 GRAPH_ICON_HOLDER / applyGraphIcons） */
 #graph svg .nodeLabel .ifm-graph-icon,
 #graph svg .node .label .ifm-graph-icon {
     display: inline-flex !important;
@@ -651,7 +694,6 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     flex: 0 0 auto;
     line-height: 0;
 }
-/* 流程节点（圆形）里的小圆点 */
 #graph svg .ifm-graph-dot {
     display: inline-block;
     width: 9px;
@@ -660,18 +702,14 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     background: var(--accent);
 }
 
-/* ===== 机器类型卡片（在「外设与定义」板块里）：按内容宽度自适应、放不下就换行 ===== */
 .machine-type-list {
     display: flex;
     flex-wrap: wrap;
     gap: 10px;
     align-items: flex-start;
     margin-top: 10px;
-    /* 与下方的方块卡片（#peripheralList）之间也要留出间距：
-       卡片自己 margin:0（见下条规则），不加这一行两块卡片会贴在一起（1.6.10 修） */
     margin-bottom: 12px;
 }
-/* 宽度取内容需要的最大值，但不超过容器宽度（不要总占满整行） */
 .machine-type-list > .card-block {
     flex: 0 1 auto;
     width: max-content;
@@ -680,22 +718,12 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     margin: 0;
 }
 
-/* 用户第 2/3 项（外设与定义）：存储 / 输入 / 输出容器卡片以前各自是一个块级列表 ——
-   每个列表独占一行，输入卡片与输出卡片之间被"强制换行"，卡片右侧还留下大片死区
-   （那块空白既不能右键框选，也白占地方）。
-   现在改成：面板自己就是一个 flex 流，5 个列表用 display:contents 退化成"透明容器"，
-   它们的卡片直接成为面板的 flex 项 → 所有卡片在同一行里紧凑换行，没有强制换行、没有死区。
-   注意：不加 wrapper 元素（run_dom_smoke.js 的"结构漂移"检查比对每个 id 的祖先链，
-   包一层 div 会让 storageList/inputList/outputList/machineTypeList 全部被判漂移）。 */
-/* 用 class（.peripheral-panel）标记面板而不是 id：加 id 会让面板里每个元素的"祖先链"都变一次，
-   run_dom_smoke.js 的"结构漂移"检查会把它当成"元素搬家"直接判 FAIL。 */
 .panel.peripheral-panel {
     display: flex;
     flex-wrap: wrap;
     gap: 10px;
     align-items: flex-start;
 }
-/* 标题行与"缺失外设"提示仍然各占一整行 */
 .panel.peripheral-panel > header,
 .panel.peripheral-panel > .peripheral-section {
     flex: 0 0 100%;
@@ -704,9 +732,7 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 .panel.peripheral-panel > #peripheralList {
     display: contents;
 }
-/* 列表本身不再产生盒子 → 原来的 margin-top/margin-bottom 也不再需要（间距由面板的 gap 负责） */
 
-/* 机器卡片内的位置卡片：纵向排列，这样每个位置更宽、外设名能显示完整 */
 .machine-slots {
     display: flex;
     flex-direction: column;
@@ -717,7 +743,6 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     border: 1px dashed var(--border);
     padding: 6px;
     min-height: 56px;
-    /* min-width: 0 让 grid 子项可以收缩，否则里面的长外设名会把卡片撑出边框 */
     min-width: 0;
     background: rgba(0, 0, 0, .18);
 }
@@ -731,9 +756,7 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     min-width: 0;
 }
 .machine-slot .slot-empty { font-size: 11px; }
-/* 位置里的外设卡片：不许超出位置卡片宽度；名字尽量显示完整（放不下才换行） */
 .pc-chip { cursor: grab; min-width: 0; max-width: 100%; }
-/* 只读机器（海龟合成器）里的外设卡片：不可拖、没有删除按钮（用户第 3 项）—— 光标不再是"可抓" */
 .pc-chip.chip-readonly { cursor: default; }
 .pc-chip .chip-text {
     max-width: none;
@@ -743,11 +766,13 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     overflow: visible;
     text-overflow: clip;
 }
-/* 输入候选浮层（自动补全，见 ifm-editor.js 的 attachAutocomplete）：
-   固定在输入框下方（放不下时翻到上方），可点选，键盘 ↑/↓ 选择 · Tab/Enter 补全 */
 .ifm-ac {
     position: fixed;
-    z-index: 80;
+    /* Above the bootstrap modals (1055) and #stockModal (1085): the panel is
+       opened from inside the editor modal, and at z-index 80 it used to hide
+       behind the modal - which left the browser's native <datalist> chrome as
+       the only candidate list the user could see. */
+    z-index: 2000;
     max-height: 220px;
     overflow-y: auto;
     background: var(--panel-bg-2);
@@ -761,7 +786,6 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 .ifm-ac-item:empty { display: none; }
 .storage-card { min-width: 0; }
 .storage-card .chip-list { min-width: 0; }
-/* 材料节点上的「正在合成 / 剩余目标」（9/22）：紧跟在图标后面，小字 */
 .ifm-graph-count {
     display: inline-block;
     vertical-align: middle;
@@ -775,30 +799,35 @@ input[type="checkbox"] { width: 16px; height: 16px; }
 .chip.unassigned .btn-pixel { padding: 1px 6px; }
 .peripheral-section { margin-bottom: 0; }
 .peripheral-section .card-block { margin-bottom: 10px; }
-/* 拖拽反馈（1.6.7）：
-   * 光标停在可拖拽的芯片上时边框高亮 —— 只有芯片能拖（方块卡片整张不可拖，见 ifm-processes.js）；
-   * 拖拽过程中，所有能接收当前芯片的位置 / 存储卡片边框高亮（.drop-ok），
-     光标正上方那个再加强（.drop-active）；
-   * 方块卡片（.card-block）与机器类型卡片不再因为鼠标悬停而点亮 —— 整张卡片亮起来
-     会让人误以为卡片本身可以拖（旧的 .card-block:hover 规则已删除）。 */
-.chip[draggable="true"] { transition: border-color .12s ease, background .12s ease; }
-.chip[draggable="true"]:hover { border-color: var(--accent); }
-.machine-slot.drop-ok { border-color: var(--accent-2); border-style: dashed; }
+/* Drag handles are marked with data attributes: the native draggable attribute is
+   gone so the wheel keeps working while a card is carried (pointer drag). */
+.chip[data-drag-peripheral], .chip[data-pc-peripheral] { transition: border-color .12s ease, background .12s ease; }
+.chip[data-drag-peripheral]:hover, .chip[data-pc-peripheral]:hover { border-color: var(--accent); }
+.machine-slot.drop-ok { border-color: var(--accent); border-style: dashed; }
 .machine-slot.drop-active { border-color: var(--accent); border-style: solid; background: rgba(120, 170, 255, .18); }
-/* 用户第 3 项：机器里指向"外设已经不存在"的卡片（以及它所在的位置框）标红 ——
-   这些定义还挂在机器的输入/输出列表里，但背后的外设已经不在了（服务端 missing 列表给出）。 */
 .chip.pc-chip.chip-missing { border-color: var(--bad); }
 .chip.pc-chip.chip-missing .chip-text { color: var(--bad); }
+/* A container whose slot information has not been read yet: its chip (storage / input /
+   output / machine slot) is outlined in the warn colour until the values are known. */
+.chip.pc-chip.capacity-pending { border-color: var(--warn); }
+.chip.pc-chip.capacity-pending .chip-text { color: var(--warn); }
 .machine-slot.slot-missing { border-color: var(--bad); border-style: dashed; }
-.card-block.storage-card.drop-ok { border-color: var(--accent-2); border-style: dashed; }
+.card-block.storage-card.drop-ok { border-color: var(--accent); border-style: dashed; }
 .card-block.storage-card.drop-active {
     border-color: var(--accent);
     border-style: solid;
-    background: rgba(120, 170, 255, .12);
+    background: rgba(120, 170, 255, .18);
 }
 .card-block.dragging, .pc-chip.dragging { opacity: .45; }
+/* The dragged node must not sit under the pointer, otherwise elementFromPoint
+   would keep hitting it instead of the drop target below. */
+.dragging { pointer-events: none; }
+body.ifm-dragging { cursor: grabbing; user-select: none; }
 
-/* ===== 底部发送面板：「待发送」（左，先进先出）+「发送中」（右，最新提交的排最前） ===== */
+/* The scheduler detail lives on this icon, not on the whole header span: only
+   hovering the icon shows the long per-queue breakdown. */
+.dispatch-help { cursor: help; margin-left: 2px; }
+
 .delivery-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .delivery-column { min-width: 0; }
 .delivery-head {
@@ -809,26 +838,245 @@ input[type="checkbox"] { width: 16px; height: 16px; }
     color: var(--text-dim);
     margin-bottom: 4px;
 }
-/* 用户第 6 项：「发送中」栏也要有一个"全部删除"，放在这一栏的标题行右侧（与「待发送」那个成对） */
 .delivery-head .delivery-clear { margin-left: auto; padding: 0 6px; }
-/* 用户第 5 项：发送中的数量显示成"剩余/总共"，总共用更小的字（合并进来的量一眼能看出来） */
 .delivery-total { font-size: 9px; color: var(--text-dim); }
 .delivery-item.pending { opacity: .65; border-style: dashed; }
-/* 用户第 5 项：这条发送卡住了（服务端 lastError 非空）→ 红边 + 左上角感叹号（悬停看原因） */
 .delivery-item.error { border-color: var(--bad); }
 .delivery-error-mark { right: auto; left: 3px; }
-/* 点「发送」时飞向「发送中」的副本（FLIP 动画） */
+
+/* Processes panel: one block per process, its live instances listed underneath */
+.process-block { margin-bottom: 6px; }
+/* Search on the processes page reorders instead of hiding: a process that does not
+   match stays in place below the hits, dimmed. */
+.process-block.process-dim { opacity: .35; }
+.instance-row {
+    margin-left: 18px;
+    border-left: 2px solid var(--accent);
+    padding-left: 8px;
+    font-size: 12px;
+}
+
+/* Flow graph search: a hit keeps full opacity and gets an outline, the rest dims */
+#graph g.node.ifm-graph-dim { opacity: .22; }
+#graph g.node.ifm-graph-hit > rect,
+#graph g.node.ifm-graph-hit > circle,
+#graph g.node.ifm-graph-hit > ellipse,
+#graph g.node.ifm-graph-hit > polygon,
+#graph g.node.ifm-graph-hit > path {
+    stroke: var(--accent-2) !important;
+    stroke-width: 3px !important;
+}
+#graph g.node.ifm-graph-hit .ifm-graph-icon,
+#graph g.node.ifm-graph-hit .ifm-graph-dot { filter: drop-shadow(0 0 4px var(--accent-2)); }
+/* Enter in the graph search focuses one hit at a time; the focused node gets a
+   stronger outline than the other matches so it is easy to spot. */
+#graph g.node.ifm-graph-focus > rect,
+#graph g.node.ifm-graph-focus > circle,
+#graph g.node.ifm-graph-focus > ellipse,
+#graph g.node.ifm-graph-focus > polygon,
+#graph g.node.ifm-graph-focus > path {
+    stroke: var(--accent) !important;
+    stroke-width: 4px !important;
+}
+#graph g.node.ifm-graph-focus .ifm-graph-icon,
+#graph g.node.ifm-graph-focus .ifm-graph-dot { filter: drop-shadow(0 0 6px var(--accent)); }
+
+/* Peripherals page search: matching machine type / peripheral / definition cards
+   are highlighted, everything else dims in place (nothing is hidden). */
+.card-block.ifm-search-hit { border-color: var(--accent-2); box-shadow: inset 0 0 0 1px var(--accent-2); }
+.card-block.ifm-search-dim { opacity: .35; }
+.card-block.ifm-search-focus { outline: 3px solid var(--accent); outline-offset: 1px; }
+
+/* Machine type icons: the machine type card and the process nodes of the graph */
+.ifm-machine-icon {
+    display: inline-block;
+    width: 20px;
+    height: 20px;
+    margin-right: 6px;
+    vertical-align: middle;
+    text-align: center;
+    image-rendering: pixelated;
+}
+.ifm-graph-machine-icon .ifm-machine-icon { width: 24px; height: 24px; margin-right: 0; }
+
+.instance-row .state-tag { opacity: .85; }
+
 .send-ghost {
     position: fixed;
-    /* 飞行副本必须压在底部面板（#deliveryPanel z-index 40）和提示条（60）之上，
-       否则动画会“飞进面板后面”看不见（1.6.11 排查：动画元素被面板遮住） */
     z-index: 3000;
     margin: 0;
     pointer-events: none;
     transition: transform .45s cubic-bezier(.2, .7, .3, 1), opacity .45s linear;
 }
 
-/* ===== 从节点：版本与主控不一致（不参与作业）时标红提示 ===== */
 .flow-row.worker-mismatch { border-color: var(--bad); }
 .flow-row.worker-mismatch strong { color: var(--bad); }
 .worker-warn { color: var(--bad); font-size: 11px; word-break: break-all; }
+
+/* Resource panel additions -------------------------------------------------- */
+
+/* The craft "+" is an indicator only now (it has no click handler). */
+.grid-item .grid-mark.craft-mark { pointer-events: none; }
+
+/* Icon wrapper: hosts the enchantment glint overlay and keeps the icon centred. */
+.grid-item .card-icon {
+    position: relative;
+    width: 48px;
+    height: 48px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+}
+/* An enchanted item gets a moving sheen, like the vanilla enchantment glint. The band
+   is a narrow diagonal stripe swept across by a transform: transform animations are
+   composited on the GPU (no per-frame repaint, no mix-blend-mode), and the stripe is
+   clipped by the wrapper, so there is no tiled "cross" pattern either. */
+.grid-item .card-icon.enchant-glint::after {
+    content: "";
+    position: absolute;
+    top: -70%;
+    left: -120%;
+    width: 55%;
+    height: 240%;
+    z-index: 1;
+    pointer-events: none;
+    background: linear-gradient(90deg,
+        rgba(200, 150, 255, 0) 0%,
+        rgba(200, 150, 255, .45) 35%,
+        rgba(255, 255, 255, .8) 50%,
+        rgba(200, 150, 255, .45) 65%,
+        rgba(200, 150, 255, 0) 100%);
+    transform: rotate(20deg) translateX(0);
+    animation: ifmEnchantGlint 2.4s linear infinite;
+}
+@keyframes ifmEnchantGlint {
+    0% { transform: rotate(20deg) translateX(0); }
+    100% { transform: rotate(20deg) translateX(420%); }
+}
+
+/* Durability bar under the icon. */
+.grid-item .durability {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 3px;
+    background: #1c1e23;
+    border: 1px solid var(--border);
+    pointer-events: none;
+    z-index: 2;
+}
+.grid-item .durability-in { display: block; height: 100%; background: var(--good); }
+.grid-item .durability-in.warn { background: var(--warn); }
+.grid-item .durability-in.bad { background: var(--bad); }
+
+/* Stock-keeping target: above the stock count in the bottom-right corner. */
+.grid-item .grid-keep {
+    position: absolute;
+    right: 3px;
+    bottom: 14px;
+    font-size: 10px;
+    font-weight: bold;
+    text-shadow: 1px 1px 2px #000, -1px -1px 2px #000, 1px -1px 2px #000, -1px 1px 2px #000;
+    pointer-events: none;
+    z-index: 2;
+}
+.grid-item .grid-keep.ok { color: var(--good); }
+.grid-item .grid-keep.short { color: var(--bad); }
+.grid-item .grid-keep.off { color: var(--text-dim); }
+
+/* Item-detail lines in the resource tooltip are white (registry lines stay dim). */
+.icon-tooltip .tip-detail { color: #fff; }
+/* A cursed enchantment line is red. */
+.icon-tooltip .tip-curse { color: var(--bad); font-weight: bold; }
+/* The title carries the display name + stored count, so it is a bit larger. */
+.icon-tooltip .tip-name { font-size: 14px; font-weight: bold; }
+
+/* Slot capacity multiplier badge in the container management tool: clickable, and
+   highlighted when the value was set by hand. */
+.slot-cell .slot-mult {
+    font-size: 10px;
+    color: var(--text-dim);
+    font-family: Consolas, 'Courier New', monospace;
+    margin-left: 4px;
+    cursor: pointer;
+}
+.slot-cell .slot-mult:hover { color: var(--accent); }
+.slot-cell .slot-mult.user { color: var(--accent-2); font-weight: bold; }
+
+/* Container role chips (storage / input / output): colour by role, like the machine
+   input/output badges. */
+.chip-badge.kind-item-storage, .chip-badge.kind-fluid-storage { color: var(--accent-2); }
+.chip-badge.kind-item-input, .chip-badge.kind-fluid-input { color: var(--bad); }
+.chip-badge.kind-item-output, .chip-badge.kind-fluid-output { color: var(--good); }
+
+/* ---------------------------------------------------------------------------
+   Panel pages: every panel is its own page and the sidebar (#panelNav) switches
+   between them, so a list growing in one panel can no longer push the controls
+   of the panels below it around. On a narrow screen the sidebar is a drawer that
+   the IFM button top left opens (web/ifm-panels.js).
+   --------------------------------------------------------------------------- */
+.app-body {
+    display: flex;
+    align-items: flex-start;
+}
+.panel-nav {
+    position: sticky;
+    top: var(--ifm-header-h, 58px);
+    flex: 0 0 auto;
+    width: 150px;
+    max-height: calc(100vh - var(--ifm-header-h, 58px) - 12px);
+    overflow: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 14px 0 14px 14px;
+}
+.nav-item {
+    width: 100%;
+    justify-content: flex-start;
+    text-align: left;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.nav-item i { width: 16px; text-align: center; }
+.nav-item.active { background: var(--accent); color: #16181d; }
+.panel-pages { flex: 1 1 auto; min-width: 0; }
+.panel-pages [data-panel-page][hidden] { display: none; }
+.nav-toggle { display: none; }
+.nav-backdrop { display: none; }
+
+/* A process folds its instances away; the toggle carries how many there are. */
+.instance-toggle { flex: 0 0 auto; }
+.instance-list[hidden] { display: none; }
+
+@media (max-width: 900px) {
+    .nav-toggle { display: inline-flex; }
+    .app-header h1 { display: none; }
+    .app-body { display: block; }
+    .panel-nav {
+        position: fixed;
+        left: 0;
+        top: 0;
+        bottom: 0;
+        z-index: 55;
+        width: 210px;
+        max-height: none;
+        padding-top: 56px;
+        background: var(--panel-bg);
+        border-right: 3px solid var(--border);
+        transform: translateX(-105%);
+        transition: transform .16s ease-out;
+        box-shadow: 4px 0 14px rgba(0, 0, 0, .45);
+    }
+    body.nav-open .panel-nav { transform: none; }
+    body.nav-open .nav-backdrop {
+        display: block;
+        position: fixed;
+        inset: 0;
+        z-index: 50;
+        background: rgba(0, 0, 0, .5);
+    }
+}

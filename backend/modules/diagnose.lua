@@ -1,12 +1,3 @@
--- IFM :: modules/diagnose.lua
--- 只读诊断：把“为什么材料/产物/发送任务不动”逐条算出来。
--- 结果作为日志行推给浏览器控制台（同时本地 print），不写任何文件（CC:T 磁盘很小）。
---
--- 三种模式（由 IFMMaster.lua 的 diagnose action 调用）：
---   report : 全面体检（外设 / 容器定义 / 机器 / 进程 / 发送任务 / 结论）
---   tick   : 手动跑一个 tick，直接暴露引擎异常（文件新旧混用时某方法不存在等）
---   move   : 对每一对容器真搬 1 个物品/流体再搬回来，验证目标容器能否接收
-
 local Diagnose = {}
 Diagnose.__index = Diagnose
 
@@ -14,16 +5,15 @@ function Diagnose.new(opts)
     opts = opts or {}
     local self = setmetatable({}, Diagnose)
     self.Util = opts.Util
+    self.Assert = opts.Assert
+        or error("diagnose.lua needs the assert module: pass opts.Assert (loadModule(\"assert\"))", 0)
+    self.Message = opts.Message
+        or error("diagnose.lua needs the message module: pass opts.Message (loadModule(\"message\"))", 0)
     self.Store = opts.Store
     self.Cache = opts.Cache
     self.Containers = opts.Containers
     self.Peripherals = opts.Peripherals
     self.Recipe = opts.Recipe
-    --- perf（各组件耗时）/ protocol（收发统计）通常由 IFMMaster.lua 在创建后回填，
-    --- 这里允许构造时直接传入；两者都缺失时 perf 诊断会给出“不可用”的提示。
-    -- 性能计时（IFMMaster.lua 的 timed 收集）。
-    -- 注意：字段名不能叫 self.perf —— `perf` 是本模块的方法名（`Diagnose:perf()`），
-    -- 赋成表会把方法覆盖掉，诊断 perf 模式就会报 “attempt to call method 'perf' (a table value)”。
     self.perfStats = opts.perfStats
     self.protocol = opts.protocol
     return self
@@ -41,19 +31,40 @@ local function joinList(list)
     return table.concat(list or {}, ",")
 end
 
---- 这个资源到底躺在哪个容器定义里（逐个统计，能看出角色是不是 storage）
+-- Pack a vararg (peripheral.getType returns one string per type) into a table.
+local function packValues(...)
+    return { n = select("#", ...), ... }
+end
+
+-- The full peripheral type list, straight from CC:T (empty/error text on failure).
+-- Printed next to the classification flags so a misclassification is visible without
+-- guessing: a container whose getType list has no "inventory" really is not one.
+local function typeList(name)
+    if type(peripheral) ~= "table" or type(peripheral.getType) ~= "function" then
+        return "no getType API"
+    end
+    local ok, types = pcall(function()
+        return packValues(peripheral.getType(name))
+    end)
+    if not ok or type(types) ~= "table" then
+        return "getType error"
+    end
+    local parts = {}
+    for index = 1, types.n do
+        parts[#parts + 1] = tostring(types[index])
+    end
+    if #parts == 0 then
+        return "(none)"
+    end
+    return table.concat(parts, ",")
+end
+
 function Diagnose:holdings(spec)
     local out = {}
     for _, def in ipairs(self.Store:list("containers")) do
-        if not self.Containers:isReadableContainer(def.name, self.Util.kindOfDef(def)) then
-            --- 交互/输出容器按设计不读（用户规则）：明确写出来，而不是当成"里面有 0 个"
-            out[#out + 1] = line("   skip:", def.name, "[", self.Util.kindOfDef(def), def.role,
-                "] = write-only by design (interaction/output are never read)")
-        else
-            local count = self.Containers:countIn(def.name, spec)
-            if count > 0 then
-                out[#out + 1] = line("   holds:", def.name, "[", self.Util.kindOfDef(def), def.role, "] =", count)
-            end
+        local count = self.Containers:countIn(def.name, spec)
+        if count > 0 then
+            out[#out + 1] = line("   holds:", def.name, "[", self.Util.kindOfDef(def), def.role, "] =", count)
         end
     end
     if #out == 0 then
@@ -62,27 +73,33 @@ function Diagnose:holdings(spec)
     return out
 end
 
---- 全面体检报告（返回行数组）
 function Diagnose:report()
     local out = {}
     local function say(...)
         out[#out + 1] = line(...)
     end
+    local function safeSay(fmt, ...)
+        out[#out + 1] = string.format(fmt, ...)
+    end
 
     local summary = {}
     say("===== IFM diagnose (report) =====")
     local tickAge = self.Recipe.lastTickAt and (os.epoch("utc") - self.Recipe.lastTickAt) or -1
-    say("engine: tickCount=" .. tostring(self.Recipe.tickCount or 0)
+    say("engine: tickCount=" .. tostring(self.Recipe.tickCount)
         .. " lastTickAgeMs=" .. tostring(tickAge)
-        .. " (\\u5F88\\u5C0F\\u7684 lastTickAgeMs = \\u5F15\\u64CE\\u5728\\u8DD1\\uFF1BtickCount \\u4E24\\u6B21\\u8BCA\\u65AD\\u4E4B\\u95F4\\u4E0D\\u589E\\u957F = \\u5F15\\u64CE\\u6CA1\\u5728\\u8DD1)")
+        .. " (a small lastTickAgeMs means the engine is running; tickCount not growing between two diagnoses means it is not)")
     if self.Recipe.lastTickError then
         say("engine lastTickError: " .. tostring(self.Recipe.lastTickError))
     end
     local counters = self.Recipe.debugCounters
     if counters then
+        safeSay("engine counters (classified): modem=%d other=%d uptime=%ds (startedAt=%s)",
+            counters.modemMessages, counters.otherEvents,
+            math.floor((os.epoch("utc") - counters.startedAt) / 1000),
+            tostring(counters.startedAt))
         say("engine counters: events=" .. tostring(counters.events) .. " timers=" .. tostring(counters.timers)
             .. " websockets=" .. tostring(counters.websockets) .. " runs=" .. tostring(counters.ticks)
-            .. " (timers \\u957F\\u671F\\u4E3A 0 = \\u8FD9\\u53F0\\u673A\\u5668\\u6536\\u4E0D\\u5230\\u5B9A\\u65F6\\u5668\\u4E8B\\u4EF6\\uFF0C\\u5F15\\u64CE\\u53EA\\u80FD\\u9760\\u5176\\u5B83\\u4E8B\\u4EF6\\u9A71\\u52A8)")
+            .. " (timers stuck at 0 = this computer gets no timer events; the engine runs off other events only)")
     end
     say("peripherals detected by CC:T:")
     for _, kind in ipairs({ "inventory", "fluid", "redstone" }) do
@@ -93,14 +110,24 @@ function Diagnose:report()
     say("container definitions:")
     for _, def in ipairs(self.Store:list("containers")) do
         local defKind = self.Util.kindOfDef(def)
-        local exists = self.Peripherals:exists(def.peripheral)
-        local capable = false
-        if exists then
-            capable = (defKind == "fluid") and self.Peripherals:isFluid(def.peripheral)
-                or self.Peripherals:isInventory(def.peripheral)
+        local peripheralName = tostring(def.peripheral)
+        local exists = self.Peripherals:exists(peripheralName)
+        local isInventory = exists and self.Peripherals:isInventory(peripheralName) or false
+        local isFluid = exists and self.Peripherals:isFluid(peripheralName) or false
+        local isTurtle = exists and self.Peripherals:isTurtle(peripheralName) or false
+        local snapshotItem = self.Containers:snapshotComplete(peripheralName, "item")
+        local snapshotFluid = self.Containers:snapshotComplete(peripheralName, "fluid")
+        say("  " .. def.name .. " [" .. defKind .. " " .. tostring(def.role) .. "] peripheral="
+            .. peripheralName .. " getType=" .. typeList(peripheralName))
+        say("      exists=" .. tostring(exists) .. " isInventory=" .. tostring(isInventory)
+            .. " isFluid=" .. tostring(isFluid) .. " isTurtle=" .. tostring(isTurtle)
+            .. " snapshotItem=" .. tostring(snapshotItem)
+            .. " snapshotFluid=" .. tostring(snapshotFluid)
+            .. " infoMissing=" .. joinList(self.Containers:infoMissing(peripheralName)))
+        local reason = self.Containers:unusableReason(def.name, defKind)
+        if reason then
+            say("      UNUSABLE: " .. self.Message.describe(reason))
         end
-        say("  " .. def.name .. " [" .. defKind .. " " .. tostring(def.role) .. "] peripheral=" .. tostring(def.peripheral)
-            .. " exists=" .. tostring(exists) .. " capable=" .. tostring(capable))
     end
 
     say("machines:")
@@ -113,41 +140,93 @@ function Diagnose:report()
             .. " itemOutputs=" .. joinList(machine.itemOutputs)
             .. " fluidOutputs=" .. joinList(machine.fluidOutputs)
             .. " signals=" .. joinList(machine.signals))
+        for _, group in ipairs({
+            { list = machine.itemInputs, kind = "item" },
+            { list = machine.fluidInputs, kind = "fluid" },
+            { list = machine.itemOutputs, kind = "item" },
+            { list = machine.fluidOutputs, kind = "fluid" },
+        }) do
+            for _, containerName in ipairs(group.list or {}) do
+                local supported = self.Containers:supports(containerName, group.kind)
+                local why = self.Containers:unusableReason(containerName, group.kind)
+                say("      container " .. tostring(containerName) .. " (" .. group.kind .. ") supports="
+                    .. tostring(supported) .. (why and (" reason=" .. self.Message.describe(why)) or ""))
+            end
+        end
         local problem = self.Recipe:machineProblem(machine)
         if problem then
-            say("      PROBLEM: " .. tostring(problem))
+            say("      PROBLEM: " .. self.Message.describe(problem))
         end
     end
 
     say("processes (runtime):")
     for _, process in ipairs(self.Store:list("processes")) do
         local record = self.Cache:proc(process.name)
-        local machine = record.machine and self.Store:get("machines", record.machine) or nil
-        say("  " .. tostring(process.name) .. " machineType=" .. tostring(process.machineType)
-            .. " state=" .. tostring(record.state) .. " phase=" .. tostring(record.phase)
-            .. " index=" .. tostring(record.index) .. " batch=" .. tostring(record.batch)
-            .. " userCount=" .. tostring(record.userCount) .. " downstream=" .. tostring(record.downstreamCount))
-        say("      machine=" .. tostring(record.machine)
-            .. " machineUsable=" .. tostring(machine ~= nil and self.Recipe:machineUsable(machine))
-            .. " wait=" .. tostring(record.wait and record.wait.kind or "nil"))
-        if record.lastError then
-            say("      lastError: " .. tostring(record.lastError))
+        local instances = self.Recipe:instancesOf(process.name)
+        local probe = instances[1]
+        local probeDef = probe and probe.def or process
+        local craftTotal = 0
+        for _, inst in ipairs(instances) do
+            craftTotal = craftTotal + (tonumber(inst.multiplier) or 0)
         end
-        local ready, element, shortBy, index = self.Recipe:batchMaterialsReady(process, record)
+        local machine = probe and self.Store:get("machines", probe.machine) or nil
+        local active = self.Cache:activeProcesses()[process.name]
+        say("  " .. tostring(process.name) .. " machineType=" .. tostring(process.machineType)
+            .. " state=" .. tostring(record.state)
+            .. " needCount=" .. tostring(active and active.needCount or 0)
+            .. " activeCount=" .. tostring(active and active.activeCount or craftTotal)
+            .. " instances=" .. tostring(#instances))
+        -- Why the planner picks this batch size (Recipe:planTick step 5 chooses
+        -- min(materialLimit, pending, maxMultiplier)): printing the three terms makes a
+        -- fragmented run explainable right here, without digging through the ledger.
+        local needCount = tonumber(active and active.needCount) or 0
+        local activeCount = tonumber(active and active.activeCount) or craftTotal
+        local pending = math.max(0, needCount - activeCount)
+        local maxMultiplier = math.max(1, math.floor(tonumber(process.maxMultiplier) or 1))
+        local sizing = {}
+        local limit = self.Recipe:materialLimit(process, pending, sizing)
+        say("      sizing: maxMultiplier=" .. tostring(maxMultiplier) .. " parallelCap="
+            .. tostring(self.Recipe:parallelCap(process)) .. " pending=" .. tostring(pending)
+            .. " materialLimit=" .. tostring(limit) .. " -> next instance x"
+            .. tostring(math.min(limit, pending, maxMultiplier)))
+        for _, row in ipairs(sizing) do
+            say("        input " .. tostring(row.key) .. " perCraft=" .. tostring(row.perCraft)
+                .. " available=" .. tostring(row.available) .. " -> " .. tostring(row.limit))
+        end
+        for _, inst in ipairs(instances) do
+            say("        live #" .. tostring(inst.id) .. " x" .. tostring(inst.multiplier)
+                .. " phase=" .. tostring(inst.phase) .. " machine=" .. tostring(inst.machine))
+        end
+        say("      machine=" .. tostring(probe and probe.machine or "-")
+            .. " machineUsable=" .. tostring(machine ~= nil and self.Recipe:machineUsable(machine))
+            .. " wait=" .. tostring((record.wait and record.wait.kind)
+                or (probe and probe.wait and probe.wait.kind) or "nil"))
+        if record.lastError or (probe and probe.lastError) then
+            say("      lastError: " .. tostring(record.lastError or (probe and probe.lastError)))
+        end
+        local runningBatch = craftTotal
+        repeat
+            if runningBatch < 1 then
+                say("      idle: no running instance (state=" .. tostring(record.state)
+                    .. ") - nothing to compute for this process")
+                summary[#summary + 1] = "process " .. tostring(process.name) .. " is idle (no running instance)"
+                break
+            end
+            local ready, element, shortBy, index = self.Recipe:batchMaterialsReady(probeDef, probe)
         say("      batchMaterialsReady=" .. tostring(ready) .. " missingElement#=" .. tostring(index)
             .. " shortBy=" .. tostring(shortBy) .. " element=" .. tostring(element and element.id or "-"))
-        if record.phase == "input" then
-            local current = self.Recipe:currentElement(process, record)
+        if probe.phase == "input" then
+            local current = self.Recipe:currentElement(probeDef, probe)
             if current then
                 say("      current element: kind=" .. tostring(current.kind) .. " id=" .. tostring(current.id)
                     .. " done=" .. tostring(current.done) .. "/" .. tostring(current.target))
             end
         end
-        for elementIndex, el in ipairs(process.inputs or {}) do
+        for elementIndex, el in ipairs(probeDef.inputs or {}) do
             if el.kind == "item" or el.kind == "fluid" or el.kind == "filter" then
                 local key = tostring(elementIndex)
-                local required = (tonumber(el.count) or 0) * (record.batch or 1)
-                local doneCount = (record.progress or {})[key] or 0
+                local required = (tonumber(el.count) or 0) * (probe and self.Recipe:batchOf(probe) or 0)
+                local doneCount = probe and (probe.progress[key] or 0) or 0
                 local itemTargets = machine and self.Recipe:inputContainers(machine, "item", el.containerIndex) or {}
                 local fluidTargets = machine and self.Recipe:inputContainers(machine, "fluid", el.containerIndex) or {}
                 local spec = { kind = el.kind, id = el.id, nbt = el.nbt, ignoreNbt = el.ignoreNbt }
@@ -156,7 +235,7 @@ function Diagnose:report()
                 local need = required - doneCount
                 local verdict
                 if not machine then
-                    verdict = "NO MACHINE SELECTED (record.machine=" .. tostring(record.machine) .. ")"
+                    verdict = "NO MACHINE SELECTED (instance machine=" .. tostring(probe and probe.machine) .. ")"
                 elseif #itemTargets == 0 and #fluidTargets == 0 then
                     verdict = "MACHINE HAS NO INPUT CONTAINERS (check itemInputs / fluidInputs)"
                 elseif need <= 0 then
@@ -185,24 +264,26 @@ function Diagnose:report()
                 end
             end
         end
-        if record.phase == "output" then
-            local outputIndex = tonumber(record.index) or 1
-            local el = (process.outputs or {})[outputIndex]
+        if probe and probe.phase == "output" then
+            local outputIndex = self.Recipe:indexOf(probe)
+            local el = (probeDef.outputs or {})[outputIndex]
             if type(el) == "table"
                 and (el.kind == "item" or el.kind == "fluid" or el.kind == "filter") then
-                local batch = record.batch or 1
+                local batch = self.Recipe:batchOf(probe)
                 local maxAmount = (tonumber(el.max) or 0) * batch
                 local minAmount = (tonumber(el.min) or 0) * batch
-                local collected = (record.outProgress or {})[tostring(outputIndex)] or 0
+                local collected = probe.outProgress[tostring(outputIndex)] or 0
                 local spec = { kind = el.kind, id = el.id, nbt = el.nbt, ignoreNbt = el.ignoreNbt }
-                local inMachine = machine and self.Recipe:machineRemaining(spec, machine) or 0
+                local inMachine = machine and self.Recipe:machineRemaining(spec, machine) or nil
                 local inStorage = self.Containers:countOf(spec, "storage")
-                local gained = self.Recipe:storageGain(spec, record)
+                local gained = self.Recipe:storageGain(spec, probe)
                 local verdict
                 if not machine then
                     verdict = "NO MACHINE SELECTED"
                 elseif collected >= maxAmount or gained >= maxAmount then
                     verdict = "DONE"
+                elseif inMachine == nil then
+                    verdict = "CANNOT READ THE MACHINE OUTPUT (peripheral gone / no output container?)"
                 elseif inMachine <= 0 and gained < minAmount then
                     verdict = "WAITING FOR MACHINE (nothing in machine output and storage did not grow)"
                 elseif inMachine <= 0 then
@@ -223,6 +304,7 @@ function Diagnose:report()
                 end
             end
         end
+        until true
     end
 
     say("deliveries (Sending queue):")
@@ -232,7 +314,7 @@ function Diagnose:report()
     end
     for _, delivery in ipairs(deliveries) do
         local spec = { kind = delivery.kind, id = delivery.name }
-        local remaining = tonumber(delivery.remaining) or 0
+        local remaining = delivery.remaining
         local containerKind = delivery.containerKind
         if containerKind ~= "item" and containerKind ~= "fluid" then
             local def = self.Store:findContainer(delivery.container, delivery.kind)
@@ -240,15 +322,11 @@ function Diagnose:report()
         end
         local targetPeripheral = self.Containers:peripheralOf(delivery.container, containerKind)
         local stacks, tanks = self.Containers:matchSpec(spec, "storage")
-        --- 用户规则：目标容器是 interaction/output 时不可读 → 只给结论，不假装"里面有 0 个"
-        local readable = self.Containers:isReadableContainer(delivery.container, containerKind)
-        local inTarget = readable and self.Containers:countIn(delivery.container, spec) or 0
+        local inTarget = self.Containers:countIn(delivery.container, spec)
         local verdict
         if not targetPeripheral then
             verdict = "TARGET CONTAINER NOT USABLE ("
-                .. tostring(self.Containers:unusableReason(delivery.container, containerKind)) .. ")"
-        elseif not readable then
-            verdict = "TARGET IS WRITE-ONLY BY DESIGN (interaction/output are never read; judge by the moved counters)"
+                .. self.Message.describe(self.Containers:unusableReason(delivery.container, containerKind)) .. ")"
         elseif #stacks + #tanks == 0 and inTarget < remaining then
             verdict = "NOTHING IN STORAGE-ROLE CONTAINERS"
         else
@@ -282,7 +360,6 @@ function Diagnose:report()
     return out
 end
 
---- 现场真搬 1 个物品/流体再搬回来（验证目标容器能否接收）
 function Diagnose:moveProbe()
     local out = {}
     local function say(...)
@@ -293,11 +370,7 @@ function Diagnose:moveProbe()
     for _, fromDef in ipairs(self.Store:list("containers")) do
         local fromKind = self.Util.kindOfDef(fromDef)
         local fromPeripheral = self.Containers:peripheralOf(fromDef.name, fromKind)
-        --- 用户规则：interaction / output 容器不可读（读它们会直接报错）—— 探针也不读它们
-        if fromPeripheral and not self.Containers:isReadableContainer(fromDef.name, fromKind) then
-            say("  skip " .. fromDef.name .. " (role=" .. tostring(fromDef.role or "storage") ..
-                "): write-only by design (interaction/output are never read)")
-        elseif fromPeripheral then
+        if fromPeripheral then
             local sample
             if fromKind == "item" then
                 sample = self.Containers:stacks(fromDef.name)[1]
@@ -312,21 +385,30 @@ function Diagnose:moveProbe()
                     local toPeripheral = self.Containers:peripheralOf(toDef.name, toKind)
                     if toPeripheral and toPeripheral ~= fromPeripheral and toKind == fromKind then
                         local moved, reason
-                        --- 探针要立刻看到搬运结果，所以临时摘掉 IFMWorker 调度器（搬完装回）
+                        local probeSlot = nil
                         local provider = self.Containers.transfer
                         self.Containers:setTransferProvider(nil)
                         if toKind == "item" then
-                            moved, reason = self.Containers:pushItem(fromDef.name, sampleSlot, 1, toDef.name)
+                            local toSlot, slotWhy = self.Containers:pickTargetSlot(toDef.name,
+                                { name = sampleName, nbt = sample.nbt }, 1)
+                            if not toSlot then
+                                moved, reason = 0, slotWhy
+                            else
+                                probeSlot = toSlot
+                                moved, reason = self.Containers:pushItem(fromDef.name, sampleSlot, 1,
+                                    toDef.name, toSlot)
+                            end
                         else
                             moved, reason = self.Containers:pushFluid(fromDef.name, 1, sampleName, toDef.name)
                         end
-                        moved = tonumber(moved) or 0
+                        self.Assert.number(moved, "moveProbe pushItem result")
                         say("  " .. fromDef.name .. " -> " .. toDef.name .. " (" .. tostring(sampleName)
                             .. ") moved=" .. tostring(moved) .. " reason=" .. tostring(reason))
                         if moved > 0 then
                             local backMoved, backReason
                             if toKind == "item" then
-                                backMoved, backReason = self.Containers:pushItem(toDef.name, 1, moved, fromDef.name)
+                                backMoved, backReason = self.Containers:pushItem(toDef.name, probeSlot, moved,
+                                    fromDef.name, sampleSlot)
                             else
                                 backMoved, backReason = self.Containers:pushFluid(toDef.name, moved, sampleName, fromDef.name)
                             end
@@ -342,15 +424,14 @@ function Diagnose:moveProbe()
     return out
 end
 
---- 手动跑一个 tick：直接暴露引擎异常（例如文件新旧混用时某个方法不存在）
 function Diagnose:tickProbe()
     local out = {}
     local function say(...)
         out[#out + 1] = line(...)
     end
     say("===== IFM diagnose (manual tick) =====")
-    local ok, err = pcall(self.Recipe.tick, self.Recipe, os.epoch("utc"))
-    say("tick: " .. (ok and "ok" or ("ERROR -> " .. tostring(err))))
+    self.Recipe.tick(self.Recipe, os.epoch("utc"))
+    say("tick: ok")
     for _, process in ipairs(self.Store:list("processes")) do
         local record = self.Cache:proc(process.name)
         say("  process " .. tostring(process.name) .. " state=" .. tostring(record.state)
@@ -365,28 +446,31 @@ function Diagnose:tickProbe()
     return out
 end
 
---- 性能诊断（诊断模式 perf）：各组件耗时 + 协议层收发字节 + 事件循环计数 + 规模。
---- 服务端“运行缓慢”时先看这里：哪个组件耗时长、哪个 action 的包最大/最频繁。
 function Diagnose:perf()
     local out = {}
     local function say(...)
         out[#out + 1] = line(...)
     end
     local function kb(bytes)
-        return string.format("%.1fKB", (tonumber(bytes) or 0) / 1024)
+        return string.format("%.1fKB", bytes / 1024)
+    end
+    local rawFormat = string.format
+    local string = {
+        format = rawFormat,
+    }
+    local function safeSay(fmt, ...)
+        out[#out + 1] = string.format(fmt, ...)
     end
 
     say("===== IFM diagnose (perf) =====")
 
-    --- 1) 各组件耗时（IFMMaster.lua 的 timed() 收集，按总耗时排序）
-    --- 字段是 perfStats（不是 self.perf：那是本方法自己的名字，见 Diagnose.new 的说明）
     local timings = {}
     for _, stat in pairs(self.perfStats or {}) do
         timings[#timings + 1] = stat
     end
     table.sort(timings, function(a, b)
-        if (a.total or 0) ~= (b.total or 0) then
-            return (a.total or 0) > (b.total or 0)
+        if a.total ~= b.total then
+            return a.total > b.total
         end
         return tostring(a.label) < tostring(b.label)
     end)
@@ -395,47 +479,45 @@ function Diagnose:perf()
         say("  (no samples yet - the main loop has not run since startup)")
     end
     for _, stat in ipairs(timings) do
-        local count = stat.count or 0
+        local count = stat.count
         say(string.format("  %-22s n=%-6d avg=%4dms max=%6dms total=%8dms slow=%d",
             tostring(stat.label),
             count,
-            count > 0 and math.floor((stat.total or 0) / count) or 0,
-            stat.max or 0,
-            stat.total or 0,
-            stat.slow or 0))
+            count > 0 and math.floor(stat.total / count) or 0,
+            stat.max,
+            stat.total,
+            stat.slow))
     end
 
-    --- 2) 协议层收发统计（protocol.lua 收集）
-    --- 注意：方法是 statsSummary（`stats` 是实例上的原始计数字段，会把同名方法遮蔽掉）
     local protocol = self.protocol
     if protocol and protocol.statsSummary then
-        local okStats, summary = pcall(protocol.statsSummary, protocol)
-        if okStats and type(summary) == "table" then
-            local seconds = math.max(1, summary.uptimeSeconds or 0)
-            say(string.format("protocol: sent %d msg %s (max %s) / recv %d msg %s (max %s)",
-                summary.sentMessages or 0, kb(summary.sentBytes), kb(summary.sentMax),
-                summary.recvMessages or 0, kb(summary.recvBytes), kb(summary.recvMax)))
-            say(string.format("protocol: rate sent=%s/s recv=%s/s over %ds",
-                kb((summary.sentBytes or 0) / seconds), kb((summary.recvBytes or 0) / seconds), seconds))
-            say(string.format("protocol: last push cost %dms -> auto interval max(%ds, 3x cost) = %dms",
-                summary.lastPushCost or 0, summary.updateInterval or 1,
-                math.max((summary.updateInterval or 1) * 1000, (summary.lastPushCost or 0) * 3)))
-            say(string.format("protocol: pushes=%d skipped=%d fullSyncs=%d changedItems=%d dropped=%d failed=%d encodeFailed=%d",
-                summary.pushes or 0, summary.pushSkipped or 0, summary.fullSyncs or 0,
-                summary.changedItems or 0, summary.dropped or 0, summary.failed or 0,
-                summary.encodeFailed or 0))
-            --- 连接生命周期（闪断排查）：多久断一次、是谁断的、断在连上后第几秒
-            say(string.format("protocol link: connectRequests=%d failures=%d timeouts=%d reconnects=%d",
-                summary.connectRequests or 0, summary.connectFailures or 0,
-                summary.connectTimeouts or 0, summary.reconnects or 0))
-            say(string.format("protocol link: pending=%d expected=%d abandoned=%d extras=%d",
-                summary.pendingAcks or 0, summary.expectedAcks or 0,
-                summary.abandoned or 0, summary.extraHandles or 0))
-            say(string.format("protocol link: closes=%d (relay=%d, own=%d, stale=%d) connectedFor=%ds idle=%ds",
-                summary.closes or 0,
-                math.max(0, (summary.closes or 0) - (summary.ownCloses or 0) - (summary.staleCloses or 0)),
-                summary.ownCloses or 0, summary.staleCloses or 0,
-                summary.connectedSeconds or 0, summary.idleSeconds or 0))
+        local summary = protocol.statsSummary(protocol)
+        if type(summary) == "table" then
+            local seconds = math.max(1, summary.uptimeSeconds)
+            safeSay("protocol: sent %d msg %s (max %s) / recv %d msg %s (max %s)",
+                summary.sentMessages, kb(summary.sentBytes), kb(summary.sentMax),
+                summary.recvMessages, kb(summary.recvBytes), kb(summary.recvMax))
+            safeSay("protocol: rate sent=%s/s recv=%s/s over %ds",
+                kb(summary.sentBytes / seconds), kb(summary.recvBytes / seconds), seconds)
+            safeSay("protocol: last push cost %dms -> auto interval max(%ds, 3x cost) = %dms",
+                summary.lastPushCost, summary.updateInterval,
+                math.max(summary.updateInterval * 1000, summary.lastPushCost * 3))
+            safeSay("protocol: pushes=%d skipped=%d fullSyncs=%d changedItems=%d dropped=%d failed=%d encodeFailed=%d",
+                summary.pushes, summary.pushSkipped, summary.fullSyncs,
+                summary.changedItems, summary.dropped, summary.failed,
+                summary.encodeFailed)
+            safeSay("protocol link: connectRequests=%d failures=%d timeouts=%d reconnects=%d",
+                summary.connectRequests, summary.connectFailures,
+                summary.connectTimeouts, summary.reconnects)
+            safeSay("protocol link: pending=%d expected=%d abandoned=%d extras=%d recvSelf=%d ownEchoSeen=%s",
+                summary.pendingAcks, summary.expectedAcks,
+                summary.abandoned, summary.extraHandles,
+                summary.recvSelf, tostring(summary.ownEchoSeen))
+            safeSay("protocol link: closes=%d (relay=%d, own=%d, stale=%d) connectedFor=%ds idle=%ds",
+                summary.closes,
+                math.max(0, summary.closes - summary.ownCloses - summary.staleCloses),
+                summary.ownCloses, summary.staleCloses,
+                summary.connectedSeconds, summary.idleSeconds)
             if summary.lastCloseReason then
                 say("protocol link: last close reason: " .. tostring(summary.lastCloseReason))
             end
@@ -446,12 +528,10 @@ function Diagnose:perf()
             end
             for index = 1, math.min(#actions, 12) do
                 local entry = actions[index]
-                say(string.format("  %-26s n=%-6d total=%-10s avg=%-9s max=%s",
-                    tostring(entry.key), entry.count or 0, kb(entry.bytes),
-                    kb(entry.average or 0), kb(entry.max)))
+                safeSay("  %-26s n=%-6d total=%-10s avg=%-9s max=%s",
+                    tostring(entry.key), entry.count, kb(entry.bytes),
+                    kb(entry.average), kb(entry.max))
             end
-            --- 用户第 3 项：incremental_update 的**成分**（哪个类别在吃流量）——
-            --- 现场问题："几分钟就 6MB，主要流量集中在 incremental_update"，但看不出是哪个类别。
             local categories = summary.categories or {}
             if #categories == 0 then
                 say("push categories: (nothing pushed yet)")
@@ -459,9 +539,9 @@ function Diagnose:perf()
                 say("push categories (bytes desc, top 12) - which category eats the incremental_update traffic:")
                 for index = 1, math.min(#categories, 12) do
                     local entry = categories[index]
-                    say(string.format("  %-26s n=%-6d items=%-7d total=%-10s avg=%-9s max=%s",
-                        tostring(entry.key), entry.frames or 0, entry.items or 0, kb(entry.bytes),
-                        kb(entry.average or 0), kb(entry.max)))
+                    safeSay("  %-26s n=%-6d items=%-7d total=%-10s avg=%-9s max=%s",
+                        tostring(entry.key), entry.frames, entry.items, kb(entry.bytes),
+                        kb(entry.average), kb(entry.max))
                 end
             end
         else
@@ -471,24 +551,17 @@ function Diagnose:perf()
         say("protocol: not available")
     end
 
-    --- 2.5) 任务调度器（1.7.0）：每条队列的深度 / 服务数 / 丢弃数 + 本轮耗时。
-    --- 这里是"为什么慢 / 为什么 worker 空着"的第一现场：
-    ---   * mode=local   没有 worker → 主控本机执行，每次调度只推进一步；
-    ---   * mode=remote  有 worker 且有空闲 → 队列轮转（派给 worker）；
-    ---   * mode=paused  有 worker 但都忙 → 本次调度不推进队列（这期间 worker 会一直有活）。
-    --- 看深度：某条队列深度一直是 0 而 steps 很小，说明瓶颈不在这条队列；
-    --- 深度一直涨而 steps 不涨 → 队列被能力门控挡住（没有具备该能力的空闲 worker）。
     if self.dispatch and self.dispatch.status then
-        local okDispatch, dispatchStatus = pcall(self.dispatch.status, self.dispatch)
-        if okDispatch and type(dispatchStatus) == "table" then
-            say(string.format("scheduler: mode=%s runs=%d steps=%d (local=%d remote=%d) paused=%d inflight=%d deferred=%d writes=%d",
-                tostring(dispatchStatus.mode), dispatchStatus.runs or 0, dispatchStatus.steps or 0,
-                dispatchStatus.localSteps or 0, dispatchStatus.remoteSteps or 0,
-                dispatchStatus.paused or 0, dispatchStatus.inflight or 0,
-                dispatchStatus.deferred or 0, dispatchStatus.writes or 0))
+        local dispatchStatus = self.dispatch.status(self.dispatch)
+        if type(dispatchStatus) == "table" then
+            safeSay("scheduler: mode=%s runs=%d steps=%d (local=%d remote=%d) paused=%d inflight=%d writes=%d",
+                tostring(dispatchStatus.mode), dispatchStatus.runs, dispatchStatus.steps,
+                dispatchStatus.localSteps, dispatchStatus.remoteSteps,
+                dispatchStatus.paused, dispatchStatus.inflight,
+                dispatchStatus.writes)
             if self.Store and self.Store.scheduleSettings then
-                local okSched, sched = pcall(self.Store.scheduleSettings, self.Store)
-                if okSched and type(sched) == "table" then
+                local sched = self.Store.scheduleSettings(self.Store)
+                if type(sched) == "table" then
                     local parts = {}
                     for _, queue in ipairs(sched.queues or {}) do
                         parts[#parts + 1] = queue .. "=" .. tostring((sched.slices or {})[queue] or 1)
@@ -496,21 +569,67 @@ function Diagnose:perf()
                     say("scheduler slices: " .. table.concat(parts, " "))
                 end
             end
-            say(string.format("scheduler: per-run last=%.1fms avg=%.1fms max=%.1fms cursor=%s uptime=%ds",
-                tonumber(dispatchStatus.lastMs) or 0, tonumber(dispatchStatus.avgMs) or 0,
-                tonumber(dispatchStatus.maxMs) or 0, tostring(dispatchStatus.cursor),
-                dispatchStatus.uptimeSeconds or 0))
-            say(string.format("scheduler guards: duplicateQueues=%d missingRunner=%d idleProcessInQueue=%d",
-                dispatchStatus.duplicateQueues or 0, dispatchStatus.missingRunner or 0,
-                (self.engine and self.engine.guardCounters and self.engine.guardCounters.idleProcessInQueue) or 0))
-            say("scheduler queues (name weight-cum-stats depth(active+waiting) inflight served done dropped retried promoted needs policy):")
+            safeSay("scheduler: per-run last=%.1fms avg=%.1fms max=%.1fms cursor=%s uptime=%ds",
+                dispatchStatus.lastMs, dispatchStatus.avgMs,
+                dispatchStatus.maxMs, tostring(dispatchStatus.cursor),
+                dispatchStatus.uptimeSeconds)
+            do
+                local brk = dispatchStatus.breakdown
+                if type(brk) == "table" then
+                    safeSay("scheduler breakdown (cumulative ms): flush=%.0f maintain=%.0f promote=%.0f gen=%.0f rotate=%.0f rounds=%d",
+                        brk.flush, brk.maintain, brk.promote, brk.gen, brk.rotate,
+                        brk.rounds)
+                end
+                local run = dispatchStatus.lastRun
+                if type(run) == "table" then
+                    safeSay("scheduler last run (ms): total=%.0f flush=%.0f maintain=%.0f promote=%.0f gen=%.0f rotate=%.0f steps=%s paused=%s",
+                        tonumber(run.ms) or 0, tonumber(run.flush) or 0, tonumber(run.maintain) or 0,
+                        tonumber(run.promote) or 0, tonumber(run.gen) or 0, tonumber(run.rotate) or 0,
+                        tostring(run.steps), tostring(run.paused))
+                    local qparts = {}
+                    for _, q in ipairs(run.queues or {}) do
+                        qparts[#qparts + 1] = string.format("%s %dx/%.0fms(max%.0f)",
+                            q.name, q.calls, q.ms, q.maxMs)
+                    end
+                    safeSay("scheduler last run queues: %s",
+                        (#qparts > 0) and table.concat(qparts, " ") or "-")
+                    if self.Containers and self.Containers.stackStepText then
+                        local stack = self.Containers:stackStepText()
+                        if type(stack) == "string" and stack ~= "" then
+                            safeSay("scheduler last run %s", stack)
+                        end
+                    end
+                end
+                local byQueue = dispatchStatus.byQueue
+                if type(byQueue) == "table" then
+                    local rows = {}
+                    for name, entry in pairs(byQueue) do
+                        rows[#rows + 1] = { name = name, ms = entry.ms,
+                            calls = entry.calls, maxMs = entry.maxMs,
+                            slow = entry.slow }
+                    end
+                    table.sort(rows, function(x, y) return x.ms > y.ms end)
+                    for _, row in ipairs(rows) do
+                        safeSay("  queue-task %-13s calls=%-7d total=%-9.0fms max=%-8.1fms slow(>=50ms)=%d",
+                            tostring(row.name), row.calls, row.ms, row.maxMs, row.slow)
+                    end
+                end
+            end
+            local idleInQueue = 0
+            if self.Recipe.guardCounters then
+                idleInQueue = tonumber(self.Recipe.guardCounters.idleProcessInQueue) or 0
+            end
+            safeSay("scheduler guards: duplicateQueues=%d missingRunner=%d idleProcessInQueue=%d",
+                dispatchStatus.duplicateQueues, dispatchStatus.missingRunner, idleInQueue)
+            say("scheduler queues (name weight runs-left depth(active+waiting) inflight served done dropped retried promoted needs policy):")
             for _, queue in ipairs(dispatchStatus.queues or {}) do
-                say(string.format("  %-13s weight=%-5s depth=%-5s active=%-5s waiting=%-5s inflight=%-3s served=%-7s done=%-7s dropped=%-5s retried=%-5s promoted=%-5s needs=%s policy=%s",
-                    tostring(queue.name), tostring(queue.slice), tostring(queue.depth),
+                safeSay("  %-13s weight=%-5s runs=%-5s depth=%-5s active=%-5s waiting=%-5s inflight=%-3s served=%-7s done=%-7s dropped=%-5s retried=%-5s promoted=%-5s needs=%s policy=%s",
+                    tostring(queue.name), tostring(queue.slice), tostring(queue.remaining),
+                    tostring(queue.depth),
                     tostring(queue.active), tostring(queue.waiting),
                     tostring(queue.inflight), tostring(queue.served), tostring(queue.done),
-                    tostring(queue.dropped), tostring(queue.retried), tostring(queue.promoted or 0),
-                    tostring(queue.needs), tostring(queue.policy)))
+                    tostring(queue.dropped), tostring(queue.retried), tostring(queue.promoted),
+                    tostring(queue.needs), tostring(queue.policy))
             end
         else
             say("scheduler: status unavailable (" .. tostring(dispatchStatus) .. ")")
@@ -519,32 +638,22 @@ function Diagnose:perf()
         say("scheduler: not available")
     end
 
-    --- 2.6) IFMWorker 搬运卸载（有 worker 时 IFM 自己不再搬东西）
     if self.transfer and self.transfer.status then
-        local okTransfer, transferStats = pcall(self.transfer.status, self.transfer)
-        if okTransfer and type(transferStats) == "table" then
+        local transferStats = self.transfer.status(self.transfer)
+        if type(transferStats) == "table" then
             say(string.format("IFMWorker: workers=%d busy=%d idle=%d pending=%d channel=%s",
-                transferStats.workers or 0, transferStats.busy or 0, transferStats.idle or 0,
-                transferStats.pending or 0, tostring(transferStats.channel or "-")))
-            say(string.format("IFMWorker: submitted=%d done=%d failed=%d timedOut=%d localMoves=%d",
-                transferStats.submitted or 0, transferStats.done or 0, transferStats.failed or 0,
-                transferStats.timedOut or 0, transferStats.localMoves or 0))
-            --- 1.7.0：代扫机制已删除（容器扫描走 storageScan / inputScan 队列），
-            --- 这里只报告 worker 侧的在飞任务数（快照统计见下面的 container snapshot 段）
-            say(string.format("IFMWorker: slots=%d freeSlots=%d inFlightTasks=%d idle=%d/%d movers=%d queriers=%d",
-                transferStats.slots or 0, transferStats.freeSlots or 0, transferStats.inFlightTasks or 0,
-                transferStats.idle or 0, transferStats.workers or 0,
-                transferStats.idleMovers or 0, transferStats.idleQueriers or 0))
+                transferStats.workers, transferStats.busy, transferStats.idle,
+                transferStats.pending, tostring(transferStats.channel or "-")))
+            say(string.format("IFMWorker: submitted=%d done=%d failed=%d timedOut=%d",
+                transferStats.submitted, transferStats.done, transferStats.failed,
+                transferStats.timedOut))
+            say(string.format("IFMWorker: slots=%d freeSlots=%d inFlightTasks=%d idle=%d/%d (workers accept every job)",
+                transferStats.slots, transferStats.freeSlots, transferStats.inFlightTasks,
+                transferStats.idle, transferStats.workers))
             say(string.format("IFMWorker: usable=%d unknownVersion=%d versionMismatch=%d atCapacity=%d (master=%s)",
-                transferStats.usable or 0, transferStats.versionUnknown or 0,
-                transferStats.versionMismatch or 0, transferStats.inFlightWorkers or 0,
+                transferStats.usable, transferStats.versionUnknown,
+                transferStats.versionMismatch, transferStats.inFlightWorkers,
                 tostring(transferStats.version or "?")))
-            --- 主控本机的并行执行（1.8.0）：worker 不够时主控自己用 32 个协程顶上
-            local pool = transferStats.localPool or {}
-            say(string.format("IFMWorker: local pool slots=%d inFlight=%d idle=%d submitted=%d done=%d failed=%d overrun=%d",
-                pool.slots or 0, pool.inFlight or 0, pool.idle or 0, pool.submitted or 0,
-                pool.done or 0, pool.failed or 0, pool.overruns or 0))
-            --- 容器扫描的代扫统计（1.7.0 P1 仍是旧实现；P2 会并入 storageScan/inputScan 队列）
         else
             say("IFMWorker: status unavailable (" .. tostring(transferStats) .. ")")
         end
@@ -552,80 +661,84 @@ function Diagnose:perf()
         say("IFMWorker: not available")
     end
 
-    --- 2.6) 容器扫描耗时（按外设名）：一次推送 / 一个 tick 要把所有容器 list() 一遍，
-    --- 这里能直接看出“哪个容器最慢”——avg 几十毫秒就说明它是主循环变慢的根源。
     if self.Containers and self.Containers.scanStatsSummary then
-        -- 自适应缓存：读取一次越慢，缓存放得越久（扫描最多占用主循环 ~1/multiplier）
         if self.Containers.scanSummary then
-            local okSummary, scan = pcall(self.Containers.scanSummary, self.Containers)
-            if okSummary and type(scan) == "table" then
-                say(string.format("container snapshot: containers=%s scanned=%s readCost=%sms passCost=%sms reads=%s readMs=%sms staleMax=%s staleAvg=%s (ticks)",
+            local scan = self.Containers.scanSummary(self.Containers)
+            if type(scan) == "table" then
+                safeSay("container snapshot: containers=%s scanned=%s readCost=%sms passCost=%sms reads=%s readMs=%sms staleMax=%s staleAvg=%s (ticks)",
                     tostring(scan.containers), tostring(scan.scanned), tostring(scan.readCost),
                     tostring(scan.passCost), tostring(scan.reads), tostring(scan.readMs),
-                    tostring(scan.staleTicks or 0), tostring(scan.staleAvgTicks or 0)))
+                    tostring(scan.staleTicks), tostring(scan.staleAvgTicks))
                 if self.Containers.snapshotSummary then
-                    local okSnap, snap = pcall(self.Containers.snapshotSummary, self.Containers)
-                    if okSnap and type(snap) == "table" then
-                        say(string.format("container snapshot detail: reservations=%d settled=%d swept=%d inFlight=%d results=%d",
-                            snap.pending or 0, snap.settled or 0, snap.swept or 0, snap.inflight or 0,
-                            snap.results or 0))
+                    local snap = self.Containers.snapshotSummary(self.Containers)
+                    if type(snap) == "table" then
+                        safeSay("container snapshot detail: inUseSlots=%d inUseItems=%d inUseFluids=%d inUseContainers=%d settled=%d inFlight=%d results=%d",
+                            snap.inUseSlots, snap.inUseItems, snap.inUseFluids, snap.inUseContainers,
+                            snap.settled, snap.inflight, snap.results)
+                        local ct = self.Containers
+                        if ct then
+                            safeSay("move dispatch: enqueued=%d rejected=%d localDirect=%d | scans: sentToWorker=%d localRead=%d deferred=%d",
+                                ct.moveEnqueued, ct.moveEnqueueRejected, ct.moveEnqueueLocal,
+                                ct.scanRequested, ct.scanLocal, ct.scanDeferred)
+                            local proto = self.protocol
+                            if proto and proto.stats then
+                                safeSay("outbox flush: flushes=%d msgs=%d frames=%d drops=%d lost=%d tooLarge=%d logThrottled=%d",
+                                    proto.stats.flushes, proto.stats.flushMessages, proto.stats.flushedFrames,
+                                    proto.stats.dropped, proto.stats.flushDropped, proto.stats.tooLarge,
+                                    proto.stats.logThrottled)
+                            end
+                        end
                     end
                 end
-                --- 槽位堆叠上限（"堆数"）扫描（用户第 5 项）：自动整理计划的输入。
-                --- 已知/未知的槽位数 + 上一次规划因为"还没扫到"跳过了多少物品。
-                if self.Containers.stackScanTargets then
-                    local okTargets, targets = pcall(self.Containers.stackScanTargets, self.Containers)
-                    if okTargets and type(targets) == "table" then
+                if self.Containers.stackScanTargets and self.Containers.stackScanStatusFromSnapshot then
+                    local targets = self.Containers.stackScanTargets(self.Containers)
+                    if type(targets) == "table" then
                         local known, unknown = 0, 0
                         for _, target in ipairs(targets) do
-                            local status = self.Containers:stackScanStatus(target.container)
-                            known = known + (status.known or 0)
-                            unknown = unknown + (status.unknown or 0)
+                            local status = self.Containers:stackScanStatusFromSnapshot(target.container)
+                            known = known + status.known
+                            unknown = unknown + status.unknown
                         end
                         say(string.format("stack scan (compact planning input): %d storage container(s), %d slot(s) with a known stack limit, %d unknown, %d item(s) skipped in planning",
-                            #targets, known, unknown, self.Containers.stackLimitUnknown or 0))
+                            #targets, known, unknown, self.Containers.stackLimitUnknown))
                     end
                 end
             end
         end
-        local okScans, scans = pcall(self.Containers.scanStatsSummary, self.Containers, 12)
-        if okScans and type(scans) == "table" and #scans > 0 then
+        local scans = self.Containers.scanStatsSummary(self.Containers, 12)
+        if type(scans) == "table" and #scans > 0 then
             say("container scans (peripheral / calls / avg / max / total / item vs fluid):")
             for _, entry in ipairs(scans) do
-                local calls = tonumber(entry.calls) or 0
+                local calls = entry.calls
                 say(string.format("  %-28s n=%-6d avg=%5dms max=%6dms total=%8dms item=%d fluid=%d",
                     tostring(entry.name), calls,
-                    calls > 0 and math.floor((entry.total or 0) / calls) or 0,
-                    entry.max or 0, entry.total or 0,
-                    entry.item or 0, entry.fluid or 0))
+                    calls > 0 and math.floor(entry.total / calls) or 0,
+                    entry.max, entry.total,
+                    entry.item, entry.fluid))
             end
         else
             say("container scans: (no samples yet - nothing has been scanned since startup)")
         end
     end
 
-    --- 2.5) IFMWorker（分布式工作节点）：只做「搬运」与「查询」
     if self.transfer and self.transfer.workersForUi then
-        local okWorkers, workers = pcall(self.transfer.workersForUi, self.transfer)
-        if okWorkers and type(workers) == "table" then
+        local workers = self.transfer.workersForUi(self.transfer, { full = true })
+        if type(workers) == "table" then
             if #workers == 0 then
                 say("IFMWorker: none online (run IFMWorker.lua on another computer)")
             else
                 say(string.format("IFMWorker: %d online (each worker only moves and queries items/fluids)", #workers))
             end
             for _, worker in ipairs(workers) do
-                local caps = {}
-                if worker.move then caps[#caps + 1] = "move" end
-                if worker.query then caps[#caps + 1] = "query" end
                 local tasks = worker.tasks or {}
-                say(string.format("  #%-4s %-16s [%s] v=%s load=%d/%d peak=%d jobs=%d moved=%d queries=%d pending=%d age=%ds%s",
-                    tostring(worker.id), tostring(worker.name), table.concat(caps, ","),
-                    tostring(worker.version or "?"), tonumber(worker.load) or 0, tonumber(worker.slots) or 1,
-                    tonumber(worker.peak) or 0,
-                    worker.jobs or 0, worker.moved or 0, worker.queries or 0, worker.pending or 0,
-                    worker.stateAge or 0,
+                say(string.format("  #%-4s %-16s v=%s load=%d/%d peak=%d jobs=%d moved=%d queries=%d pending=%d age=%ds%s",
+                    tostring(worker.id), tostring(worker.name),
+                    tostring(worker.version or "?"), worker.load, worker.slots,
+                    worker.peak,
+                    worker.jobs, worker.moved, worker.queries, worker.pending,
+                    worker.stateAge,
                     (worker.stateAge == nil) and " (no state yet)" or ""))
-                if (worker.stuck or 0) > 0 then
+                if worker.stuck > 0 then
                     say(string.format("        stuck: %d task(s) dropped (a container/peripheral stopped answering)",
                         worker.stuck))
                 end
@@ -639,20 +752,17 @@ function Diagnose:perf()
                 end
                 if worker.details ~= nil then
                     say(string.format("        item detail: %d batch(es), %d detail(s) (getItemDetail offloaded)",
-                        tonumber(worker.details) or 0, tonumber(worker.detailItems) or 0))
+                        worker.details, worker.detailItems))
                 end
             end
-        else
-            say("IFMWorker: status unavailable (" .. tostring(workers) .. ")")
         end
     end
-    --- 物品详情代查（getItemDetail 打包给 worker）：主控本机调用次数越多 = 阻塞越多
     if self.transfer and self.transfer.detailStatus then
-        local okDetail, detail = pcall(self.transfer.detailStatus, self.transfer)
-        if okDetail and type(detail) == "table" then
-            say(string.format("item detail offload: batches=%d done=%d items=%d pending=%d failed=%d queriers=%d",
-                detail.submitted or 0, detail.done or 0, detail.items or 0, detail.pending or 0,
-                detail.failed or 0, detail.queriers or 0))
+        local detail = self.transfer.detailStatus(self.transfer)
+        if type(detail) == "table" then
+            say(string.format("item detail offload: batches=%d done=%d items=%d pending=%d failed=%d workers=%d",
+                detail.submitted, detail.done, detail.items, detail.pending,
+                detail.failed, detail.workers))
             if self.Containers and self.Containers.localDetailCalls then
                 say(string.format("  getItemDetail called on the master: %d time(s) (0 is ideal; " ..
                     "each one blocks ~1 game tick)", self.Containers.localDetailCalls))
@@ -660,14 +770,25 @@ function Diagnose:perf()
         end
     end
 
-    --- 3) 事件循环计数（timers 长期为 0 = 这台机器收不到定时器事件）
     local counters = self.Recipe and self.Recipe.debugCounters
     if counters then
-        say(string.format("events: events=%d timers=%d websockets=%d engineRuns=%d",
-            counters.events or 0, counters.timers or 0, counters.websockets or 0, counters.ticks or 0))
+        local duplicates = 0
+        if type(counters.requests) == "table" then
+            duplicates = tonumber(counters.requests.duplicates) or 0
+        end
+        safeSay("events: events=%d timers=%d websockets=%d engineRuns=%d modem=%d other=%d duplicates=%d",
+            counters.events, counters.timers, counters.websockets, counters.ticks,
+            counters.modemMessages, counters.otherEvents, duplicates)
+        do
+            local gaps = counters.tickGaps or {}
+            local parts = {}
+            for i = 1, #gaps do
+                parts[i] = tostring(gaps[i])
+            end
+            say("tick gaps (raw, last " .. tostring(#gaps) .. ", ms): " .. table.concat(parts, " "))
+        end
     end
 
-    --- 4) 规模（定义/资源越多，每 tick 与每次推送的开销越大）
     say(string.format("scale: containers=%d signals=%d filters=%d machineTypes=%d machines=%d processes=%d deliveries=%d",
         #(self.Store:list("containers") or {}),
         #(self.Store:list("signals") or {}),
@@ -677,20 +798,20 @@ function Diagnose:perf()
         #(self.Store:list("processes") or {}),
         #(self.Cache:deliveries() or {})))
 
-    --- 5) 怎么读这份报告
     say("how to read this:")
     say("  * log line 'Slow <label>: Nms (calls=.. avg=.. max=.. slow=..)' = one call of that")
     say("    component took N ms; slow counts how many calls were >= 500 ms.")
-    say("  * 'engine tick' / 'protocol event' / 'tag auto scan' each scan ALL containers; one full")
-    say("    scan costs the sum of 'container scans' below. That cost is CONSTANT, so it does not")
-    say("    drop when the factory is idle - it is peripheral scanning, not diffing.")
+    say("  * 'engine tick' / 'protocol event' / 'tag auto scan' refresh the snapshots that are wanted")
+    say("    right now: storage / input containers always, interaction containers only while an active")
+    say("    process instance uses that machine (or the web manual tool watches it), output containers")
+    say("    only while a send (inventoryOut) is in flight; a container with unsettled dirty marks is")
+    say("    re-scanned once so it can be reconciled. One full pass costs the sum of 'container scans'.")
     say("  * compare events/timers with engineRuns: if events/timers are much larger than engineRuns,")
     say("    every loop iteration is blocked by the scans (engine tick + push + tag scan).")
     say("  * 'container scans' (section above) = per-peripheral list()/tanks() cost: tens of ms for")
     say("    one container means that block or the wired network is what slows everything down.")
     say("  * big send:incremental_update = one full sync when a browser connects (all categories at")
-    say("    once); later pushes happen at most once per updateInterval (default 1s) and after a")
-    say("    request (throttled by minPushInterval - heartbeats never trigger a push).")
+    say("    once); later pushes are not throttled any more, and heartbeats never trigger a push.")
     say("  * timers=0 while events grows = this computer gets no timer events (engine only moves")
     say("    when other events arrive).")
     say("===== end of perf probe =====")

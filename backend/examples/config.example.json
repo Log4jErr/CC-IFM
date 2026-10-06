@@ -52,7 +52,7 @@
                 { "kind": "waitSignal", "machineSignalIndex": 1, "sides": ["front"], "op": "ge", "threshold": 15 }
             ],
             "outputs": [
-                { "kind": "item", "id": "minecraft:iron_ingot", "min": 1, "max": 1, "priority": 10, "containerIndex": -1, "slot": -1 }
+                { "kind": "item", "id": "minecraft:iron_ingot", "min": 1, "expect": 1, "max": 1, "priority": 10, "containerIndex": -1, "slot": -1 }
             ]
         },
         "smelt_ore_batch": {
@@ -64,7 +64,7 @@
                 { "kind": "waitTime", "seconds": 0.5 }
             ],
             "outputs": [
-                { "kind": "item", "id": "minecraft:iron_ingot", "min": 1, "max": 4, "priority": 5, "containerIndex": -1, "slot": -1 },
+                { "kind": "item", "id": "minecraft:iron_ingot", "min": 1, "expect": 4, "max": 4, "priority": 5, "containerIndex": -1, "slot": -1 },
                 { "kind": "placeholder", "name": "slag", "item": "minecraft:gravel" },
                 { "kind": "emitSignal", "machineSignalIndex": 1, "sides": ["front"], "strength": 15 }
             ]
